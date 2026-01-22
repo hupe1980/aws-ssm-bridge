@@ -36,7 +36,8 @@
 				"serayuzgur.crates",
 				"editorconfig.editorconfig",
 				"ms-python.python",
-				"tamasfe.even-better-toml"
+				"tamasfe.even-better-toml",
+				"mhutchie.git-graph"
 			]
 		}
 	}

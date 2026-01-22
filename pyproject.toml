@@ -4,20 +4,19 @@ build-backend = "maturin"
 
 [project]
 name = "aws-ssm-bridge"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Python bindings for AWS Systems Manager Session Manager protocol"
 authors = [
-    {name = "AWS SSM Bridge Contributors"}
+    {name = "hupe1980"}
 ]
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "MIT OR Apache-2.0"}
+license = {text = "MIT"}
 keywords = ["aws", "ssm", "session-manager", "async"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -29,9 +28,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/example/aws-ssm-bridge"
-Repository = "https://github.com/example/aws-ssm-bridge"
-Documentation = "https://github.com/example/aws-ssm-bridge/docs"
+Homepage = "https://hupe1980.github.io/aws-ssm-bridge/"
+Repository = "https://github.com/hupe1980/aws-ssm-bridge"
+Documentation = "https://hupe1980.github.io/aws-ssm-bridge/"
 
 [tool.maturin]
 features = ["python"]

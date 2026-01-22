@@ -1,12 +1,12 @@
 [package]
 name = "aws-ssm-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.81"
 authors = ["hupe1980"]
 license = "MIT"
-repository = "https://github.com/example/aws-ssm-bridge"
-homepage = "https://github.com/example/aws-ssm-bridge"
+repository = "https://github.com/hupe1980/aws-ssm-bridge"
+homepage = "https://hupe1980.github.io/aws-ssm-bridge/"
 description = "Rust library implementing AWS Systems Manager Session Manager protocol"
 keywords = ["aws", "ssm", "session-manager", "async"]
 categories = ["network-programming", "asynchronous"]
