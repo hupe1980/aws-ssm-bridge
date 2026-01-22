@@ -1,0 +1,105 @@
+[package]
+name = "aws-ssm-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+authors = ["hupe1980"]
+license = "MIT"
+repository = "https://github.com/example/aws-ssm-bridge"
+homepage = "https://github.com/example/aws-ssm-bridge"
+description = "Rust library implementing AWS Systems Manager Session Manager protocol"
+keywords = ["aws", "ssm", "session-manager", "async"]
+categories = ["network-programming", "asynchronous"]
+readme = "README.md"
+
+[lib]
+name = "aws_ssm_bridge"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["interactive"]
+# Core features
+# interactive = terminal handling for interactive shells
+interactive = []
+# python = Python bindings via PyO3
+python = ["dep:pyo3", "dep:pyo3-asyncio", "dep:tracing-subscriber"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# AWS SDK (with SSO/login support)
+aws-config = { version = "1.5", features = ["behavior-version-latest", "sso", "credentials-login"] }
+aws-sdk-ssm = "1.45"
+aws-smithy-types = "1.2"
+aws-smithy-runtime-api = "1.7"
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tungstenite = "0.24"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+# Utilities
+bytes = "1.7"
+futures = "0.3"
+pin-project-lite = "0.2"
+base64 = "0.22"
+sha2 = "0.10"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+rand = "0.8"
+url = "2.5"  # URL parsing and validation
+
+# Terminal handling
+crossterm = "0.28"
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+
+# Python bindings (optional)
+pyo3 = { version = "0.20", features = ["extension-module", "abi3-py38"], optional = true }
+pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"], optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+mockall = "0.13"
+tokio-test = "0.4"
+futures-util = "0.3"
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+proptest = "1.4"
+test-case = "3.3"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Only enable useful lints, disable overly pedantic ones
+# Correctness
+all = { level = "warn", priority = -1 }
+# Style improvements (selective)
+unnested_or_patterns = "allow"
+match_same_arms = "allow"
+redundant_else = "allow"
+# Pedantic (disable most, too noisy for production code)
+pedantic = { level = "allow", priority = -1 }
+# Nursery (disable, unstable)
+nursery = { level = "allow", priority = -1 }

@@ -1,0 +1,38 @@
+[package]
+name = "aws-ssm-bridge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1.7"
+serde_json = "1.0"
+
+[dependencies.aws-ssm-bridge]
+path = ".."
+
+[[bin]]
+name = "fuzz_binary_protocol"
+path = "fuzz_targets/binary_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_json_messages"
+path = "fuzz_targets/json_messages.rs"
+test = false
+doc = false
+bench = false
