@@ -1,0 +1,9 @@
+# Linker configuration for PyO3 Python extensions on macOS
+# Python extensions should NOT statically link against libpython.
+# These symbols are resolved at runtime when Python loads the extension.
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-args=-undefined dynamic_lookup"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-args=-undefined dynamic_lookup"]
