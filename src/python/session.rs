@@ -155,7 +155,11 @@ impl PySession {
     /// Blocks until the session is ready or timeout expires.
     /// Call this after start_session() before sending data.
     #[pyo3(signature = (timeout_secs = 30.0))]
-    fn wait_for_ready<'py>(&self, py: Python<'py>, timeout_secs: f64) -> PyResult<Bound<'py, PyAny>> {
+    fn wait_for_ready<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_secs: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let timeout = std::time::Duration::from_secs_f64(timeout_secs);
@@ -333,7 +337,11 @@ impl PySessionManager {
     }
 
     /// Terminate a session by ID
-    fn terminate_session<'py>(&self, py: Python<'py>, session_id: String) -> PyResult<Bound<'py, PyAny>> {
+    fn terminate_session<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let manager = Arc::clone(&self.inner);
 
         future_into_py(py, async move {

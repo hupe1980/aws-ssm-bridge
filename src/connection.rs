@@ -133,7 +133,10 @@ pub enum ManagerCommand {
     /// Send data to stdin (uses PayloadType::Output)
     SendData(Bytes),
     /// Send a message with specific payload type
-    SendMessage { data: Bytes, payload_type: crate::binary_protocol::PayloadType },
+    SendMessage {
+        data: Bytes,
+        payload_type: crate::binary_protocol::PayloadType,
+    },
     /// Terminate connection
     Terminate,
 }
