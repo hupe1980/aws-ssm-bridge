@@ -99,11 +99,6 @@ impl ChannelMultiplexer {
         self.closed.store(true, Ordering::SeqCst);
     }
 
-    /// Check if the channel is closed
-    pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
-    }
-
     /// Send output data to all subscribed output streams
     /// Returns Ok if at least one receiver exists, Err if no receivers
     pub async fn send_output(&self, data: Bytes) -> Result<()> {

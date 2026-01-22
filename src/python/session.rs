@@ -273,6 +273,7 @@ pub struct PySessionManager {
 impl PySessionManager {
     /// Create a new session manager
     #[staticmethod]
+    #[allow(clippy::new_ret_no_self)]
     fn new(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         future_into_py(py, async move {
             let manager = SessionManager::new().await.map_err(to_py_err)?;
@@ -284,6 +285,7 @@ impl PySessionManager {
 
     /// Start a new SSM session
     #[pyo3(signature = (target, region=None, session_type=None, document_name=None, parameters=None, reason=None))]
+    #[allow(clippy::too_many_arguments)]
     fn start_session<'py>(
         &self,
         py: Python<'py>,
