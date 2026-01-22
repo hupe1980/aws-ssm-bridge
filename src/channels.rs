@@ -3,6 +3,7 @@
 use bytes::Bytes;
 use futures::Stream;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::{broadcast, RwLock};
@@ -14,11 +15,12 @@ use crate::errors::Result;
 /// Uses broadcast receiver to allow multiple consumers
 pub struct OutputStream {
     rx: broadcast::Receiver<Bytes>,
+    closed: Arc<AtomicBool>,
 }
 
 impl OutputStream {
-    fn new(rx: broadcast::Receiver<Bytes>) -> Self {
-        Self { rx }
+    fn new(rx: broadcast::Receiver<Bytes>, closed: Arc<AtomicBool>) -> Self {
+        Self { rx, closed }
     }
 }
 
@@ -26,9 +28,18 @@ impl Stream for OutputStream {
     type Item = Bytes;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Check if channel was explicitly closed
+        if self.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(None);
+        }
+
         match self.rx.try_recv() {
             Ok(item) => Poll::Ready(Some(item)),
             Err(broadcast::error::TryRecvError::Empty) => {
+                // Check again after try_recv in case it was closed
+                if self.closed.load(Ordering::SeqCst) {
+                    return Poll::Ready(None);
+                }
                 // Register waker for when data is available
                 // Note: broadcast doesn't have poll_recv, so we use a workaround
                 // In production, consider using tokio_stream::wrappers::BroadcastStream
@@ -53,6 +64,9 @@ pub struct ChannelMultiplexer {
     /// Allows multiple consumers to subscribe to output
     output_tx: broadcast::Sender<Bytes>,
 
+    /// Flag to signal channel closure
+    closed: Arc<AtomicBool>,
+
     /// Sequence number counter for outgoing messages
     #[allow(dead_code)] // Reserved for future message sequencing integration
     sequence_counter: Arc<RwLock<i64>>,
@@ -68,6 +82,7 @@ impl ChannelMultiplexer {
 
         Self {
             output_tx,
+            closed: Arc::new(AtomicBool::new(false)),
             sequence_counter: Arc::new(RwLock::new(0)),
         }
     }
@@ -75,7 +90,18 @@ impl ChannelMultiplexer {
     /// Create an output stream that receives broadcasted data
     /// Each call creates a new subscriber to the broadcast channel
     pub fn output_stream(&self) -> OutputStream {
-        OutputStream::new(self.output_tx.subscribe())
+        OutputStream::new(self.output_tx.subscribe(), Arc::clone(&self.closed))
+    }
+
+    /// Close the output channel, causing all output streams to return None
+    pub fn close(&self) {
+        debug!("Closing channel multiplexer");
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// Check if the channel is closed
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// Send output data to all subscribed output streams

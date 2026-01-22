@@ -6,8 +6,10 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::binary_protocol::PayloadType;
 use crate::errors::{Error, Result, SessionError};
 use crate::protocol::SessionType;
+use crate::terminal::TerminalSize;
 use crate::{
     channels::ChannelMultiplexer,
     connection::{ConnectionManager, ManagerCommand},
@@ -226,6 +228,33 @@ impl Session {
 
         self.command_tx
             .send(ManagerCommand::SendData(data))
+            .map_err(|_| Error::InvalidState("Session command channel closed".to_string()))?;
+
+        Ok(())
+    }
+
+    /// Send terminal size to the session
+    ///
+    /// This sends a control message with PayloadType::Size to inform the
+    /// remote agent of the terminal dimensions.
+    pub async fn send_size(&self, size: TerminalSize) -> Result<()> {
+        let state = self.state().await;
+        if !state.can_send() {
+            return Err(SessionError::InvalidState {
+                expected: "Connected".to_string(),
+                actual: format!("{:?}", state),
+            }
+            .into());
+        }
+
+        let data = size.to_json()?;
+        debug!(cols = size.cols, rows = size.rows, "Sending terminal size");
+
+        self.command_tx
+            .send(ManagerCommand::SendMessage {
+                data,
+                payload_type: PayloadType::Size,
+            })
             .map_err(|_| Error::InvalidState("Session command channel closed".to_string()))?;
 
         Ok(())

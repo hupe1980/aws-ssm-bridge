@@ -16,6 +16,11 @@
 		}
 	},
 
+	// Mount AWS credentials from host
+	"mounts": [
+		"source=${localEnv:HOME}/.aws,target=/home/vscode/.aws,type=bind,consistency=cached"
+	],
+
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	"forwardPorts": [9050, 4000],
 

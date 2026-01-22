@@ -130,8 +130,10 @@ pub struct ConnectionManager {
 /// Commands sent to the connection manager
 #[derive(Debug)]
 pub enum ManagerCommand {
-    /// Send data to stdin
+    /// Send data to stdin (uses PayloadType::Output)
     SendData(Bytes),
+    /// Send a message with specific payload type
+    SendMessage { data: Bytes, payload_type: crate::binary_protocol::PayloadType },
     /// Terminate connection
     Terminate,
 }
@@ -276,7 +278,23 @@ impl ConnectionManager {
                         ManagerCommand::SendData(data) => {
                             debug!(len = data.len(), "Processing SendData command");
                             if let Err(e) = self.send_data(data).await {
-                                error!(error = ?e, "Failed to send data");
+                                // Downgrade to debug for shutdown-related errors
+                                if e.to_string().contains("closing") || e.to_string().contains("closed") {
+                                    debug!(error = ?e, "Send failed (connection closing)");
+                                } else {
+                                    error!(error = ?e, "Failed to send data");
+                                }
+                            }
+                        }
+                        ManagerCommand::SendMessage { data, payload_type } => {
+                            debug!(len = data.len(), ?payload_type, "Processing SendMessage command");
+                            if let Err(e) = self.send_message(data, payload_type).await {
+                                // Downgrade to debug for shutdown-related errors
+                                if e.to_string().contains("closing") || e.to_string().contains("closed") {
+                                    debug!(error = ?e, "Send failed (connection closing)");
+                                } else {
+                                    error!(error = ?e, "Failed to send message");
+                                }
                             }
                         }
                         ManagerCommand::Terminate => {
@@ -427,6 +445,7 @@ impl ConnectionManager {
                             }
                             Some(Ok(Message::Close(frame))) => {
                                 info!(?frame, "WebSocket close frame received");
+                                channels.close();
                                 break;
                             }
                             Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {
@@ -434,10 +453,12 @@ impl ConnectionManager {
                             }
                             Some(Err(e)) => {
                                 error!(error = ?e, "WebSocket error");
+                                channels.close();
                                 break;
                             }
                             None => {
                                 info!("WebSocket stream ended");
+                                channels.close();
                                 break;
                             }
                         }
@@ -590,6 +611,60 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// Send a message with a specific payload type
+    ///
+    /// Used for control messages like terminal size that need specific PayloadType.
+    async fn send_message(&self, data: Bytes, payload_type: PayloadType) -> Result<()> {
+        let sequence = self
+            .sequence
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // Create binary protocol message with specified payload type
+        let msg = ClientMessage::new(
+            MessageType::InputStreamData,
+            sequence,
+            payload_type,
+            data.clone(),
+        );
+
+        // Serialize to binary
+        let msg_bytes = msg.serialize()?;
+
+        // Validate message size
+        if msg_bytes.len() > MAX_MESSAGE_SIZE {
+            return Err(Error::InvalidState(format!(
+                "Message too large: {} bytes (max: {})",
+                msg_bytes.len(),
+                MAX_MESSAGE_SIZE
+            )));
+        }
+
+        // Send via writer
+        {
+            let mut writer = self.writer.lock().await;
+            writer
+                .send(Message::Binary(msg_bytes.to_vec()))
+                .await
+                .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+        }
+
+        // Record send metrics
+        metrics::counter(MetricNames::MESSAGES_SENT, 1, &[]);
+        metrics::counter(MetricNames::BYTES_SENT, msg_bytes.len() as u64, &[]);
+
+        // Track in OutgoingMessageBuffer for reliable delivery
+        self.outgoing_buffer.add(msg_bytes, sequence).await;
+
+        debug!(
+            sequence,
+            ?payload_type,
+            len = data.len(),
+            "Sent message (tracked for ACK)"
+        );
+
+        Ok(())
+    }
+
     /// Route incoming message to appropriate channel
     ///
     /// Handles modern agents with handshake protocol.
@@ -736,6 +811,8 @@ impl ConnectionManager {
                         info!(exit_info = %exit_info, "Channel close info");
                     }
                 }
+                // Close the output channel to signal consumers
+                channels.close();
             }
             "start_publication" => {
                 info!("Received start_publication - ready to send data");

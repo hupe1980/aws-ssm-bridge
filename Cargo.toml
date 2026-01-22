@@ -22,7 +22,7 @@ default = ["interactive"]
 # interactive = terminal handling for interactive shells
 interactive = []
 # python = Python bindings via PyO3
-python = ["dep:pyo3", "dep:pyo3-asyncio", "dep:tracing-subscriber"]
+python = ["dep:pyo3", "dep:pyo3-async-runtimes", "dep:tracing-subscriber"]
 
 [dependencies]
 # Async runtime
@@ -67,8 +67,8 @@ signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 
 # Python bindings (optional)
-pyo3 = { version = "0.20", features = ["extension-module", "abi3-py38"], optional = true }
-pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"], optional = true }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"], optional = true }
+pyo3-async-runtimes = { version = "0.24", features = ["tokio-runtime"], optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -78,6 +78,25 @@ futures-util = "0.3"
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 proptest = "1.4"
 test-case = "3.3"
+
+[[example]]
+name = "interactive_shell"
+required-features = ["interactive"]
+
+[[example]]
+name = "metrics_session"
+
+[[example]]
+name = "port_forwarding"
+
+[[example]]
+name = "reconnecting"
+
+[[example]]
+name = "session_pool"
+
+[[example]]
+name = "shell_session"
 
 [[bench]]
 name = "throughput"

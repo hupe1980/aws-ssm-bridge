@@ -36,9 +36,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use tracing::{debug, info, instrument, trace};
 
-use crate::binary_protocol::{ClientMessage, PayloadType};
 use crate::errors::{Error, Result};
-use crate::protocol::MessageType;
 use crate::session::{Session, SessionConfig, SessionState};
 use crate::terminal::{ControlSignal, Terminal, TerminalConfig, TerminalInput};
 use crate::SessionManager;
@@ -125,19 +123,7 @@ impl InteractiveShell {
     /// Send terminal size to session
     async fn send_size_to_session(session: &Session, terminal: &Terminal) -> Result<()> {
         let size = terminal.size();
-        let payload = size.to_json()?;
-
-        debug!(cols = size.cols, rows = size.rows, "Sending terminal size");
-
-        // Create size message with PayloadType::Size
-        let message = ClientMessage::new(
-            MessageType::InputStreamData,
-            0, // Sequence number managed by session
-            PayloadType::Size,
-            payload,
-        );
-
-        session.send(message.serialize()?).await
+        session.send_size(size).await
     }
 
     /// Send current terminal size to remote

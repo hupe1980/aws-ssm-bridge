@@ -2,7 +2,7 @@
 
 use crate::interactive::{InteractiveConfig, InteractiveShell};
 use pyo3::prelude::*;
-use pyo3_asyncio::tokio::future_into_py;
+use pyo3_async_runtimes::tokio::future_into_py;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -106,7 +106,7 @@ impl PyInteractiveShell {
     ///
     /// Raises:
     ///     RuntimeError: If connection fails or already connected
-    fn connect<'py>(&self, py: Python<'py>, target: String) -> PyResult<&'py PyAny> {
+    fn connect<'py>(&self, py: Python<'py>, target: String) -> PyResult<Bound<'py, PyAny>> {
         let shell = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let mut guard = shell.lock().await;
@@ -127,7 +127,7 @@ impl PyInteractiveShell {
     ///
     /// The terminal is automatically restored to its original state on exit,
     /// even if an error or panic occurs.
-    fn run<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let shell = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let mut guard = shell.lock().await;
@@ -140,7 +140,7 @@ impl PyInteractiveShell {
     }
 
     /// Check if connected to an instance
-    fn is_connected<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn is_connected<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let shell = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let guard = shell.lock().await;
@@ -167,7 +167,7 @@ impl PyInteractiveShell {
 ///     >>> asyncio.run(run_shell("i-0123456789abcdef0"))
 #[pyfunction]
 #[pyo3(name = "run_shell")]
-fn py_run_shell(py: Python<'_>, target: String) -> PyResult<&PyAny> {
+fn py_run_shell(py: Python<'_>, target: String) -> PyResult<Bound<'_, PyAny>> {
     future_into_py(py, async move {
         crate::interactive::run_shell(&target)
             .await
@@ -177,7 +177,7 @@ fn py_run_shell(py: Python<'_>, target: String) -> PyResult<&PyAny> {
 }
 
 /// Get the run_shell function and classes for registration
-pub fn register(m: &PyModule) -> PyResult<()> {
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyInteractiveConfig>()?;
     m.add_class::<PyInteractiveShell>()?;
     m.add_function(wrap_pyfunction!(py_run_shell, m)?)?;

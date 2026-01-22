@@ -13,7 +13,7 @@ use session::{PyOutputStream, PySession, PySessionConfig, PySessionManager, PySe
 
 /// Initialize the Python module
 #[pymodule]
-fn _internal(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize tracing subscriber for logging
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

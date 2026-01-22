@@ -2,7 +2,7 @@
 
 use crate::{SessionConfig, SessionManager, SessionState, SessionType};
 use pyo3::prelude::*;
-use pyo3_asyncio::tokio::future_into_py;
+use pyo3_async_runtimes::tokio::future_into_py;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -114,7 +114,7 @@ pub struct PySession {
 impl PySession {
     /// Get session ID
     #[getter]
-    fn id<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn id<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let session_guard = session.lock().await;
@@ -123,7 +123,7 @@ impl PySession {
     }
 
     /// Get session state
-    fn state<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let session_guard = session.lock().await;
@@ -142,7 +142,7 @@ impl PySession {
     ///
     /// The session is ready once the SSM agent has completed the handshake
     /// and sent the start_publication message.
-    fn is_ready<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn is_ready<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let session_guard = session.lock().await;
@@ -155,7 +155,7 @@ impl PySession {
     /// Blocks until the session is ready or timeout expires.
     /// Call this after start_session() before sending data.
     #[pyo3(signature = (timeout_secs = 30.0))]
-    fn wait_for_ready<'py>(&self, py: Python<'py>, timeout_secs: f64) -> PyResult<&'py PyAny> {
+    fn wait_for_ready<'py>(&self, py: Python<'py>, timeout_secs: f64) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let timeout = std::time::Duration::from_secs_f64(timeout_secs);
@@ -171,7 +171,7 @@ impl PySession {
     /// Example:
     ///     async for chunk in session.output():
     ///         print(chunk.decode())
-    fn output<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn output<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let session_guard = session.lock().await;
@@ -183,7 +183,7 @@ impl PySession {
     }
 
     /// Send data to the session
-    fn send<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<&'py PyAny> {
+    fn send<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let session_guard = session.lock().await;
@@ -196,7 +196,7 @@ impl PySession {
     }
 
     /// Terminate the session
-    fn terminate<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn terminate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let mut session_guard = session.lock().await;
@@ -206,7 +206,7 @@ impl PySession {
     }
 
     /// Wait for session to terminate
-    fn wait_terminated<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn wait_terminated<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let session_guard = session.lock().await;
@@ -223,7 +223,7 @@ impl PySession {
     ///     await session.send(b"ls\n")
     /// # Session automatically terminated
     /// ```
-    fn __aenter__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn __aenter__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&slf.inner);
         future_into_py(py, async move {
             // Wait for ready with default timeout
@@ -241,10 +241,10 @@ impl PySession {
     fn __aexit__<'py>(
         &self,
         py: Python<'py>,
-        _exc_type: Option<&PyAny>,
-        _exc_val: Option<&PyAny>,
-        _exc_tb: Option<&PyAny>,
-    ) -> PyResult<&'py PyAny> {
+        _exc_type: Option<Bound<'_, PyAny>>,
+        _exc_val: Option<Bound<'_, PyAny>>,
+        _exc_tb: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let mut session_guard = session.lock().await;
@@ -269,7 +269,7 @@ pub struct PySessionManager {
 impl PySessionManager {
     /// Create a new session manager
     #[staticmethod]
-    fn new(py: Python<'_>) -> PyResult<&PyAny> {
+    fn new(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         future_into_py(py, async move {
             let manager = SessionManager::new().await.map_err(to_py_err)?;
             Ok(PySessionManager {
@@ -289,7 +289,7 @@ impl PySessionManager {
         document_name: Option<String>,
         parameters: Option<HashMap<String, Vec<String>>>,
         reason: Option<String>,
-    ) -> PyResult<&'py PyAny> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let manager = Arc::clone(&self.inner);
 
         // Parse session type
@@ -333,7 +333,7 @@ impl PySessionManager {
     }
 
     /// Terminate a session by ID
-    fn terminate_session<'py>(&self, py: Python<'py>, session_id: String) -> PyResult<&'py PyAny> {
+    fn terminate_session<'py>(&self, py: Python<'py>, session_id: String) -> PyResult<Bound<'py, PyAny>> {
         let manager = Arc::clone(&self.inner);
 
         future_into_py(py, async move {
@@ -367,7 +367,7 @@ impl PyOutputStream {
     /// Get next chunk of output
     ///
     /// Returns the next bytes from the stream, or raises StopAsyncIteration when exhausted.
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Option<&'py PyAny>> {
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
         use futures::StreamExt;
         use pyo3::exceptions::PyStopAsyncIteration;
 
