@@ -72,13 +72,13 @@ impl PyInteractiveConfig {
 ///
 /// Example:
 ///     >>> from aws_ssm_bridge import InteractiveShell, InteractiveConfig
-///     >>> 
+///     >>>
 ///     >>> async def main():
 ///     ...     config = InteractiveConfig.default()
 ///     ...     shell = InteractiveShell(config)
 ///     ...     await shell.connect("i-0123456789abcdef0")
 ///     ...     await shell.run()  # Blocks until Ctrl+D or session closes
-///     >>> 
+///     >>>
 ///     >>> import asyncio
 ///     >>> asyncio.run(main())
 #[pyclass(name = "InteractiveShell")]
@@ -110,9 +110,9 @@ impl PyInteractiveShell {
         let shell = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let mut guard = shell.lock().await;
-            let shell = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Shell already consumed"))?;
+            let shell = guard.as_mut().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("Shell already consumed")
+            })?;
             shell.connect(&target).await.map_err(to_py_err)?;
             Ok(())
         })
@@ -131,9 +131,9 @@ impl PyInteractiveShell {
         let shell = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let mut guard = shell.lock().await;
-            let shell = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Shell already consumed"))?;
+            let shell = guard.as_mut().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("Shell already consumed")
+            })?;
             shell.run().await.map_err(to_py_err)?;
             Ok(())
         })
@@ -169,7 +169,9 @@ impl PyInteractiveShell {
 #[pyo3(name = "run_shell")]
 fn py_run_shell(py: Python<'_>, target: String) -> PyResult<&PyAny> {
     future_into_py(py, async move {
-        crate::interactive::run_shell(&target).await.map_err(to_py_err)?;
+        crate::interactive::run_shell(&target)
+            .await
+            .map_err(to_py_err)?;
         Ok(())
     })
 }

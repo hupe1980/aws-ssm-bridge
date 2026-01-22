@@ -54,9 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Option 2: Full control with custom configuration
     let config = InteractiveConfig {
-        show_banner: true,         // Show session ID on connect
-        send_initial_size: true,   // Send terminal dimensions on connect
-        forward_signals: true,     // Forward Ctrl+C/Z to remote
+        show_banner: true,       // Show session ID on connect
+        send_initial_size: true, // Send terminal dimensions on connect
+        forward_signals: true,   // Forward Ctrl+C/Z to remote
         ..Default::default()
     };
 
