@@ -63,8 +63,6 @@ url = "2.5"  # URL parsing and validation
 
 # Terminal handling
 crossterm = "0.28"
-signal-hook = "0.3"
-signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 
 # Python bindings (optional)
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"], optional = true }
