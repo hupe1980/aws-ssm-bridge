@@ -40,7 +40,7 @@ Unlike the [official AWS Session Manager Plugin](https://github.com/aws/session-
 
 ```toml
 [dependencies]
-aws-ssm-bridge = "0.1"
+aws-ssm-bridge = "0.3"
 tokio = { version = "1", features = ["full"] }
 ```
 

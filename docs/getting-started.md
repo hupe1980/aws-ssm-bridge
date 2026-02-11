@@ -42,7 +42,7 @@ nav_order: 2
 
 ```toml
 [dependencies]
-aws-ssm-bridge = "0.1"
+aws-ssm-bridge = "0.3"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -136,7 +136,7 @@ let config = SessionConfig {
 
 ```toml
 [dependencies]
-aws-ssm-bridge = { version = "0.1", default-features = false, features = ["interactive"] }
+aws-ssm-bridge = { version = "0.3", default-features = false, features = ["interactive"] }
 ```
 
 | Feature | Description | Default |
