@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -113,6 +113,15 @@ pub struct Session {
 
     /// Publication state from connection manager (protocol-level can_send)
     protocol_can_send: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Notified when protocol becomes ready (start_publication / handshake complete)
+    ready_notify: Arc<Notify>,
+
+    /// Notified when session transitions to Terminated
+    terminated_notify: Arc<Notify>,
+
+    /// SSM client for API-side termination (optional — None for bare connections)
+    ssm_client: Option<Arc<aws_sdk_ssm::Client>>,
 }
 
 impl Session {
@@ -122,16 +131,25 @@ impl Session {
         config: SessionConfig,
         stream_url: String,
         token_value: String,
+        ssm_client: Option<Arc<aws_sdk_ssm::Client>>,
     ) -> Result<Self> {
         info!(session_id = %session_id, "Creating new session");
 
         // Create command channel
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
+        // Create Notify for ready signaling
+        let ready_notify = Arc::new(Notify::new());
+
         // Create connection manager
-        let manager =
-            ConnectionManager::connect(session_id.clone(), stream_url, token_value, command_rx)
-                .await?;
+        let manager = ConnectionManager::connect(
+            session_id.clone(),
+            stream_url,
+            token_value,
+            command_rx,
+            Arc::clone(&ready_notify),
+        )
+        .await?;
 
         // Get channels and can_send state before moving manager
         let channels = manager.channels();
@@ -148,6 +166,9 @@ impl Session {
             channels,
             manager_task: Some(manager_task),
             protocol_can_send,
+            ready_notify,
+            terminated_notify: Arc::new(Notify::new()),
+            ssm_client,
         };
 
         // Transition to connected state
@@ -182,20 +203,23 @@ impl Session {
     /// This should be called before sending data to ensure the agent is ready.
     /// Returns `true` if ready, `false` if timeout expired.
     pub async fn wait_for_ready(&self, timeout: std::time::Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let check_interval = std::time::Duration::from_millis(100);
-
-        while tokio::time::Instant::now() < deadline {
-            if self
-                .protocol_can_send
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return true;
-            }
-            tokio::time::sleep(check_interval).await;
+        // Fast path: already ready
+        if self
+            .protocol_can_send
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return true;
         }
 
-        false
+        // Wait for notification or timeout
+        match tokio::time::timeout(timeout, self.ready_notify.notified()).await {
+            Ok(_) => true,
+            Err(_) => {
+                // Timeout — check once more (notification may have raced)
+                self.protocol_can_send
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
     }
 
     /// Update session state
@@ -208,6 +232,9 @@ impl Session {
             "Session state transition"
         );
         *state = new_state;
+        if new_state == SessionState::Terminated {
+            self.terminated_notify.notify_waiters();
+        }
     }
 
     /// Get output stream for reading stdout/stderr
@@ -261,6 +288,8 @@ impl Session {
     }
 
     /// Terminate the session
+    ///
+    /// Terminates both the WebSocket connection and the AWS-side session.
     pub async fn terminate(&mut self) -> Result<()> {
         info!(session_id = %self.session_id, "Terminating session");
 
@@ -279,6 +308,20 @@ impl Session {
             }
         }
 
+        // Terminate on AWS side (best-effort)
+        if let Some(ref client) = self.ssm_client {
+            if let Err(e) = client
+                .terminate_session()
+                .session_id(&self.session_id)
+                .send()
+                .await
+            {
+                warn!(error = ?e, "Failed to terminate session via AWS API (best-effort)");
+            } else {
+                debug!("Session terminated via AWS API");
+            }
+        }
+
         self.set_state(SessionState::Terminated).await;
 
         Ok(())
@@ -286,13 +329,11 @@ impl Session {
 
     /// Wait for session to terminate
     pub async fn wait_terminated(&self) {
-        loop {
-            let state = self.state().await;
-            if state == SessionState::Terminated {
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Fast path
+        if *self.state.read().await == SessionState::Terminated {
+            return;
         }
+        self.terminated_notify.notified().await;
     }
 }
 
@@ -345,6 +386,14 @@ impl SessionManager {
         // Validate configuration
         if config.target.is_empty() {
             return Err(Error::Config("Target cannot be empty".to_string()));
+        }
+
+        // Validate target format (instance-id, mi-id, or ECS target)
+        if !Self::is_valid_target(&config.target) {
+            return Err(Error::Config(format!(
+                "Invalid target format: '{}'. Expected i-xxx, mi-xxx, or ARN",
+                config.target
+            )));
         }
 
         // Determine document name based on session type
@@ -405,7 +454,14 @@ impl SessionManager {
         info!(session_id = %session_id, "SSM session started");
 
         // Create session with actual connection
-        let session = Session::new(session_id, config, stream_url, token_value).await?;
+        let session = Session::new(
+            session_id,
+            config,
+            stream_url,
+            token_value,
+            Some(Arc::clone(&self.ssm_client)),
+        )
+        .await?;
 
         Ok(session)
     }
@@ -426,6 +482,27 @@ impl SessionManager {
 
         Ok(())
     }
+
+    /// Validate target format.
+    ///
+    /// Accepted formats:
+    /// - EC2 instance ID: `i-<hex17>`
+    /// - Managed instance: `mi-<hex17>`
+    /// - ARN (ECS tasks, etc.): `arn:aws:...`
+    fn is_valid_target(target: &str) -> bool {
+        // Instance IDs: i-0123456789abcdef0 or mi-0123456789abcdef0
+        let is_instance_id = (target.starts_with("i-") || target.starts_with("mi-"))
+            && target.len() >= 10
+            && target
+                .split('-')
+                .next_back()
+                .is_some_and(|hex| hex.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // ARN format: arn:aws:...
+        let is_arn = target.starts_with("arn:aws:");
+
+        is_instance_id || is_arn
+    }
 }
 
 #[cfg(test)]
@@ -445,5 +522,24 @@ mod tests {
         let config = SessionConfig::default();
         assert_eq!(config.session_type, SessionType::StandardStream);
         assert!(config.document_name.is_none());
+    }
+
+    #[test]
+    fn test_valid_targets() {
+        assert!(SessionManager::is_valid_target("i-1234567890abcdef0"));
+        assert!(SessionManager::is_valid_target("mi-1234567890abcdef0"));
+        assert!(SessionManager::is_valid_target(
+            "arn:aws:ecs:us-east-1:123456789012:task/my-cluster/abc123"
+        ));
+    }
+
+    #[test]
+    fn test_invalid_targets() {
+        assert!(!SessionManager::is_valid_target(""));
+        assert!(!SessionManager::is_valid_target("foobar"));
+        assert!(!SessionManager::is_valid_target("i-"));
+        assert!(!SessionManager::is_valid_target("x-1234567890abcdef0"));
+        assert!(!SessionManager::is_valid_target("../../etc/passwd"));
+        assert!(!SessionManager::is_valid_target("i-ZZZZ"));
     }
 }

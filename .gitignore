@@ -21,5 +21,13 @@ target
 #.idea/
 
 # custom
+_prompts/
+BACKLOG*.md
+CONCEPT.md
 FINDINGS.md
 .venv/
+
+# Maturin build artifacts
+*.so
+*.pyd
+*.dylib

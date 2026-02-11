@@ -134,7 +134,6 @@ pub mod names {
 
 /// Increment a counter if metrics are registered.
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn counter(name: &str, value: u64, labels: &[(&str, &str)]) {
     if let Some(m) = get_metrics() {
         m.increment_counter(name, value, labels);
@@ -143,7 +142,6 @@ pub(crate) fn counter(name: &str, value: u64, labels: &[(&str, &str)]) {
 
 /// Set a gauge if metrics are registered.
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn gauge(name: &str, value: f64, labels: &[(&str, &str)]) {
     if let Some(m) = get_metrics() {
         m.set_gauge(name, value, labels);
@@ -152,7 +150,6 @@ pub(crate) fn gauge(name: &str, value: f64, labels: &[(&str, &str)]) {
 
 /// Record a histogram value if metrics are registered.
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn histogram(name: &str, value: f64, labels: &[(&str, &str)]) {
     if let Some(m) = get_metrics() {
         m.record_histogram(name, value, labels);
@@ -161,7 +158,6 @@ pub(crate) fn histogram(name: &str, value: f64, labels: &[(&str, &str)]) {
 
 /// Record a timing if metrics are registered.
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn timing(name: &str, duration: Duration, labels: &[(&str, &str)]) {
     if let Some(m) = get_metrics() {
         m.record_timing(name, duration, labels);

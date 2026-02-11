@@ -47,6 +47,7 @@ from ._internal import (
     InteractiveShell,
     InteractiveConfig,
     run_shell,
+    configure_logging,
     __version__,
 )
 
@@ -101,6 +102,7 @@ __all__ = [
     "InteractiveShell",
     "InteractiveConfig",
     "run_shell",
+    "configure_logging",
     "connect",
     "__version__",
 ]

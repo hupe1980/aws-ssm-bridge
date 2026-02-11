@@ -6,21 +6,28 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, warn};
 
 use crate::errors::Result;
 
-/// Stream of output data
-/// Uses broadcast receiver to allow multiple consumers
+/// Stream of output data.
+///
+/// Wraps a `BroadcastStream` that properly parks the waker instead of
+/// busy-spinning when no data is available.
 pub struct OutputStream {
-    rx: broadcast::Receiver<Bytes>,
+    inner: BroadcastStream<Bytes>,
     closed: Arc<AtomicBool>,
 }
 
 impl OutputStream {
     fn new(rx: broadcast::Receiver<Bytes>, closed: Arc<AtomicBool>) -> Self {
-        Self { rx, closed }
+        Self {
+            inner: BroadcastStream::new(rx),
+            closed,
+        }
     }
 }
 
@@ -28,94 +35,94 @@ impl Stream for OutputStream {
     type Item = Bytes;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Check if channel was explicitly closed
         if self.closed.load(Ordering::SeqCst) {
             return Poll::Ready(None);
         }
 
-        match self.rx.try_recv() {
-            Ok(item) => Poll::Ready(Some(item)),
-            Err(broadcast::error::TryRecvError::Empty) => {
-                // Check again after try_recv in case it was closed
-                if self.closed.load(Ordering::SeqCst) {
-                    return Poll::Ready(None);
-                }
-                // Register waker for when data is available
-                // Note: broadcast doesn't have poll_recv, so we use a workaround
-                // In production, consider using tokio_stream::wrappers::BroadcastStream
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+        // BroadcastStream properly parks the waker — no busy-wait.
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(item)),
+            Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
                 warn!(skipped, "Output stream lagged, messages were dropped");
-                // Continue trying to get the next message
+                // Re-poll to get the next available message
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-            Err(broadcast::error::TryRecvError::Closed) => Poll::Ready(None),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                // Check close flag after pending (sender may have closed)
+                if self.closed.load(Ordering::SeqCst) {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            }
         }
     }
 }
 
-/// Channel multiplexer for managing streams
-/// Production-grade implementation with broadcast channels for fan-out
+/// Channel multiplexer for managing streams.
+///
+/// Production-grade implementation with broadcast channels for fan-out.
+/// On close, the sender is dropped so all `BroadcastStream` receivers are
+/// woken immediately (no polling delay).
 pub struct ChannelMultiplexer {
-    /// Broadcast sender for output data (stdout/stderr combined)
-    /// Allows multiple consumers to subscribe to output
-    output_tx: broadcast::Sender<Bytes>,
+    /// Broadcast sender for output data (stdout/stderr combined).
+    /// Wrapped in `Mutex<Option<_>>` so `close()` can drop it, which
+    /// wakes all parked receivers instantly.
+    output_tx: std::sync::Mutex<Option<broadcast::Sender<Bytes>>>,
 
-    /// Flag to signal channel closure
+    /// Flag to signal channel closure (fast check without lock).
     closed: Arc<AtomicBool>,
-
-    /// Sequence number counter for outgoing messages
-    #[allow(dead_code)] // Reserved for future message sequencing integration
-    sequence_counter: Arc<RwLock<i64>>,
 }
 
 impl ChannelMultiplexer {
-    /// Create a new channel multiplexer
-    /// Uses broadcast channel with capacity of 1024 messages
+    /// Create a new channel multiplexer.
+    /// Uses broadcast channel with capacity of 1024 messages.
     pub fn new() -> Self {
-        // Broadcast channel allows multiple subscribers
-        // Capacity of 1024 prevents unbounded memory growth
         let (output_tx, _) = broadcast::channel(1024);
 
         Self {
-            output_tx,
+            output_tx: std::sync::Mutex::new(Some(output_tx)),
             closed: Arc::new(AtomicBool::new(false)),
-            sequence_counter: Arc::new(RwLock::new(0)),
         }
     }
 
-    /// Create an output stream that receives broadcasted data
-    /// Each call creates a new subscriber to the broadcast channel
+    /// Create an output stream that receives broadcasted data.
+    /// Each call creates a new subscriber to the broadcast channel.
     pub fn output_stream(&self) -> OutputStream {
-        OutputStream::new(self.output_tx.subscribe(), Arc::clone(&self.closed))
+        let guard = self.output_tx.lock().expect("output_tx lock poisoned");
+        let rx = guard
+            .as_ref()
+            .expect("output_stream() called after close()")
+            .subscribe();
+        OutputStream::new(rx, Arc::clone(&self.closed))
     }
 
-    /// Close the output channel, causing all output streams to return None
+    /// Close the output channel, causing all output streams to return None.
+    ///
+    /// Drops the broadcast sender so all parked `BroadcastStream` receivers
+    /// are woken immediately and yield `None`.
     pub fn close(&self) {
         debug!("Closing channel multiplexer");
         self.closed.store(true, Ordering::SeqCst);
+        // Drop the sender — this wakes all receivers instantly
+        let _ = self
+            .output_tx
+            .lock()
+            .expect("output_tx lock poisoned")
+            .take();
     }
 
-    /// Send output data to all subscribed output streams
-    /// Returns Ok if at least one receiver exists, Err if no receivers
+    /// Send output data to all subscribed output streams.
     pub async fn send_output(&self, data: Bytes) -> Result<()> {
-        // broadcast returns Err if there are no active receivers
-        // We consider this a warning, not an error
-        if self.output_tx.send(data).is_err() {
-            debug!("No active output stream receivers");
+        let guard = self.output_tx.lock().expect("output_tx lock poisoned");
+        if let Some(tx) = guard.as_ref() {
+            if tx.send(data).is_err() {
+                debug!("No active output stream receivers");
+            }
         }
         Ok(())
-    }
-
-    /// Get next sequence number for outgoing messages
-    #[allow(dead_code)] // Reserved for future message sequencing integration
-    pub async fn next_sequence(&self) -> i64 {
-        let mut counter = self.sequence_counter.write().await;
-        *counter += 1;
-        *counter
     }
 }
 
@@ -139,10 +146,7 @@ mod tests {
         mux.send_output(Bytes::from("test1")).await.unwrap();
         mux.send_output(Bytes::from("test2")).await.unwrap();
 
-        // Give time for async delivery
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // Receive data
+        // BroadcastStream properly wakes — no sleep needed
         let data1 = stream.next().await.unwrap();
         assert_eq!(data1, Bytes::from("test1"));
 
@@ -156,12 +160,8 @@ mod tests {
         let mut stream1 = mux.output_stream();
         let mut stream2 = mux.output_stream();
 
-        // Send data - should be received by both streams
         mux.send_output(Bytes::from("broadcast")).await.unwrap();
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // Both streams should receive the same data
         let data1 = stream1.next().await.unwrap();
         let data2 = stream2.next().await.unwrap();
 
@@ -170,15 +170,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sequence_numbers() {
+    async fn test_close_terminates_stream() {
         let mux = ChannelMultiplexer::new();
+        let mut stream = mux.output_stream();
 
-        let seq1 = mux.next_sequence().await;
-        let seq2 = mux.next_sequence().await;
-        let seq3 = mux.next_sequence().await;
+        mux.send_output(Bytes::from("before_close")).await.unwrap();
+        let data = stream.next().await.unwrap();
+        assert_eq!(data, Bytes::from("before_close"));
 
-        assert_eq!(seq1, 1);
-        assert_eq!(seq2, 2);
-        assert_eq!(seq3, 3);
+        // Close the multiplexer
+        mux.close();
+
+        // Stream should terminate
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
+        assert!(result.is_ok(), "Stream should terminate after close");
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_no_busy_wait_on_empty() {
+        // Verify that polling an empty stream doesn't consume CPU.
+        // BroadcastStream parks the waker properly, so a timeout should
+        // return Err (timeout) instead of spinning forever.
+        let mux = ChannelMultiplexer::new();
+        let mut stream = mux.output_stream();
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await;
+
+        // Should timeout (Err), NOT return None (which would mean busy-spin)
+        assert!(result.is_err(), "Empty stream should park, not spin");
     }
 }

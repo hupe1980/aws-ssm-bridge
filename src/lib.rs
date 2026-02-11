@@ -25,7 +25,6 @@
 //! - [`retry`] - Exponential backoff and circuit breaker patterns
 //!
 //! ### Internal Modules (implementation details)
-//! - `aws_client` - AWS SDK integration wrapper
 //! - `connection` - WebSocket connection lifecycle
 //! - `channels` - Channel multiplexing for stdin/stdout/stderr
 //!
@@ -138,7 +137,6 @@ pub mod tracing_ext;
 // Internal Modules (not re-exported)
 // ============================================================================
 
-mod aws_client;
 mod channels;
 mod connection;
 

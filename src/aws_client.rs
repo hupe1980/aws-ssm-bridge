@@ -1,52 +1,33 @@
 //! AWS SSM client wrapper
+//!
+//! Note: Direct SSM API integration currently handled by `SessionManager`
+//! in `session.rs`. This module is reserved for future use cases requiring
+//! a standalone client (e.g., listing sessions, describing instances).
 
 use aws_sdk_ssm::Client;
 use std::sync::Arc;
 
-/// Wrapper around AWS SSM client with additional utilities
-#[allow(dead_code)] // Reserved for future direct SSM API integration
-pub struct SsmClient {
-    /// Internal AWS SDK client
+/// Wrapper around AWS SSM client with additional utilities.
+///
+/// Currently unused — `SessionManager` handles all SSM API calls directly.
+/// Retained for future expansion (instance listing, session enumeration, etc.).
+#[allow(dead_code)]
+pub(crate) struct SsmClient {
     client: Arc<Client>,
 }
 
-#[allow(dead_code)] // Reserved for future direct SSM API integration
+#[allow(dead_code)]
 impl SsmClient {
-    /// Create a new SSM client from AWS config
+    /// Create a new SSM client from AWS config.
     pub fn new(config: &aws_config::SdkConfig) -> Self {
         Self {
             client: Arc::new(Client::new(config)),
         }
     }
 
-    /// Create from default AWS config
-    pub async fn from_env() -> Self {
-        let config = aws_config::load_from_env().await;
-        Self::new(&config)
-    }
-
-    /// Get reference to the underlying AWS SDK client
+    /// Get reference to the underlying AWS SDK client.
     pub fn inner(&self) -> &Client {
         &self.client
-    }
-
-    /// Get Arc clone of the client (for sharing across threads)
-    pub fn clone_client(&self) -> Arc<Client> {
-        Arc::clone(&self.client)
-    }
-}
-
-impl From<Client> for SsmClient {
-    fn from(client: Client) -> Self {
-        Self {
-            client: Arc::new(client),
-        }
-    }
-}
-
-impl From<Arc<Client>> for SsmClient {
-    fn from(client: Arc<Client>) -> Self {
-        Self { client }
     }
 }
 

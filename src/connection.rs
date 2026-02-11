@@ -16,7 +16,8 @@ use futures::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::time::Instant;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -32,6 +33,7 @@ use crate::metrics::{self, names as MetricNames};
 use crate::protocol::MessageType;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::retry::{retry_with_backoff, RetryConfig};
+use zeroize::Zeroize;
 
 /// Maximum message size (10MB) - prevent DoS
 const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -61,6 +63,9 @@ const RETRANSMIT_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// Maximum retransmission attempts (3000 per AWS = 5 minutes / 200ms interval)
 const MAX_RETRANSMIT_ATTEMPTS: u32 = 3000;
 
+/// Maximum consecutive missed pong responses before declaring connection dead
+const MAX_MISSED_PONGS: u32 = 3;
+
 /// Type aliases for split WebSocket streams
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type WsWriter = SplitSink<WsStream, Message>;
@@ -69,7 +74,9 @@ type WsReader = SplitStream<WsStream>;
 /// Open data channel input - sent as JSON after WebSocket connects.
 ///
 /// **Security**: Debug impl is removed to prevent accidental token leakage in logs.
-#[derive(Clone, Serialize, Deserialize)]
+/// Implements `Zeroize` to scrub `token_value` from memory on drop.
+#[derive(Clone, Serialize, Deserialize, Zeroize)]
+#[zeroize(drop)]
 #[serde(rename_all = "PascalCase")]
 struct OpenDataChannelInput {
     message_schema_version: String,
@@ -96,14 +103,14 @@ impl std::fmt::Debug for OpenDataChannelInput {
 ///
 /// Uses split read/write streams to allow concurrent send/receive without deadlock.
 /// The WebSocket is split into:
-/// - Writer (SplitSink) - protected by Mutex for sending data, heartbeats
+/// - Writer (SplitSink) - owned by a dedicated writer task fed via mpsc channel (lock-free)
 /// - Reader (SplitStream) - consumed by dedicated receiver task
 pub struct ConnectionManager {
     /// Session ID
     session_id: String,
 
-    /// WebSocket write half (protected by mutex for concurrent access)
-    writer: Arc<Mutex<WsWriter>>,
+    /// Write channel — all tasks send WebSocket frames here (lock-free)
+    writer_tx: mpsc::UnboundedSender<Message>,
 
     /// Channel multiplexer
     channels: Arc<ChannelMultiplexer>,
@@ -117,14 +124,21 @@ pub struct ConnectionManager {
     /// Task handles
     tasks: Vec<JoinHandle<()>>,
 
-    /// Sequence number counter for outgoing messages
+    /// Global sequence number counter for ALL outgoing messages
     sequence: Arc<std::sync::atomic::AtomicI64>,
 
     /// Publication state - whether we've received start_publication
     can_send: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Notified when can_send transitions to true
+    #[allow(dead_code)] // Kept alive via Arc; actual notification happens in receiver task
+    ready_notify: Arc<tokio::sync::Notify>,
+
     /// Outgoing message buffer for reliable delivery with retransmission
     outgoing_buffer: Arc<OutgoingMessageBuffer>,
+
+    /// Pong tracking — set to true on pong receipt, swapped to false on each ping
+    pong_received: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Commands sent to the connection manager
@@ -134,34 +148,62 @@ pub enum ManagerCommand {
     SendData(Bytes),
     /// Send a message with specific payload type
     SendMessage {
+        /// Data payload
         data: Bytes,
+        /// Payload type discriminator
         payload_type: crate::binary_protocol::PayloadType,
     },
     /// Terminate connection
     Terminate,
 }
 
+/// Shared context passed through the receiver task's message-processing pipeline.
+///
+/// Groups the five references that every internal routing function needs,
+/// reducing `route_message` from 11 parameters to 6 and `process_output_message`
+/// from 7 to 3.
+struct ReceiverContext {
+    channels: Arc<ChannelMultiplexer>,
+    writer_tx: mpsc::UnboundedSender<Message>,
+    can_send: Arc<std::sync::atomic::AtomicBool>,
+    ready_notify: Arc<tokio::sync::Notify>,
+    sequence: Arc<std::sync::atomic::AtomicI64>,
+}
+
+/// Mutable per-receiver state that travels with the message-processing pipeline.
+///
+/// Groups the evolving state that `route_message` and friends need,
+/// keeping function signatures lean.
+struct ReceiverState {
+    handshake_handler: HandshakeHandler,
+    expected_sequence: i64,
+    handshake_started: Option<Instant>,
+}
+
 impl ConnectionManager {
     /// Create a new connection manager and establish WebSocket connection
     /// Uses retry logic with exponential backoff for resilience
-    #[instrument(skip(token_value, command_rx), fields(session_id = %session_id))]
+    #[instrument(skip(token_value, command_rx, ready_notify), fields(session_id = %session_id))]
     pub async fn connect(
         session_id: String,
         stream_url: String,
         token_value: String,
         command_rx: mpsc::UnboundedReceiver<ManagerCommand>,
+        ready_notify: Arc<tokio::sync::Notify>,
     ) -> Result<Self> {
         // Validate stream URL to prevent SSRF attacks
         Self::validate_stream_url(&stream_url)?;
 
         // Build WebSocket URL with authentication token
         // SECURITY: Token is in query params but this URL is NEVER logged
-        // The stream_url from AWS already has query params (role, cell-number), so use &
-        let separator = if stream_url.contains('?') { "&" } else { "?" };
-        let ws_url = format!(
-            "{}{}sessionId={}&tokenValue={}",
-            stream_url, separator, session_id, token_value
-        );
+        // Use url::Url for proper encoding of special characters in token/session ID
+        let mut parsed_url = url::Url::parse(&stream_url)
+            .map_err(|e| Error::Config(format!("Invalid stream URL: {}", e)))?;
+        parsed_url
+            .query_pairs_mut()
+            .append_pair("sessionId", &session_id)
+            .append_pair("tokenValue", &token_value);
+        let ws_url = parsed_url.to_string();
 
         // Log sanitized URL (without token) for debugging
         info!(url = %Self::sanitize_url(&stream_url), "Attempting WebSocket connection");
@@ -207,41 +249,55 @@ impl ConnectionManager {
         debug!("Sending data channel handshake");
 
         writer
-            .send(Message::Text(handshake_json))
+            .send(Message::Text(handshake_json.into()))
             .await
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         info!("Data channel handshake sent");
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
-        let writer = Arc::new(Mutex::new(writer));
         let channels = Arc::new(ChannelMultiplexer::new());
         let can_send = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pong_received = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sequence = Arc::new(std::sync::atomic::AtomicI64::new(0));
 
         // Create outgoing message buffer for reliable delivery (before receiver task)
         let outgoing_buffer = Arc::new(OutgoingMessageBuffer::new(OUTGOING_BUFFER_CAPACITY));
+
+        // Create lock-free write channel — all tasks push frames here
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<Message>();
+
+        // Spawn dedicated writer task (owns the WsWriter sink)
+        let writer_task = Self::spawn_writer_task(writer, writer_rx, shutdown_tx.subscribe());
 
         // Spawn receiver task immediately with the reader half
         // This task owns the reader and runs independently of send operations
         let receiver_task = Self::spawn_receiver_task(
             reader,
-            Arc::clone(&channels),
-            Arc::clone(&writer),
-            Arc::clone(&can_send),
+            ReceiverContext {
+                channels: Arc::clone(&channels),
+                writer_tx: writer_tx.clone(),
+                can_send: Arc::clone(&can_send),
+                ready_notify: Arc::clone(&ready_notify),
+                sequence: Arc::clone(&sequence),
+            },
             Arc::clone(&outgoing_buffer),
+            Arc::clone(&pong_received),
             shutdown_tx.subscribe(),
         );
 
         Ok(Self {
             session_id,
-            writer,
+            writer_tx,
             channels,
             command_rx,
             shutdown_tx,
-            tasks: vec![receiver_task],
-            sequence: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            tasks: vec![writer_task, receiver_task],
+            sequence,
             can_send,
+            ready_notify,
             outgoing_buffer,
+            pong_received,
         })
     }
 
@@ -325,19 +381,19 @@ impl ConnectionManager {
     /// It cannot deadlock with send operations because they use separate stream halves.
     fn spawn_receiver_task(
         mut reader: WsReader,
-        channels: Arc<ChannelMultiplexer>,
-        writer: Arc<Mutex<WsWriter>>,
-        can_send: Arc<std::sync::atomic::AtomicBool>,
+        ctx: ReceiverContext,
         outgoing_buffer: Arc<OutgoingMessageBuffer>,
+        pong_received: Arc<std::sync::atomic::AtomicBool>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             debug!("Receiver task started");
-            let mut handshake_handler = HandshakeHandler::new(HandshakeConfig::default());
-            let mut sequence_counter: i64 = 0;
-            // Track expected sequence number for duplicate detection (like AWS ExpectedSequenceNumber)
-            // Messages with sequence < expected are duplicates - ACK them but don't process to output
-            let mut expected_sequence_number: i64 = 0;
+
+            let mut state = ReceiverState {
+                handshake_handler: HandshakeHandler::new(HandshakeConfig::default()),
+                expected_sequence: 0,
+                handshake_started: None,
+            };
             // Buffer for out-of-order messages (like AWS IncomingMessageBuffer)
             let incoming_buffer = IncomingMessageBuffer::new(INCOMING_BUFFER_CAPACITY);
 
@@ -384,9 +440,8 @@ impl ConnectionManager {
                                 metrics::counter(MetricNames::MESSAGES_RECEIVED, 1, &[]);
                                 metrics::counter(MetricNames::BYTES_RECEIVED, data.len() as u64, &[]);
 
-                                // Convert to Bytes once, then clone for routing (cheap - reference counted)
-                                let raw_bytes = Bytes::from(data);
-                                match ClientMessage::deserialize(raw_bytes.clone()) {
+                                // data is already Bytes (reference counted) — clone is cheap
+                                match ClientMessage::deserialize(data.clone()) {
                                     Ok(msg) => {
                                         debug!(
                                             message_type = %msg.message_type,
@@ -398,24 +453,21 @@ impl ConnectionManager {
                                         );
 
                                         // Extra debug: log first bytes of payload if it looks like JSON
-                                        if !msg.payload.is_empty() {
-                                            if let Ok(s) = String::from_utf8(msg.payload.to_vec()) {
+                                        // Guarded to avoid allocation when debug logging is disabled
+                                        if tracing::enabled!(tracing::Level::DEBUG) && !msg.payload.is_empty() {
+                                            if let Ok(s) = std::str::from_utf8(&msg.payload) {
                                                 if s.starts_with('{') {
                                                     debug!(payload_preview = %s[..s.len().min(300)], "Payload content");
                                                 }
                                             }
                                         }
                                         if let Err(e) = Self::route_message(
-                                            &channels,
+                                            &ctx,
                                             msg,
-                                            &mut handshake_handler,
-                                            &writer,
-                                            &can_send,
+                                            &mut state,
                                             &outgoing_buffer,
-                                            &mut sequence_counter,
-                                            &mut expected_sequence_number,
                                             &incoming_buffer,
-                                            raw_bytes,
+                                            data,
                                         ).await {
                                             error!(error = ?e, "Failed to route message");
                                         }
@@ -432,12 +484,14 @@ impl ConnectionManager {
                                 let text_trimmed = text.trim();
                                 if text_trimmed == "start_publication" {
                                     info!("Received TEXT start_publication - ready to send data");
-                                    can_send.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    ctx.can_send.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    ctx.ready_notify.notify_waiters();
                                 } else if text_trimmed == "pause_publication" {
                                     debug!("Received TEXT pause_publication - pausing data send");
-                                    can_send.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    ctx.can_send.store(false, std::sync::atomic::Ordering::SeqCst);
                                 } else if text_trimmed == "channel_closed" {
                                     info!("Received TEXT channel_closed");
+                                    ctx.channels.close();
                                     break;
                                 } else if text_trimmed.starts_with('{') {
                                     // Might be JSON - try to parse
@@ -448,20 +502,27 @@ impl ConnectionManager {
                             }
                             Some(Ok(Message::Close(frame))) => {
                                 info!(?frame, "WebSocket close frame received");
-                                channels.close();
+                                ctx.channels.close();
                                 break;
                             }
-                            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {
-                                trace!("Received ping/pong/frame");
+                            Some(Ok(Message::Ping(_))) => {
+                                trace!("Received ping");
+                            }
+                            Some(Ok(Message::Pong(_))) => {
+                                trace!("Received pong");
+                                pong_received.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            Some(Ok(Message::Frame(_))) => {
+                                trace!("Received raw frame");
                             }
                             Some(Err(e)) => {
                                 error!(error = ?e, "WebSocket error");
-                                channels.close();
+                                ctx.channels.close();
                                 break;
                             }
                             None => {
                                 info!("WebSocket stream ended");
-                                channels.close();
+                                ctx.channels.close();
                                 break;
                             }
                         }
@@ -472,13 +533,56 @@ impl ConnectionManager {
         })
     }
 
-    /// Spawn heartbeat task
+    /// Spawn dedicated writer task that owns the WebSocket sink.
+    ///
+    /// All other tasks send `Message` values through an unbounded mpsc channel.
+    /// This eliminates mutex contention between heartbeat, retransmit,
+    /// receiver ACKs, and the main command loop.
+    fn spawn_writer_task(
+        mut writer: WsWriter,
+        mut rx: mpsc::UnboundedReceiver<Message>,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            debug!("Writer task started");
+            loop {
+                tokio::select! {
+                    biased;
+
+                    _ = shutdown_rx.recv() => {
+                        debug!("Writer task shutting down");
+                        break;
+                    }
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(msg) => {
+                                if let Err(e) = writer.send(msg).await {
+                                    error!(error = ?e, "Writer task: WebSocket send failed");
+                                    break;
+                                }
+                            }
+                            None => {
+                                debug!("Writer channel closed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = writer.close().await;
+            debug!("Writer task exited");
+        })
+    }
+
+    /// Spawn heartbeat task with pong-based dead connection detection
     fn spawn_heartbeat_task(&self) -> JoinHandle<()> {
-        let writer = Arc::clone(&self.writer);
+        let writer_tx = self.writer_tx.clone();
+        let pong_received = Arc::clone(&self.pong_received);
         let mut shutdown_rx = self.shutdown_rx();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+            let mut missed_pongs: u32 = 0;
 
             loop {
                 tokio::select! {
@@ -489,10 +593,26 @@ impl ConnectionManager {
                         break;
                     }
                     _ = interval.tick() => {
+                        // Check if previous pong was received
+                        if !pong_received.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            missed_pongs += 1;
+                            warn!(missed = missed_pongs, "Missed pong response");
+                            if missed_pongs >= MAX_MISSED_PONGS {
+                                error!(
+                                    missed = missed_pongs,
+                                    threshold = MAX_MISSED_PONGS,
+                                    "Connection appears dead, stopping heartbeat"
+                                );
+                                metrics::counter(MetricNames::MESSAGES_RECEIVED, 0, &[("dead_connection", "true")]);
+                                break;
+                            }
+                        } else {
+                            missed_pongs = 0;
+                        }
+
                         trace!("Sending heartbeat ping");
-                        let mut writer = writer.lock().await;
-                        if let Err(e) = writer.send(Message::Ping(vec![])).await {
-                            error!(error = ?e, "Failed to send heartbeat");
+                        if writer_tx.send(Message::Ping(Bytes::new())).is_err() {
+                            debug!("Writer channel closed, stopping heartbeat");
                             break;
                         }
                     }
@@ -506,13 +626,15 @@ impl ConnectionManager {
     /// Checks OutgoingMessageBuffer at fixed intervals and retransmits messages
     /// that haven't been ACKed within the retransmission timeout (adaptive based on RTT).
     fn spawn_retransmit_task(&self) -> JoinHandle<()> {
-        let writer = Arc::clone(&self.writer);
+        let writer_tx = self.writer_tx.clone();
         let outgoing_buffer = Arc::clone(&self.outgoing_buffer);
+        let can_send = Arc::clone(&self.can_send);
         let mut shutdown_rx = self.shutdown_rx();
         let session_id = self.session_id.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(RETRANSMIT_INTERVAL);
+            let mut tick_count: u64 = 0;
 
             loop {
                 tokio::select! {
@@ -523,6 +645,34 @@ impl ConnectionManager {
                         break;
                     }
                     _ = interval.tick() => {
+                        tick_count += 1;
+
+                        // Emit health metrics every ~5 seconds (25 ticks at 200ms)
+                        if tick_count % 25 == 0 {
+                            let buf_len = outgoing_buffer.len().await;
+                            let is_connected = can_send.load(std::sync::atomic::Ordering::SeqCst);
+                            let health: f64 = if !is_connected {
+                                1.0 // unhealthy
+                            } else if buf_len > 100 {
+                                2.0 // degraded
+                            } else {
+                                3.0 // healthy
+                            };
+                            metrics::gauge(MetricNames::CONNECTION_HEALTH, health, &[]);
+
+                            // Estimate packet loss: unACKed messages / buffer capacity
+                            let loss_pct = (buf_len as f64 / OUTGOING_BUFFER_CAPACITY as f64) * 100.0;
+                            metrics::gauge(MetricNames::PACKET_LOSS_PERCENT, loss_pct, &[]);
+
+                            // RTT jitter
+                            if let Some(rtt) = outgoing_buffer.last_rtt().await {
+                                let stats = outgoing_buffer.rtt_stats().await;
+                                let jitter = stats.rttvar.as_secs_f64();
+                                metrics::gauge(MetricNames::RTT_JITTER_SECONDS, jitter, &[]);
+                                metrics::histogram(MetricNames::RTT_SECONDS, rtt.as_secs_f64(), &[]);
+                            }
+                        }
+
                         // Get candidates for retransmission
                         let candidates = outgoing_buffer.get_retransmit_candidates(MAX_RETRANSMIT_ATTEMPTS).await;
 
@@ -542,8 +692,7 @@ impl ConnectionManager {
                             metrics::counter(MetricNames::RETRANSMISSIONS, 1, &[]);
 
                             // Retransmit the message
-                            let mut writer = writer.lock().await;
-                            if let Err(e) = writer.send(Message::Binary(data.to_vec())).await {
+                            if let Err(e) = writer_tx.send(Message::Binary(data)) {
                                 warn!(
                                     seq,
                                     error = ?e,
@@ -569,12 +718,14 @@ impl ConnectionManager {
             .sequence
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        let data_len = data.len();
+
         // Create binary protocol message
         let msg = ClientMessage::new(
             MessageType::InputStreamData,
             sequence,
             PayloadType::Output, // Input data uses Output payload type
-            data.clone(),
+            data,
         );
 
         // Serialize to binary
@@ -589,14 +740,10 @@ impl ConnectionManager {
             )));
         }
 
-        // Send via writer (short lock duration - no blocking operations while holding)
-        {
-            let mut writer = self.writer.lock().await;
-            writer
-                .send(Message::Binary(msg_bytes.to_vec()))
-                .await
-                .map_err(|e| TransportError::WebSocket(e.to_string()))?;
-        }
+        // Send via lock-free writer channel
+        self.writer_tx
+            .send(Message::Binary(msg_bytes.clone()))
+            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         // Record send metrics
         metrics::counter(MetricNames::MESSAGES_SENT, 1, &[]);
@@ -607,7 +754,7 @@ impl ConnectionManager {
 
         debug!(
             sequence,
-            len = data.len(),
+            len = data_len,
             "Sent input data (tracked for ACK)"
         );
 
@@ -622,13 +769,10 @@ impl ConnectionManager {
             .sequence
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        let data_len = data.len();
+
         // Create binary protocol message with specified payload type
-        let msg = ClientMessage::new(
-            MessageType::InputStreamData,
-            sequence,
-            payload_type,
-            data.clone(),
-        );
+        let msg = ClientMessage::new(MessageType::InputStreamData, sequence, payload_type, data);
 
         // Serialize to binary
         let msg_bytes = msg.serialize()?;
@@ -642,14 +786,10 @@ impl ConnectionManager {
             )));
         }
 
-        // Send via writer
-        {
-            let mut writer = self.writer.lock().await;
-            writer
-                .send(Message::Binary(msg_bytes.to_vec()))
-                .await
-                .map_err(|e| TransportError::WebSocket(e.to_string()))?;
-        }
+        // Send via lock-free writer channel
+        self.writer_tx
+            .send(Message::Binary(msg_bytes.clone()))
+            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         // Record send metrics
         metrics::counter(MetricNames::MESSAGES_SENT, 1, &[]);
@@ -661,7 +801,7 @@ impl ConnectionManager {
         debug!(
             sequence,
             ?payload_type,
-            len = data.len(),
+            len = data_len,
             "Sent message (tracked for ACK)"
         );
 
@@ -678,36 +818,31 @@ impl ConnectionManager {
     /// - seq == expected: Process message, increment expected, send ACK
     /// - seq > expected:  Out-of-order, buffer if possible, send ACK immediately
     /// - seq < expected:  Duplicate, do NOT ACK, silently drop
-    #[allow(clippy::too_many_arguments)]
     async fn route_message(
-        channels: &ChannelMultiplexer,
+        ctx: &ReceiverContext,
         msg: ClientMessage,
-        handshake_handler: &mut HandshakeHandler,
-        writer: &Arc<Mutex<WsWriter>>,
-        can_send: &Arc<std::sync::atomic::AtomicBool>,
+        state: &mut ReceiverState,
         outgoing_buffer: &OutgoingMessageBuffer,
-        sequence_counter: &mut i64,
-        expected_sequence_number: &mut i64,
         incoming_buffer: &IncomingMessageBuffer,
         raw_bytes: Bytes,
     ) -> Result<()> {
         match msg.message_type.as_str() {
             "output_stream_data" => {
                 // AWS Protocol: Check sequence number BEFORE sending ACK
-                if msg.sequence_number < *expected_sequence_number {
+                if msg.sequence_number < state.expected_sequence {
                     // Duplicate message - do NOT ACK, silently drop
                     // AWS behavior: sender will eventually stop retrying
                     debug!(
                         sequence = msg.sequence_number,
-                        expected = *expected_sequence_number,
+                        expected = state.expected_sequence,
                         "Duplicate message detected, NOT ACKing (AWS protocol)"
                     );
                     return Ok(());
                 }
 
-                if msg.sequence_number == *expected_sequence_number {
+                if msg.sequence_number == state.expected_sequence {
                     // In-order message: process, ACK, then check buffer for consecutive messages
-                    if let Err(e) = Self::send_acknowledge(writer, &msg, sequence_counter).await {
+                    if let Err(e) = Self::send_acknowledge(&ctx.writer_tx, &msg) {
                         error!(error = ?e, "Failed to send acknowledge");
                     } else {
                         debug!(
@@ -718,27 +853,23 @@ impl ConnectionManager {
 
                     // Process the message
                     Self::process_output_message(
-                        channels,
+                        ctx,
                         &msg,
-                        handshake_handler,
-                        writer,
-                        can_send,
-                        sequence_counter,
+                        &mut state.handshake_handler,
+                        &mut state.handshake_started,
                     )
                     .await?;
 
                     // Increment expected sequence
-                    *expected_sequence_number = msg.sequence_number + 1;
+                    state.expected_sequence = msg.sequence_number + 1;
 
                     // Process any buffered messages that are now in-order
                     Self::process_buffered_messages(
-                        channels,
+                        ctx,
                         incoming_buffer,
-                        handshake_handler,
-                        writer,
-                        can_send,
-                        sequence_counter,
-                        expected_sequence_number,
+                        &mut state.handshake_handler,
+                        &mut state.expected_sequence,
+                        &mut state.handshake_started,
                     )
                     .await?;
                 } else {
@@ -746,15 +877,13 @@ impl ConnectionManager {
                     // Buffer if we have capacity, send ACK immediately
                     debug!(
                         sequence = msg.sequence_number,
-                        expected = *expected_sequence_number,
+                        expected = state.expected_sequence,
                         "Out-of-order message received"
                     );
 
                     if incoming_buffer.add(msg.clone(), raw_bytes).await {
                         // Successfully buffered - send ACK with IsSequentialMessage=false
-                        if let Err(e) =
-                            Self::send_acknowledge_non_sequential(writer, &msg, sequence_counter)
-                                .await
+                        if let Err(e) = Self::send_acknowledge_non_sequential(&ctx.writer_tx, &msg)
                         {
                             error!(error = ?e, "Failed to send acknowledge for out-of-order message");
                         } else {
@@ -810,31 +939,33 @@ impl ConnectionManager {
                 info!("Channel closed by server");
                 // Parse exit code from payload if present
                 if !msg.payload.is_empty() {
-                    if let Ok(exit_info) = String::from_utf8(msg.payload.to_vec()) {
+                    if let Ok(exit_info) = std::str::from_utf8(&msg.payload) {
                         info!(exit_info = %exit_info, "Channel close info");
                     }
                 }
                 // Close the output channel to signal consumers
-                channels.close();
+                ctx.channels.close();
             }
             "start_publication" => {
                 info!("Received start_publication - ready to send data");
-                can_send.store(true, std::sync::atomic::Ordering::SeqCst);
+                ctx.can_send
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                ctx.ready_notify.notify_waiters();
             }
             "pause_publication" => {
                 debug!("Received pause_publication - pausing data send");
-                can_send.store(false, std::sync::atomic::Ordering::SeqCst);
-                if !msg.payload.is_empty() {
-                    if let Ok(payload_str) = String::from_utf8(msg.payload.to_vec()) {
+                ctx.can_send
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                if tracing::enabled!(tracing::Level::DEBUG) && !msg.payload.is_empty() {
+                    if let Ok(payload_str) = std::str::from_utf8(&msg.payload) {
                         debug!(payload = %payload_str, "pause_publication payload");
                     }
                 }
             }
             msg_type => {
                 debug!(message_type = %msg_type, "Received message type: {}", msg_type);
-                // Log payload for debugging
-                if !msg.payload.is_empty() {
-                    if let Ok(payload_str) = String::from_utf8(msg.payload.to_vec()) {
+                if tracing::enabled!(tracing::Level::DEBUG) && !msg.payload.is_empty() {
+                    if let Ok(payload_str) = std::str::from_utf8(&msg.payload) {
                         debug!(payload = %payload_str, "Message payload");
                     }
                 }
@@ -847,52 +978,51 @@ impl ConnectionManager {
     /// Process an output_stream_data message payload
     /// Extracted to be reusable for both direct and buffered messages
     async fn process_output_message(
-        channels: &ChannelMultiplexer,
+        ctx: &ReceiverContext,
         msg: &ClientMessage,
         handshake_handler: &mut HandshakeHandler,
-        writer: &Arc<Mutex<WsWriter>>,
-        can_send: &Arc<std::sync::atomic::AtomicBool>,
-        sequence_counter: &mut i64,
+        handshake_started: &mut Option<Instant>,
     ) -> Result<()> {
         match msg.payload_type {
             PayloadType::Output | PayloadType::StdErr | PayloadType::Undefined => {
                 // Check for legacy agent: if we receive output before handshake completes,
                 // this is a legacy shell session that doesn't do handshake
                 if handshake_handler.state() == HandshakeState::AwaitingRequest
-                    && !can_send.load(std::sync::atomic::Ordering::SeqCst)
+                    && !ctx.can_send.load(std::sync::atomic::Ordering::SeqCst)
                 {
                     info!(
                         "Legacy agent detected: receiving output without handshake, enabling send"
                     );
-                    can_send.store(true, std::sync::atomic::Ordering::SeqCst);
+                    ctx.can_send
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    ctx.ready_notify.notify_waiters();
                 }
 
                 // Normal output data - send to output channel
                 if !msg.payload.is_empty() {
                     trace!(len = msg.payload.len(), payload_type = ?msg.payload_type, "Routing output data");
-                    channels.send_output(msg.payload.clone()).await?;
+                    ctx.channels.send_output(msg.payload.clone()).await?;
                 }
             }
             PayloadType::HandshakeRequest => {
                 // Agent handshake request - parse and respond
-                if let Ok(handshake_json) = String::from_utf8(msg.payload.to_vec()) {
+                if let Ok(handshake_json) = std::str::from_utf8(&msg.payload) {
                     debug!(handshake = %handshake_json, "HandshakeRequest payload");
 
                     // Parse handshake request
-                    if let Ok(request) = serde_json::from_str::<HandshakeRequest>(&handshake_json) {
+                    if let Ok(request) = serde_json::from_str::<HandshakeRequest>(handshake_json) {
                         // Process and generate response
                         match handshake_handler.process_request(request) {
                             Ok(Some(response)) => {
                                 // First handshake request - log at INFO and send response
                                 info!("Received HandshakeRequest from agent");
+                                *handshake_started = Some(Instant::now());
                                 // Send handshake response
                                 if let Err(e) = Self::send_handshake_response(
-                                    writer,
+                                    &ctx.writer_tx,
                                     &response,
-                                    sequence_counter,
-                                )
-                                .await
-                                {
+                                    &ctx.sequence,
+                                ) {
                                     error!(error = ?e, "Failed to send handshake response");
                                 } else {
                                     info!("Handshake response sent");
@@ -914,18 +1044,27 @@ impl ConnectionManager {
             PayloadType::HandshakeComplete => {
                 // Handshake complete - session is ready
                 info!("Agent handshake complete, session ready");
-                if let Ok(complete_json) = String::from_utf8(msg.payload.to_vec()) {
-                    debug!(complete = %complete_json, "HandshakeComplete payload");
+                if let Some(started) = handshake_started.take() {
+                    let duration = started.elapsed();
+                    info!(duration_ms = duration.as_millis(), "Handshake duration");
+                    metrics::timing(MetricNames::HANDSHAKE_DURATION, duration, &[]);
+                }
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    if let Ok(complete_json) = std::str::from_utf8(&msg.payload) {
+                        debug!(complete = %complete_json, "HandshakeComplete payload");
+                    }
                 }
                 // Mark that we can start sending data
-                can_send.store(true, std::sync::atomic::Ordering::SeqCst);
+                ctx.can_send
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                ctx.ready_notify.notify_waiters();
             }
             PayloadType::Size => {
                 debug!("Received size update request");
             }
             PayloadType::ExitCode => {
                 if !msg.payload.is_empty() {
-                    if let Ok(exit_info) = String::from_utf8(msg.payload.to_vec()) {
+                    if let Ok(exit_info) = std::str::from_utf8(&msg.payload) {
                         info!(exit_code = %exit_info, "Process exit code");
                     }
                 }
@@ -943,13 +1082,11 @@ impl ConnectionManager {
     /// Process buffered messages that are now in-order
     /// (Per AWS ProcessIncomingMessageBufferItems)
     async fn process_buffered_messages(
-        channels: &ChannelMultiplexer,
+        ctx: &ReceiverContext,
         incoming_buffer: &IncomingMessageBuffer,
         handshake_handler: &mut HandshakeHandler,
-        writer: &Arc<Mutex<WsWriter>>,
-        can_send: &Arc<std::sync::atomic::AtomicBool>,
-        sequence_counter: &mut i64,
         expected_sequence_number: &mut i64,
+        handshake_started: &mut Option<Instant>,
     ) -> Result<()> {
         while let Some(buffered) = incoming_buffer.remove(*expected_sequence_number).await {
             debug!(
@@ -959,12 +1096,10 @@ impl ConnectionManager {
 
             // Process the buffered message
             Self::process_output_message(
-                channels,
+                ctx,
                 &buffered.message,
                 handshake_handler,
-                writer,
-                can_send,
-                sequence_counter,
+                handshake_started,
             )
             .await?;
 
@@ -974,27 +1109,28 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Send handshake response via writer
-    async fn send_handshake_response(
-        writer: &Arc<Mutex<WsWriter>>,
+    /// Send handshake response via writer channel
+    fn send_handshake_response(
+        writer_tx: &mpsc::UnboundedSender<Message>,
         response: &HandshakeResponse,
-        sequence_counter: &mut i64,
+        sequence: &Arc<std::sync::atomic::AtomicI64>,
     ) -> Result<()> {
         let response_json = serde_json::to_vec(response).map_err(Error::Serialization)?;
 
+        let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         debug!(
             response_json = %String::from_utf8_lossy(&response_json),
-            sequence = *sequence_counter,
+            sequence = seq,
             "Sending HandshakeResponse"
         );
 
         let msg = ClientMessage::new(
             MessageType::InputStreamData,
-            *sequence_counter,
+            seq,
             PayloadType::HandshakeResponse,
             Bytes::from(response_json),
         );
-        *sequence_counter += 1;
 
         let msg_bytes = msg.serialize()?;
         debug!(
@@ -1002,10 +1138,8 @@ impl ConnectionManager {
             "Serialized HandshakeResponse message"
         );
 
-        let mut writer = writer.lock().await;
-        writer
-            .send(Message::Binary(msg_bytes.to_vec()))
-            .await
+        writer_tx
+            .send(Message::Binary(msg_bytes))
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         debug!("HandshakeResponse sent to WebSocket");
@@ -1013,10 +1147,9 @@ impl ConnectionManager {
     }
 
     /// Send acknowledge message for a received message (sequential)
-    async fn send_acknowledge(
-        writer: &Arc<Mutex<WsWriter>>,
+    fn send_acknowledge(
+        writer_tx: &mpsc::UnboundedSender<Message>,
         received_msg: &ClientMessage,
-        _sequence_counter: &mut i64,
     ) -> Result<()> {
         // Create acknowledgment message using AckTracker helper
         let ack_msg = AckTracker::create_ack(received_msg, true)?;
@@ -1031,20 +1164,17 @@ impl ConnectionManager {
         );
         let msg_bytes = ack_msg.serialize()?;
 
-        let mut writer = writer.lock().await;
-        writer
-            .send(Message::Binary(msg_bytes.to_vec()))
-            .await
+        writer_tx
+            .send(Message::Binary(msg_bytes))
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         Ok(())
     }
 
     /// Send acknowledge message for an out-of-order message (non-sequential)
-    async fn send_acknowledge_non_sequential(
-        writer: &Arc<Mutex<WsWriter>>,
+    fn send_acknowledge_non_sequential(
+        writer_tx: &mpsc::UnboundedSender<Message>,
         received_msg: &ClientMessage,
-        _sequence_counter: &mut i64,
     ) -> Result<()> {
         // Create acknowledgment with IsSequentialMessage=false
         let ack_msg = AckTracker::create_ack(received_msg, false)?;
@@ -1059,10 +1189,8 @@ impl ConnectionManager {
         );
         let msg_bytes = ack_msg.serialize()?;
 
-        let mut writer = writer.lock().await;
-        writer
-            .send(Message::Binary(msg_bytes.to_vec()))
-            .await
+        writer_tx
+            .send(Message::Binary(msg_bytes))
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         Ok(())
@@ -1075,15 +1203,12 @@ impl ConnectionManager {
         // Signal all tasks to shutdown
         let _ = self.shutdown_tx.send(());
 
+        // Drop the write channel — this causes the writer task to close the WebSocket
+        drop(self.writer_tx);
+
         // Wait for all tasks to complete with timeout
         for task in self.tasks {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
-        }
-
-        // Close WebSocket writer
-        {
-            let mut writer = self.writer.lock().await;
-            let _ = writer.close().await;
         }
 
         info!("Connection manager shutdown complete");
@@ -1298,5 +1423,13 @@ mod tests {
         // Ensure retransmit settings match AWS
         assert_eq!(RETRANSMIT_INTERVAL.as_millis(), 200);
         assert_eq!(MAX_RETRANSMIT_ATTEMPTS, 3000); // 5 minutes at 200ms intervals
+    }
+
+    #[test]
+    fn test_missed_pongs_constant() {
+        // 3 missed pongs = 90 seconds without response at 30s heartbeat interval
+        assert_eq!(MAX_MISSED_PONGS, 3);
+        let dead_threshold = HEARTBEAT_INTERVAL * MAX_MISSED_PONGS;
+        assert_eq!(dead_threshold.as_secs(), 90);
     }
 }

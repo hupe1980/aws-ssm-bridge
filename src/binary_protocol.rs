@@ -47,29 +47,21 @@ const TOTAL_HEADER_SIZE: usize = 120; // 4 + 116
 /// Maximum payload size (10MB) - prevents memory exhaustion attacks
 pub const MAX_PAYLOAD_SIZE: u32 = 10 * 1024 * 1024;
 
-// Field offsets (used by serialization/deserialization)
-#[allow(dead_code)]
-const HL_OFFSET: usize = 0;
-#[allow(dead_code)]
-const MESSAGE_TYPE_OFFSET: usize = 4;
-#[allow(dead_code)]
-const SCHEMA_VERSION_OFFSET: usize = 36;
-#[allow(dead_code)]
-const CREATED_DATE_OFFSET: usize = 40;
-#[allow(dead_code)]
-const SEQUENCE_NUMBER_OFFSET: usize = 48;
-#[allow(dead_code)]
-const FLAGS_OFFSET: usize = 56;
-#[allow(dead_code)]
-const MESSAGE_ID_OFFSET: usize = 64;
-#[allow(dead_code)]
-const PAYLOAD_DIGEST_OFFSET: usize = 80;
-#[allow(dead_code)]
-const PAYLOAD_TYPE_OFFSET: usize = 112;
-#[allow(dead_code)]
-const PAYLOAD_LENGTH_OFFSET: usize = 116;
-#[allow(dead_code)]
-const PAYLOAD_OFFSET: usize = 120;
+// Field offsets within the 120-byte binary header (for reference):
+//
+//   Offset  Size  Field
+//   ------  ----  ------------------
+//     0       4   HL (header length = 116)
+//     4      32   MessageType
+//    36       4   SchemaVersion
+//    40       8   CreatedDate (ms since epoch)
+//    48       8   SequenceNumber
+//    56       8   Flags
+//    64      16   MessageId (UUID bytes)
+//    80      32   PayloadDigest (SHA-256)
+//   112       4   PayloadType
+//   116       4   PayloadLength
+//   120       …   Payload
 
 /// Payload type enumeration (AWS official specification)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,7 +389,12 @@ impl ClientMessage {
         // Note: Simple comparison is fine here - the digest is not secret.
         // An attacker who can observe the message already has the payload
         // and can compute the correct digest themselves.
-        if self.payload_length > 0 {
+        //
+        // AWS sends some control messages with empty payloads where the digest
+        // is all zeros rather than SHA-256(""). We accept zero-filled digests
+        // for empty payloads since they indicate "not applicable".
+        let is_zero_digest = self.payload_digest == [0u8; 32];
+        if !(self.payload.is_empty() && is_zero_digest) {
             let computed_digest = compute_digest(&self.payload);
             if computed_digest != self.payload_digest {
                 return Err(ProtocolError::InvalidMessage(
@@ -537,6 +534,29 @@ mod tests {
         // Invalid payload digest
         msg.payload_digest = [0u8; 32];
         assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn test_empty_payload_digest_validated() {
+        // Empty payload with correct SHA-256("") digest must pass
+        let msg = ClientMessage::new(
+            MessageType::InputStreamData,
+            0,
+            PayloadType::Output,
+            Bytes::new(), // empty
+        );
+        assert!(msg.validate().is_ok());
+
+        // AWS sends some control messages with empty payload and zero-filled digest
+        // (meaning "not applicable") — this must also pass
+        let mut zeros = msg.clone();
+        zeros.payload_digest = [0u8; 32];
+        assert!(zeros.validate().is_ok());
+
+        // Tampered digest (non-zero, non-matching) on empty payload must fail
+        let mut tampered = msg;
+        tampered.payload_digest = [0xFFu8; 32];
+        assert!(tampered.validate().is_err());
     }
 
     #[test]

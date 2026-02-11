@@ -29,7 +29,7 @@ Reliable message delivery uses two buffers:
 | Buffer | Type | Capacity | Purpose |
 |:-------|:-----|:---------|:--------|
 | **OutgoingMessageBuffer** | LinkedList | 10,000 | Messages waiting for ACK |
-| **IncomingMessageBuffer** | HashMap | 10,000 | Out-of-order messages |
+| **IncomingMessageBuffer** | BTreeMap | 10,000 | Out-of-order messages |
 
 **RTT Tracking** (Jacobson/Karels algorithm, RFC 6298):
 - `RoundTripTime` - Smoothed RTT estimate

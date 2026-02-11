@@ -61,7 +61,6 @@ src/
 ├── channels.rs         # Broadcast multiplexer (fan-out)
 ├── retry.rs            # Exponential backoff, circuit breaker
 ├── errors.rs           # Error types
-├── aws_client.rs       # AWS SDK wrapper
 └── python/             # PyO3 bindings
     ├── mod.rs          # Module exports
     └── session.rs      # Python wrappers
@@ -73,10 +72,15 @@ src/
 |----------|-----------|
 | **Flat modules** | Industry standard (tokio, serde), simpler imports |
 | **Broadcast channels** | Multiple output consumers, proper fan-out |
-| **`tokio-tungstenite`** | AWS SDK uses Tokio, mature WebSocket impl |
+| **Dedicated writer task** | Lock-free writes via mpsc channel, eliminates mutex contention |
+| **`tokio-tungstenite` 0.26** | Zero-copy `Message::Binary(Bytes)` — no `.to_vec()` on sends |
 | **`bytes::Bytes`** | Zero-copy, reference-counted buffers |
 | **`aws-lc-rs`** | AWS's libcrypto, hardware-accelerated SHA-256 |
-| **`tokio::sync::Notify`** | Efficient shutdown signaling |
+| **`tokio::sync::Notify`** | Efficient signaling for ready/terminated state |
+| **`zeroize`** | Scrub session tokens from memory on drop |
+| **`ReceiverContext` struct** | Bundles shared Arcs for receiver, eliminates parameter bloat |
+| **`ReceiverState` struct** | Bundles mutable receiver state (handshake, sequence, timing) |
+| **`BTreeMap` incoming buffer** | Ordered iteration, HashDoS resistance vs `HashMap` |
 | **`forbid(unsafe_code)`** | Memory safety guarantee |
 
 ## Data Flow
@@ -104,7 +108,7 @@ Session::new()
     │       │
     │       ├─▶ Handshake (open_data_channel → request → response → complete)
     │       │
-    │       └─▶ Spawn: message_loop, retransmit_scheduler
+    │       └─▶ Spawn: writer_task, receiver_task, heartbeat, retransmit_scheduler
     │
     └─▶ Return Session handle
 ```
@@ -129,7 +133,7 @@ ConnectionManager
     │
     ├─▶ Metrics: counter(messages_sent), counter(bytes_sent)
     │
-    └─▶ WebSocket::send(Binary)
+    └─▶ writer_tx.send(Binary) → Writer Task → WebSocket::send()
 ```
 
 ### Message Flow (Incoming)
@@ -180,12 +184,17 @@ OutgoingMessageBuffer::get_retransmit_candidates()
 ## Concurrency Model
 
 - **Fully async**: Built on Tokio runtime
-- **Message passing**: `mpsc` channels (unbounded for commands, bounded for data)
-- **Shared state**: `Arc<RwLock<T>>` / `Arc<Mutex<T>>` where necessary
+- **Message passing**: `mpsc` channels — commands and WebSocket writes are lock-free
+- **Dedicated writer task**: All WebSocket sends go through a single writer task via `mpsc::UnboundedSender<Message>`, eliminating mutex contention between heartbeat, retransmit, ACKs, and the main command loop
+- **Notify-based signaling**: `wait_for_ready()` and `wait_terminated()` use `tokio::sync::Notify` (no polling)
+- **Unified sequence counter**: A single `Arc<AtomicI64>` shared across main loop and receiver task for globally unique sequence numbers
+- **Shared state**: `Arc<RwLock<T>>` / `Arc<AtomicBool>` for lightweight flags
 - **Task-based**: Each session spawns:
-  - Message processing loop
-  - Retransmit scheduler
-  - (Optional) Output stream consumers
+  - Writer task (owns WebSocket sink)
+  - Receiver task (owns WebSocket reader)
+  - Command handler (send, terminate)
+  - Heartbeat (with pong-based dead connection detection)
+  - Retransmit scheduler (200ms interval)
 
 ### Session Tasks
 
@@ -194,15 +203,19 @@ Session
     │
     ├─▶ ConnectionManager::run()
     │       │
-    │       ├─▶ WebSocket recv loop
+    │       ├─▶ Writer task (owns WsWriter, fed by mpsc channel)
     │       │
-    │       ├─▶ Command handler (send, terminate)
+    │       ├─▶ Receiver task (owns WsReader, sends ACKs via writer channel)
     │       │
-    │       └─▶ Retransmit scheduler (200ms interval)
+    │       ├─▶ Heartbeat task (ping/pong tracking, dead connection detection)
+    │       │
+    │       ├─▶ Retransmit scheduler (200ms interval, health metrics)
+    │       │
+    │       └─▶ Command handler (send data, terminate)
     │
     └─▶ ChannelMultiplexer
             │
-            └─▶ Broadcast channels for output
+            └─▶ BroadcastStream-backed output channels
 ```
 
 ## Error Handling
@@ -279,8 +292,8 @@ Result<T, Error> → PyResult<T>
 
 | Class | Methods |
 |-------|---------|
-| `SessionManager` | `new()`, `start_session()`, `terminate_session()` |
-| `Session` | `send()`, `output()`, `terminate()`, `wait_for_ready()`, `is_ready()` |
+| `SessionManager` | `new(region=None)`, `start_session()`, `start_session_with_config()`, `terminate_session()` |
+| `Session` | `send()`, `output()`, `terminate()`, `wait_for_ready()`, `id` (property), `is_ready()` (sync) |
 | `SessionConfig` | Constructor with all options |
 | `OutputStream` | Async iterator (`async for chunk in stream`) |
 

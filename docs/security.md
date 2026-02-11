@@ -22,8 +22,10 @@ Threat model and security implementation details.
 
 1. **Memory safety** - `#![forbid(unsafe_code)]`
 2. **AWS transport security** - All SSM traffic encrypted via TLS (WSS)
-3. **Input validation** - Defensive parsing throughout
+3. **Input validation** - Target format validation, defensive parsing
 4. **Rate limiting** - Built-in DoS protection
+5. **Secret scrubbing** - `zeroize` erases tokens from memory on drop
+6. **Dead connection detection** - Pong tracking detects silent failures
 
 ---
 
@@ -32,7 +34,7 @@ Threat model and security implementation details.
 | Threat | Mitigation |
 |:-------|:-----------|
 | Message tampering | SHA-256 digest validation |
-| Credential leakage | Redacted Debug impls, URL sanitization |
+| Credential leakage | Redacted Debug impls, URL sanitization, `zeroize` token scrubbing |
 | Replay attacks | Sequence number tracking |
 | DoS (large messages) | 10MB max payload |
 | DoS (message flood) | Rate limiting (configurable) |
@@ -44,9 +46,25 @@ Threat model and security implementation details.
 ## Credential Handling
 
 Credentials are automatically sanitized:
+- Session tokens scrubbed from memory on drop via `zeroize` crate
 - Session tokens skipped in tracing spans
 - URLs sanitized to remove query parameters in logs
 - Custom `Debug` impls redact sensitive fields
+- Token properly URL-encoded to prevent injection
+
+---
+
+## Target Validation
+
+Session targets are validated against known AWS formats before API calls:
+
+| Format | Example |
+|:-------|:--------|
+| EC2 instance | `i-0123456789abcdef0` |
+| Managed instance | `mi-0123456789abcdef0` |
+| ARN | `arn:aws:ssm:us-east-1:123456789012:...` |
+
+Invalid targets are rejected immediately with a descriptive error.
 
 ---
 

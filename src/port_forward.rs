@@ -40,7 +40,9 @@ pub struct PortForwardConfig {
 impl Default for PortForwardConfig {
     fn default() -> Self {
         Self {
-            local_addr: "127.0.0.1:0".parse().unwrap(), // Random port
+            local_addr: "127.0.0.1:0"
+                .parse()
+                .expect("127.0.0.1:0 is a valid socket address"), // Random port
             remote_port: 0,
             max_connections: 10,
         }

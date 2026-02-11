@@ -124,12 +124,12 @@ impl MockSsmServer {
                     i as i64,
                     format!("Message {}\n", i).as_bytes(),
                 );
-                ws_stream.send(Message::Text(output)).await?;
+                ws_stream.send(Message::Text(output.into())).await?;
             }
 
             // Send channel closed
             let close_msg = super::create_channel_closed_message("stdout", "");
-            ws_stream.send(Message::Text(close_msg)).await?;
+            ws_stream.send(Message::Text(close_msg.into())).await?;
             debug!("Connection closed after {} messages", count);
             ws_stream.close(None).await?;
             return Ok(());
@@ -140,7 +140,7 @@ impl MockSsmServer {
             match msg {
                 Ok(Message::Text(text)) => {
                     debug!("Received text message: {}", text);
-                    self.received_messages.lock().await.push(text.clone());
+                    self.received_messages.lock().await.push(text.to_string());
 
                     // Parse message type
                     if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -166,11 +166,11 @@ impl MockSsmServer {
                                         // Send output
                                         let output =
                                             super::create_output_message("stdout", seq, &decoded);
-                                        ws_stream.send(Message::Text(output)).await?;
+                                        ws_stream.send(Message::Text(output.into())).await?;
 
                                         // Send acknowledge
                                         let ack = super::create_ack_message(msg_id, seq);
-                                        ws_stream.send(Message::Text(ack)).await?;
+                                        ws_stream.send(Message::Text(ack.into())).await?;
                                     }
                                 }
                             }
@@ -178,13 +178,13 @@ impl MockSsmServer {
                                 debug!("Received pause_publication");
                                 // Send acknowledge
                                 let ack = super::create_ack_message(msg_id, seq);
-                                ws_stream.send(Message::Text(ack)).await?;
+                                ws_stream.send(Message::Text(ack.into())).await?;
                             }
                             "start_publication" => {
                                 debug!("Received start_publication");
                                 // Send acknowledge
                                 let ack = super::create_ack_message(msg_id, seq);
-                                ws_stream.send(Message::Text(ack)).await?;
+                                ws_stream.send(Message::Text(ack.into())).await?;
                             }
                             _ => {
                                 debug!("Unknown message type: {}", msg_type);

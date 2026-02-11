@@ -442,11 +442,12 @@ impl ReliableSender {
 
 /// Buffer for out-of-order incoming messages
 ///
-/// Matches AWS IncomingMessageBuffer (HashMap-based, capacity-limited)
+/// Matches AWS IncomingMessageBuffer (capacity-limited).
+/// Uses `BTreeMap` for consistent ordered iteration and defense against HashDoS.
 /// Messages are stored when seq > expected and processed when gaps are filled.
 pub struct IncomingMessageBuffer {
-    /// Messages stored by sequence number
-    messages: RwLock<std::collections::HashMap<i64, BufferedMessage>>,
+    /// Messages stored by sequence number (ordered)
+    messages: RwLock<std::collections::BTreeMap<i64, BufferedMessage>>,
     /// Maximum buffer capacity
     capacity: usize,
 }
@@ -466,7 +467,7 @@ impl IncomingMessageBuffer {
     /// Create a new incoming message buffer
     pub fn new(capacity: usize) -> Self {
         Self {
-            messages: RwLock::new(std::collections::HashMap::new()),
+            messages: RwLock::new(std::collections::BTreeMap::new()),
             capacity,
         }
     }
@@ -624,7 +625,9 @@ impl OutgoingMessageBuffer {
             .iter()
             .position(|m| m.sequence_number == sequence_number)
         {
-            let msg = messages.remove(pos).unwrap();
+            let msg = messages
+                .remove(pos)
+                .expect("index was just found via position()");
 
             // Calculate RTT and update timeout (only if this was first transmission)
             if msg.resend_attempt == 0 {

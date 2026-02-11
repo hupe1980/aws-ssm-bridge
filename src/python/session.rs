@@ -108,18 +108,16 @@ impl PySessionConfig {
 #[pyclass(name = "Session")]
 pub struct PySession {
     inner: Arc<tokio::sync::Mutex<crate::Session>>,
+    /// Cached session ID (avoids async lock for a read-only field)
+    session_id: String,
 }
 
 #[pymethods]
 impl PySession {
-    /// Get session ID
+    /// Get session ID (synchronous — no await needed)
     #[getter]
-    fn id<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let session = Arc::clone(&self.inner);
-        future_into_py(py, async move {
-            let session_guard = session.lock().await;
-            Ok(session_guard.id().to_string())
-        })
+    fn id(&self) -> String {
+        self.session_id.clone()
     }
 
     /// Get session state
@@ -138,16 +136,19 @@ impl PySession {
         })
     }
 
-    /// Check if the session is ready to send data.
+    /// Check if the session is ready to send data (synchronous — no await needed).
     ///
     /// The session is ready once the SSM agent has completed the handshake
     /// and sent the start_publication message.
-    fn is_ready<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let session = Arc::clone(&self.inner);
-        future_into_py(py, async move {
-            let session_guard = session.lock().await;
-            Ok(session_guard.is_ready())
-        })
+    fn is_ready(&self) -> bool {
+        // is_ready() only reads an AtomicBool — no lock needed
+        // We access it through a short lock, but since we cached session_id
+        // and is_ready is atomic, we can use try_lock for a non-blocking check
+        if let Ok(guard) = self.inner.try_lock() {
+            guard.is_ready()
+        } else {
+            false
+        }
     }
 
     /// Wait for the session to become ready.
@@ -163,6 +164,8 @@ impl PySession {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let timeout = std::time::Duration::from_secs_f64(timeout_secs);
+            // Acquire lock briefly to call wait_for_ready, which uses Notify
+            // internally (no spin-polling, so holding the lock is fine now)
             let session_guard = session.lock().await;
             Ok(session_guard.wait_for_ready(timeout).await)
         })
@@ -219,7 +222,7 @@ impl PySession {
         })
     }
 
-    /// Async context manager entry.
+    /// Async context manager entry — returns `self` (preserves object identity).
     ///
     /// Allows using `async with` syntax:
     /// ```python
@@ -229,6 +232,7 @@ impl PySession {
     /// ```
     fn __aenter__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&slf.inner);
+        let self_obj: Py<PySession> = slf.into();
         future_into_py(py, async move {
             // Wait for ready with default timeout
             let session_guard = session.lock().await;
@@ -236,7 +240,7 @@ impl PySession {
                 .wait_for_ready(std::time::Duration::from_secs(30))
                 .await;
             drop(session_guard);
-            Ok(PySession { inner: session })
+            Ok(self_obj)
         })
     }
 
@@ -259,7 +263,7 @@ impl PySession {
     }
 
     fn __repr__(&self) -> String {
-        "Session()".to_string()
+        format!("Session(id='{}')", self.session_id)
     }
 }
 
@@ -272,18 +276,29 @@ pub struct PySessionManager {
 #[pymethods]
 impl PySessionManager {
     /// Create a new session manager
+    ///
+    /// If `region` is provided, it overrides the default AWS region.
     #[staticmethod]
+    #[pyo3(signature = (region=None))]
     #[allow(clippy::new_ret_no_self)]
-    fn new(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    fn new(py: Python<'_>, region: Option<String>) -> PyResult<Bound<'_, PyAny>> {
         future_into_py(py, async move {
-            let manager = SessionManager::new().await.map_err(to_py_err)?;
+            let config = if let Some(ref region) = region {
+                aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .region(aws_config::Region::new(region.clone()))
+                    .load()
+                    .await
+            } else {
+                aws_config::load_from_env().await
+            };
+            let manager = SessionManager::with_config(&config);
             Ok(PySessionManager {
                 inner: Arc::new(RwLock::new(manager)),
             })
         })
     }
 
-    /// Start a new SSM session
+    /// Start a new SSM session with individual parameters
     #[pyo3(signature = (target, region=None, session_type=None, document_name=None, parameters=None, reason=None))]
     #[allow(clippy::too_many_arguments)]
     fn start_session<'py>(
@@ -332,8 +347,33 @@ impl PySessionManager {
                 .await
                 .map_err(to_py_err)?;
 
+            let session_id = session.id().to_string();
             Ok(PySession {
                 inner: Arc::new(tokio::sync::Mutex::new(session)),
+                session_id,
+            })
+        })
+    }
+
+    /// Start a new SSM session from a SessionConfig object
+    fn start_session_with_config<'py>(
+        &self,
+        py: Python<'py>,
+        config: PySessionConfig,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let manager = Arc::clone(&self.inner);
+
+        future_into_py(py, async move {
+            let manager_guard = manager.read().await;
+            let session = manager_guard
+                .start_session(config.inner)
+                .await
+                .map_err(to_py_err)?;
+
+            let session_id = session.id().to_string();
+            Ok(PySession {
+                inner: Arc::new(tokio::sync::Mutex::new(session)),
+                session_id,
             })
         })
     }

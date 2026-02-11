@@ -131,24 +131,30 @@ impl std::fmt::Debug for ShutdownSignal {
 /// returns early.
 pub struct ShutdownGuard {
     signal: ShutdownSignal,
+    armed: bool,
 }
 
 impl ShutdownGuard {
     /// Create a new shutdown guard.
     pub fn new(signal: ShutdownSignal) -> Self {
-        Self { signal }
+        Self {
+            signal,
+            armed: true,
+        }
     }
 
     /// Disarm the guard without triggering shutdown.
-    pub fn disarm(self) {
-        std::mem::forget(self);
+    pub fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for ShutdownGuard {
     fn drop(&mut self) {
-        debug!("ShutdownGuard dropped, triggering shutdown");
-        self.signal.shutdown();
+        if self.armed {
+            debug!("ShutdownGuard dropped, triggering shutdown");
+            self.signal.shutdown();
+        }
     }
 }
 
@@ -282,7 +288,7 @@ mod tests {
         let signal = ShutdownSignal::new();
 
         {
-            let guard = ShutdownGuard::new(signal.clone());
+            let mut guard = ShutdownGuard::new(signal.clone());
             guard.disarm();
             // Guard is disarmed, won't trigger shutdown on drop
         }

@@ -25,10 +25,12 @@ Unlike the [official AWS Session Manager Plugin](https://github.com/aws/session-
 
 - **Binary Protocol**: Full 116-byte AWS header, SHA-256 digest validation
 - **Reliable Delivery**: Sequence tracking, ACK/retransmission, RTT estimation (Jacobson/Karels)
+- **Lock-Free Architecture**: Dedicated writer task via mpsc channel, no mutex contention
+- **Dead Connection Detection**: Pong-based heartbeat tracking with configurable threshold
 - **Interactive Shell**: Raw terminal mode, resize handling (SIGWINCH)
 - **Port Forwarding**: TCP tunneling via `PortForwarder`
 - **Python Bindings**: Async support via PyO3, type stubs included
-- **Security**: `#![forbid(unsafe_code)]`, rate limiting, SSRF protection
+- **Security**: `#![forbid(unsafe_code)]`, zeroize token scrubbing, rate limiting, SSRF protection, target validation
 
 ---
 
@@ -217,9 +219,10 @@ Run with: `python python_examples/interactive_shell.py i-0123456789abcdef0`
 src/
 ├── lib.rs              # Public API
 ├── binary_protocol.rs  # 116-byte header, SHA-256
-├── session.rs          # Session lifecycle
-├── connection.rs       # WebSocket, retransmit
-├── ack.rs              # ACK tracking, RTT
+├── session.rs          # Session lifecycle, target validation
+├── connection.rs       # WebSocket, writer task, retransmit, pong tracking
+├── channels.rs         # BroadcastStream-backed output multiplexer
+├── ack.rs              # ACK tracking, RTT (Jacobson/Karels)
 ├── handshake.rs        # 3-phase handshake
 ├── port_forward.rs     # TCP tunneling
 ├── rate_limit.rs       # Token bucket
@@ -231,9 +234,12 @@ src/
 ## Security
 
 - `#![forbid(unsafe_code)]`
+- `zeroize` scrubs session tokens from memory on drop
+- Target format validation (EC2 instance, managed instance, ARN)
 - SSRF protection (AWS endpoint validation)
 - Rate limiting (configurable token bucket)
 - TLS required (WSS only)
+- Dead connection detection via pong tracking
 - AWS transport encryption (all SSM traffic is encrypted)
 
 See [Security Documentation](docs/security.md) for threat model and details.

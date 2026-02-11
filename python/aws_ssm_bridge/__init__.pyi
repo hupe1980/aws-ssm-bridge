@@ -10,6 +10,22 @@ __version__: str
 """Package version string."""
 
 
+def configure_logging(level: str = "warn") -> None:
+    """
+    Configure logging verbosity for the Rust backend.
+
+    Call this before creating a SessionManager to control log output.
+    Note: logging can only be configured once per process.
+
+    Alternatively, set the RUST_LOG environment variable (e.g. RUST_LOG=debug).
+
+    Args:
+        level: Log level - "off", "error", "warn", "info", "debug", or "trace".
+               Defaults to "warn".
+    """
+    ...
+
+
 class SessionType:
     """Session type enumeration for AWS SSM Session Manager."""
     
@@ -150,8 +166,8 @@ class Session:
         ...
     
     @property
-    async def id(self) -> str:
-        """Session ID assigned by AWS."""
+    def id(self) -> str:
+        """Session ID assigned by AWS (synchronous — no await needed)."""
         ...
     
     async def state(self) -> str:
@@ -163,9 +179,9 @@ class Session:
         """
         ...
     
-    async def is_ready(self) -> bool:
+    def is_ready(self) -> bool:
         """
-        Check if the session is ready to send data.
+        Check if the session is ready to send data (synchronous — no await needed).
         
         The session is ready once the SSM agent has completed the handshake
         and sent the start_publication message.
@@ -271,11 +287,17 @@ class SessionManager:
     """
     
     @staticmethod
-    async def new() -> "SessionManager":
+    async def new(region: Optional[str] = None) -> "SessionManager":
         """
         Create a new session manager.
         
         Initializes AWS SDK and loads credentials from the default chain.
+        
+        Args:
+            region: AWS region override. If provided, all sessions created by
+                this manager will default to this region. If ``None``, the
+                standard AWS region resolution order is used (env vars,
+                config files, instance metadata).
         
         Returns:
             SessionManager: Ready to create sessions
@@ -285,6 +307,8 @@ class SessionManager:
         
         Example:
             >>> manager = await SessionManager.new()
+            >>> # or with explicit region:
+            >>> manager = await SessionManager.new(region="eu-west-1")
         """
         ...
     
@@ -321,6 +345,32 @@ class SessionManager:
             ...     region="us-west-2",
             ...     reason="Investigating disk space issue"
             ... )
+        """
+        ...
+    
+    async def start_session_with_config(
+        self,
+        config: SessionConfig,
+    ) -> Session:
+        """
+        Start a new SSM session from a SessionConfig object.
+        
+        Prefer this when reusing configurations or when type-safe config
+        construction via ``SessionConfig(...)`` is desired.
+        
+        Args:
+            config: Pre-built session configuration
+        
+        Returns:
+            Session: Connected session ready for use
+        
+        Raises:
+            RuntimeError: If session creation fails
+            ValueError: If configuration is invalid
+        
+        Example:
+            >>> cfg = SessionConfig("i-1234567890abcdef0", region="us-west-2")
+            >>> session = await manager.start_session_with_config(cfg)
         """
         ...
     

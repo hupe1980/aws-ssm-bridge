@@ -60,6 +60,9 @@ async def main():
     # Create manager (loads AWS credentials from default chain)
     manager = await SessionManager.new()
     
+    # Or specify a region explicitly
+    manager = await SessionManager.new(region="us-west-2")
+    
     # Start session with options
     session = await manager.start_session(
         target="i-0123456789abcdef0",
@@ -70,6 +73,8 @@ async def main():
     
     # Wait for session to be ready
     if await session.wait_for_ready(timeout_secs=30.0):
+        print(f"Connected: {session.id}")  # id is a sync property
+        print(f"Ready: {session.is_ready()}")  # is_ready() is sync
         await session.send(b"hostname\n")
         async for chunk in await session.output():
             print(chunk.decode(), end="")
@@ -224,6 +229,11 @@ from aws_ssm_bridge import SessionManager, Session, OutputStream
 
 async def example(manager: SessionManager) -> None:
     session: Session = await manager.start_session(target="i-xxx")
+    
+    # id and is_ready() are synchronous — no await needed
+    session_id: str = session.id
+    ready: bool = session.is_ready()
+    
     stream: OutputStream = await session.output()
     
     async for chunk in stream:
