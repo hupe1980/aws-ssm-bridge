@@ -80,7 +80,8 @@ type WsReader = SplitStream<WsStream>;
 
 /// Open data channel input - sent as JSON after WebSocket connects.
 ///
-/// **Security**: Debug impl is removed to prevent accidental token leakage in logs.
+/// **Security**: Has a manual `Debug` implementation that redacts `token_value`
+/// to prevent accidental token leakage in logs.
 /// Implements `Zeroize` to scrub `token_value` from memory on drop.
 /// `Clone` is intentionally absent — no copies of the session token should exist.
 #[derive(Serialize, Deserialize, Zeroize)]

@@ -247,9 +247,20 @@ async fn send_task(session: Arc<Session>, mut frame_rx: mpsc::Receiver<Bytes>, i
             frame = frame_rx.recv() => {
                 match frame {
                     Some(f) => {
-                        if let Err(e) = session.send(f).await {
-                            warn!(error = ?e, "smux send task: session error");
-                            break;
+                        // Subscribe to `die` *before* starting the send so that
+                        // a concurrent `notify_waiters()` during the send is not
+                        // missed (Tokio's Notify only wakes current subscribers).
+                        let die = inner.die.notified();
+                        tokio::pin!(die);
+                        tokio::select! {
+                            biased;
+                            _ = &mut die => break,
+                            result = session.send(f) => {
+                                if let Err(e) = result {
+                                    warn!(error = ?e, "smux send task: session error");
+                                    break;
+                                }
+                            }
                         }
                     }
                     None => break,

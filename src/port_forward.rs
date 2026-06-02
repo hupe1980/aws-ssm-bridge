@@ -108,8 +108,8 @@ impl PortForwarder {
     /// Requires the SSM session to have been started with a mux-capable
     /// document such as `AWS-StartPortForwardingSessionToRemoteHost`.
     /// L-3: Accepts a `ShutdownSignal` so the forwarding loop can be
-    /// cancelled cleanly (e.g. from `Ctrl-C` or session termination) without
-    /// leaving a dangling `TcpListener` open.
+    /// cancelled cleanly (e.g. from `Ctrl-C` or session termination);
+    /// on shutdown the listener is explicitly dropped to release the bound port.
     #[instrument(skip(self, session, shutdown))]
     pub async fn forward(
         &mut self,
@@ -146,6 +146,7 @@ impl PortForwarder {
 
                 _ = shutdown.cancelled() => {
                     info!("Port forwarder shutdown requested");
+                    self.listener = None; // release the bound port immediately
                     return Ok(());
                 }
 
