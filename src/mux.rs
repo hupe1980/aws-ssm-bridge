@@ -211,8 +211,13 @@ async fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) -> bool {
         // buffer would allow unbounded memory growth while waiting for a frame
         // that may never arrive — treat it as a fatal protocol violation.
         if buf.len() >= HEADER_SIZE {
+            let version = buf[0];
             let length = u16::from_le_bytes([buf[2], buf[3]]) as usize;
-            if length > MAX_PAYLOAD {
+            // Only enforce MAX_PAYLOAD for version-1 frames.  Unknown-version
+            // frames are discarded by decode_frame (buf.advance past the whole
+            // frame), so applying this guard to them would misclassify a
+            // garbled-length unknown-version frame as a v1 protocol violation.
+            if version == VERSION && length > MAX_PAYLOAD {
                 warn!(
                     length,
                     MAX_PAYLOAD,

@@ -163,6 +163,14 @@ impl PySession {
         py: Python<'py>,
         timeout_secs: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Validate before entering the async block: Duration::from_secs_f64
+        // panics on NaN, infinite, or negative values, which would abort the
+        // entire Python process.
+        if !timeout_secs.is_finite() || timeout_secs < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "timeout_secs must be a non-negative finite number, got {timeout_secs}"
+            )));
+        }
         let can_send = Arc::clone(&self.protocol_can_send);
         let ready_notify = Arc::clone(&self.ready_notify);
         future_into_py(py, async move {

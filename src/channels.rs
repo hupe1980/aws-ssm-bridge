@@ -175,10 +175,14 @@ impl ChannelMultiplexer {
     /// fast as it arrives.
     pub fn subscribe_lossless(&self) -> mpsc::UnboundedReceiver<Bytes> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.direct_subs
-            .lock()
-            .expect("direct_subs lock poisoned")
-            .push(tx);
+        let mut guard = self.direct_subs.lock().expect("direct_subs lock poisoned");
+        // Check the closed flag *while holding the lock* to close the race
+        // with close(), which sets `closed` before acquiring this same lock.
+        // If already closed, `tx` is dropped here so `rx.recv()` returns
+        // None immediately instead of hanging forever.
+        if !self.closed.load(Ordering::SeqCst) {
+            guard.push(tx);
+        }
         rx
     }
 }
