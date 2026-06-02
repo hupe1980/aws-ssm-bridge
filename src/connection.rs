@@ -1281,6 +1281,12 @@ impl ConnectionManager {
     async fn shutdown(self) -> Result<()> {
         info!("Shutting down connection manager");
 
+        // Close the channel multiplexer so all Session::output() consumers
+        // immediately see EOF rather than blocking forever.  The receiver task
+        // also exits on the shutdown broadcast below, but races mean it may not
+        // have closed the channels yet when consumers check.
+        self.channels.close();
+
         // Signal all tasks to shutdown
         let _ = self.shutdown_tx.send(());
 

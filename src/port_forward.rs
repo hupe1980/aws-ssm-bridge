@@ -193,29 +193,47 @@ impl PortForwarder {
         }
     }
 
-    /// Bidirectionally copy between a local TCP connection and a smux stream.
+    /// Copy between a local TCP connection and a smux stream in both directions.
     ///
-    /// Races the copy against the shutdown signal so that in-flight connections
-    /// are aborted promptly when shutdown is requested rather than waiting for
-    /// the TCP sockets to close on their own.
+    /// Two independent one-way `copy` futures run concurrently; the select exits
+    /// as soon as **either** direction completes or errors.  This avoids the
+    /// zombie-connection problem with `copy_bidirectional`: after the remote sends
+    /// `CMD_FIN` the smux read half returns EOF, but `copy_bidirectional` would
+    /// keep draining the local TCP socket and writing PSH frames into a stream
+    /// the remote has already closed.
     #[instrument(skip(stream, mux, shutdown))]
     async fn handle_connection(
-        mut stream: TcpStream,
+        stream: TcpStream,
         mux: Arc<SmuxSession>,
         shutdown: crate::shutdown::ShutdownSignal,
     ) -> Result<()> {
         debug!("Starting connection handler");
 
-        let mut smux_stream = mux.open_stream()?;
+        let smux_stream = mux.open_stream()?;
+
+        let (mut tcp_rx, mut tcp_tx) = stream.into_split();
+        let (mut smux_rx, mut smux_tx) = tokio::io::split(smux_stream);
+
+        let local_to_remote = tokio::io::copy(&mut tcp_rx, &mut smux_tx);
+        let remote_to_local = tokio::io::copy(&mut smux_rx, &mut tcp_tx);
+        tokio::pin!(local_to_remote, remote_to_local);
 
         tokio::select! {
             biased;
-            result = tokio::io::copy_bidirectional(&mut stream, &mut smux_stream) => {
-                result.map_err(Error::Io)?;
-                info!("Connection handler completed");
-            }
             _ = shutdown.cancelled() => {
                 debug!("Connection handler cancelled due to shutdown");
+            }
+            res = &mut local_to_remote => {
+                match res {
+                    Ok(n) => info!(bytes = n, "Local\u{2192}remote copy completed"),
+                    Err(e) => return Err(Error::Io(e)),
+                }
+            }
+            res = &mut remote_to_local => {
+                match res {
+                    Ok(n) => info!(bytes = n, "Remote\u{2192}local copy completed"),
+                    Err(e) => return Err(Error::Io(e)),
+                }
             }
         }
 
