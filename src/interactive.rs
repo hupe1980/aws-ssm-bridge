@@ -214,8 +214,23 @@ impl InteractiveShell {
         self.terminal.stop();
         session.terminate().await?;
 
+        // In raw mode OPOST is disabled, so bare `\n` is a line-feed only
+        // (cursor down, no carriage return).  If the last session output ended
+        // mid-line the cursor could be at column N > 0, which would cause zsh's
+        // PROMPT_SP to fire (the `%` block with surrounding spaces) after exit.
+        // Writing an explicit `\r\n` while still in raw mode guarantees column 0.
+        {
+            use std::io::Write;
+            let _ = std::io::stdout().lock().write_all(b"\r\n");
+        }
+
+        // Restore terminal BEFORE printing the banner so that the subsequent
+        // `println!` runs in cooked mode with OPOST/ONLCR re-enabled and
+        // `\n` correctly translates to `\r\n`.
+        drop(_raw_guard);
+
         if self.config.show_banner {
-            println!("\n\x1b[33mSession terminated.\x1b[0m\n");
+            println!("\x1b[33mSession terminated.\x1b[0m\n");
         }
 
         result

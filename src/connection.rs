@@ -468,6 +468,22 @@ impl ConnectionManager {
                                 // data is already Bytes (reference counted) — clone is cheap
                                 match ClientMessage::deserialize(data.clone()) {
                                     Ok(msg) => {
+                                        // Advisory digest check: warn but still process.
+                                        // Some AWS SSM agent versions send messages where
+                                        // payload_digest was computed over a different byte
+                                        // sequence.  Dropping these messages can break the
+                                        // session (e.g. HandshakeComplete or start_publication
+                                        // gets silently lost).  Authentication is the TLS/SigV4
+                                        // layer, not this field.
+                                        if !msg.verify_digest() {
+                                            warn!(
+                                                message_type = %msg.message_type,
+                                                sequence = msg.sequence_number,
+                                                payload_type = ?msg.payload_type,
+                                                "Payload digest mismatch (known AWS agent quirk); \
+                                                 processing message anyway"
+                                            );
+                                        }
                                         debug!(
                                             message_type = %msg.message_type,
                                             sequence = msg.sequence_number,

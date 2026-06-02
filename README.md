@@ -110,9 +110,10 @@ use aws_ssm_bridge::{SessionBuilder, PortForwardConfig, PortForwarder,
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let signal = ShutdownSignal::new();
-    install_signal_handlers(signal.clone());
+    let shutdown = ShutdownSignal::new();
+    install_signal_handlers(shutdown.clone());
 
+    // Remote port belongs in the session document, not PortForwardConfig.
     let session = Arc::new(
         SessionBuilder::new("i-0123456789abcdef0")
             .port_forward(80)
@@ -120,15 +121,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?
     );
 
-    let config = PortForwardConfig {
+    // bind() binds the local TCP port immediately; local_addr() returns the
+    // actual address (useful when port 0 was requested for an OS-assigned port).
+    let forwarder = PortForwarder::bind(PortForwardConfig {
         local_addr: "127.0.0.1:8080".parse::<SocketAddr>()?,
-        remote_port: 80,
         ..Default::default()
-    };
-    let mut forwarder = PortForwarder::new(config);
-    let local_addr = forwarder.listen().await?;
-    println!("Forwarding {local_addr} -> remote:80");
-    forwarder.forward(session, signal).await?;
+    }).await?;
+    println!("Forwarding {} -> remote:80", forwarder.local_addr());
+    forwarder.forward(session, shutdown).await?;
     Ok(())
 }
 ```
@@ -158,12 +158,9 @@ Use type-safe document wrappers instead of magic strings:
 ```rust
 use aws_ssm_bridge::{SessionBuilder, documents::*};
 
-// Port forwarding to instance
+// Port forwarding to instance (remote port 3306)
 let session = SessionBuilder::new("i-xxx")
-    .document(PortForwardingSession::builder()
-        .remote_port(3306)
-        .local_port(13306)
-        .build())
+    .document(PortForwardingSession::new(3306))
     .build().await?;
 
 // Port forwarding through bastion to RDS

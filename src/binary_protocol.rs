@@ -354,7 +354,20 @@ impl ClientMessage {
         Ok(msg)
     }
 
-    /// Validate message integrity
+    /// Validate structural integrity of the message.
+    ///
+    /// Checks bounds and length fields that, if wrong, indicate a framing
+    /// error or protocol violation — the message cannot be safely processed.
+    ///
+    /// **Digest validation is intentionally excluded here.**  Some AWS SSM agent
+    /// versions send messages where `payload_digest` was computed over a
+    /// different byte sequence (e.g. the pre-encryption buffer rather than the
+    /// on-wire payload).  These messages are valid and must be processed.  The
+    /// Go reference implementation (`session-manager-plugin`) logs a warning on
+    /// digest mismatch but does not drop the message.  Call [`verify_digest`]
+    /// separately to obtain the advisory digest result.
+    ///
+    /// [`verify_digest`]: Self::verify_digest
     pub fn validate(&self) -> Result<()> {
         // Check header length
         if self.header_length != HEADER_LENGTH {
@@ -385,26 +398,32 @@ impl ClientMessage {
             .into());
         }
 
-        // Validate payload digest (SHA-256)
-        // Note: Simple comparison is fine here - the digest is not secret.
-        // An attacker who can observe the message already has the payload
-        // and can compute the correct digest themselves.
-        //
-        // AWS sends some control messages with empty payloads where the digest
-        // is all zeros rather than SHA-256(""). We accept zero-filled digests
-        // for empty payloads since they indicate "not applicable".
-        let is_zero_digest = self.payload_digest == [0u8; 32];
-        if !(self.payload.is_empty() && is_zero_digest) {
-            let computed_digest = compute_digest(&self.payload);
-            if computed_digest != self.payload_digest {
-                return Err(ProtocolError::InvalidMessage(
-                    "Payload digest validation failed (SHA-256 mismatch)".to_string(),
-                )
-                .into());
-            }
-        }
-
         Ok(())
+    }
+
+    /// Check whether the payload digest matches the actual payload (advisory).
+    ///
+    /// Returns `true` if the digest is valid.  This is an advisory check only:
+    /// callers should log a warning on `false` but still process the message.
+    ///
+    /// The check is skipped (returns `true`) when the digest field is
+    /// all-zeros, which AWS uses to signal "not applicable" for control
+    /// messages whose payload digest was intentionally omitted.
+    ///
+    /// # Why advisory?
+    ///
+    /// Some AWS SSM agent versions send messages where `payload_digest` was
+    /// computed over a different byte sequence than the on-wire payload (a
+    /// known agent-side quirk).  Authentication is provided by the TLS session
+    /// and AWS SigV4 credentials on the WebSocket — the digest field is a
+    /// data-integrity hint, not the primary authenticity mechanism.  The Go
+    /// reference implementation matches this advisory semantics.
+    pub fn verify_digest(&self) -> bool {
+        // Zero-filled digest is an explicit "not applicable" signal.
+        if self.payload_digest == [0u8; 32] {
+            return true;
+        }
+        compute_digest(&self.payload) == self.payload_digest
     }
 }
 
@@ -531,32 +550,51 @@ mod tests {
         assert!(msg.validate().is_err());
         msg.header_length = HEADER_LENGTH;
 
-        // Invalid payload digest
-        msg.payload_digest = [0u8; 32];
-        assert!(msg.validate().is_err());
+        // Digest is no longer checked in validate() — it is an advisory check
+        // via verify_digest().  Structural checks (header_length, payload_length,
+        // sequence bounds) are still enforced.
     }
 
     #[test]
-    fn test_empty_payload_digest_validated() {
-        // Empty payload with correct SHA-256("") digest must pass
+    fn test_verify_digest() {
+        let payload = Bytes::from_static(b"hello");
         let msg = ClientMessage::new(
             MessageType::InputStreamData,
             0,
             PayloadType::Output,
-            Bytes::new(), // empty
+            payload,
         );
+        // Freshly created message has correct digest
+        assert!(msg.verify_digest());
+
+        // Zero-filled digest = "not applicable" → always valid
+        let mut zero_digest = msg.clone();
+        zero_digest.payload_digest = [0u8; 32];
+        assert!(zero_digest.verify_digest());
+
+        // Wrong non-zero digest → invalid
+        let mut bad_digest = msg;
+        bad_digest.payload_digest = [0xFFu8; 32];
+        assert!(!bad_digest.verify_digest());
+    }
+
+    #[test]
+    fn test_empty_payload_digest() {
+        // Empty payload: correct SHA-256("") digest passes
+        let msg = ClientMessage::new(
+            MessageType::InputStreamData,
+            0,
+            PayloadType::Output,
+            Bytes::new(),
+        );
+        assert!(msg.verify_digest());
         assert!(msg.validate().is_ok());
 
-        // AWS sends some control messages with empty payload and zero-filled digest
-        // (meaning "not applicable") — this must also pass
-        let mut zeros = msg.clone();
+        // Zero-filled digest on empty payload also valid (AWS "not applicable")
+        let mut zeros = msg;
         zeros.payload_digest = [0u8; 32];
+        assert!(zeros.verify_digest());
         assert!(zeros.validate().is_ok());
-
-        // Tampered digest (non-zero, non-matching) on empty payload must fail
-        let mut tampered = msg;
-        tampered.payload_digest = [0xFFu8; 32];
-        assert!(tampered.validate().is_err());
     }
 
     #[test]
