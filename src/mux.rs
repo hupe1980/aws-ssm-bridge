@@ -144,13 +144,17 @@ pub enum StreamCloseReason {
 // Sentinel stored in `SmuxStream::close_reason_tag` while the stream is still open.
 const REASON_OPEN: u8 = 255;
 
+/// Per-stream entry stored in [`Inner::streams`]:
+/// the inbound-data sender and a close-reason tag shared with the stream reader.
+type StreamEntry = (mpsc::Sender<Bytes>, Arc<AtomicU8>);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared inner state
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct Inner {
     /// Active streams: stream_id → (sender for inbound data, close-reason tag).
-    streams: Mutex<HashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicU8>)>>,
+    streams: Mutex<HashMap<u32, StreamEntry>>,
     /// Outbound frame queue consumed by the send task.
     frame_tx: mpsc::Sender<Bytes>,
     /// Next stream ID for client-initiated streams (odd: 1, 3, 5 …).
