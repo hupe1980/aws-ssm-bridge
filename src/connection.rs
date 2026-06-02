@@ -581,8 +581,15 @@ impl ConnectionManager {
         tokio::spawn(async move {
             debug!("Writer task started");
 
-            let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-            heartbeat.tick().await; // skip the immediate first tick
+            let mut heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+                HEARTBEAT_INTERVAL,
+            );
+            // After a writer.send stall the default Burst policy would fire
+            // multiple ticks back-to-back, falsely incrementing missed_pongs
+            // without a real 30 s gap.  Delay always waits a full interval
+            // from the last processed tick, guaranteeing genuine spacing.
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             let mut missed_pongs: u32 = 0;
             // Set only after writer.send(Ping) returns — guarantees the Ping

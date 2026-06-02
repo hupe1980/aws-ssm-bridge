@@ -536,14 +536,12 @@ impl AsyncRead for SmuxStream {
             return Poll::Ready(Ok(()));
         }
 
-        // Treat a closed mux as clean EOF rather than BrokenPipe so that
-        // copy_bidirectional completes gracefully instead of propagating a
-        // spurious error on normal shutdown.
-        if this.inner.is_closed() {
-            this.read_closed = true;
-            return Poll::Ready(Ok(())); // EOF
-        }
-
+        // Poll the channel before consulting is_closed().  There may still be
+        // frames queued for this stream even after the mux has been closed
+        // (route_psh enqueues before the close flag is set).  Checking
+        // is_closed() first would silently drop those bytes; instead we only
+        // use is_closed() to convert a Pending result into EOF once the channel
+        // is confirmed empty.
         match this.data_rx.poll_recv(cx) {
             Poll::Ready(Some(mut chunk)) => {
                 let n = chunk.len().min(buf.remaining());
@@ -559,7 +557,15 @@ impl AsyncRead for SmuxStream {
                 this.read_closed = true;
                 Poll::Ready(Ok(()))
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                // No data queued.  If the mux is closed no more frames will
+                // ever arrive for this stream — convert Pending to clean EOF.
+                if this.inner.is_closed() {
+                    this.read_closed = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending
+            }
         }
     }
 }
