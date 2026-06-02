@@ -573,11 +573,21 @@ impl ConnectionManager {
     /// but the queue is not yet full.
     ///
     /// **Heartbeat during backpressure**: the message-send path pins its future
-    /// and polls it in a 3-way select (shutdown | heartbeat | send-complete).
-    /// When a heartbeat tick fires while the socket is stalled, pong detection
-    /// runs immediately and `deferred_ping` is set; the Ping is sent once the
-    /// socket becomes free again.  This guarantees dead-connection detection is
-    /// never delayed by a slow or stalled remote.
+    /// and drives it in a 3-way inner `select!` (shutdown | heartbeat | send).
+    /// When a heartbeat tick fires while the socket is stalled:
+    ///
+    /// * **Pong detection** runs once (on the first stall tick) using the
+    ///   `pending_pong` / `pong_received` flags.  Subsequent ticks skip this
+    ///   check because `pending_pong` is cleared after the first detection;
+    ///   re-checking on later ticks would count false negatives for a Ping that
+    ///   hasn't been sent yet.
+    /// * **Send-stall trip-wire**: an independent `send_stall_ticks` counter
+    ///   increments on every stall tick.  After `MAX_MISSED_PONGS` intervals the
+    ///   connection is declared dead and shutdown is triggered.  This covers
+    ///   the case where the OS TCP buffer is permanently full (dead connection)
+    ///   yet the ping/pong path would only ever accumulate a single missed-pong
+    ///   count (because the deferred Ping is never sent while the socket is
+    ///   stuck).
     fn spawn_writer_task(
         mut writer: WsWriter,
         mut rx: mpsc::Receiver<Message>,
@@ -696,6 +706,16 @@ impl ConnectionManager {
                         let send_fut = writer.send(msg);
                         tokio::pin!(send_fut);
 
+                        // Counts heartbeat ticks that fired while the current
+                        // send was in progress.  Used as an independent dead-
+                        // connection trip-wire: if the OS send buffer stays
+                        // full for MAX_MISSED_PONGS consecutive heartbeat
+                        // intervals the connection is almost certainly dead
+                        // even if the TCP stack hasn't timed out yet, so we
+                        // declare it dead ourselves rather than waiting for the
+                        // OS retransmit timeout (which can be minutes).
+                        let mut send_stall_ticks: u32 = 0;
+
                         loop {
                             tokio::select! {
                                 biased;
@@ -706,8 +726,14 @@ impl ConnectionManager {
                                 }
 
                                 _ = heartbeat.tick() => {
-                                    // Socket is busy with the in-flight send; run
-                                    // pong detection now, defer the Ping send.
+                                    // --- Pong detection (runs once per stall, on the
+                                    // first tick only) ---
+                                    // After the first tick `pending_pong` is cleared,
+                                    // so subsequent ticks skip this block.  This is
+                                    // intentional: `pong_received` was consumed on the
+                                    // first tick; re-checking it on later ticks would
+                                    // count false negatives for a ping we haven't
+                                    // sent yet (the deferred one).
                                     if pending_pong {
                                         if !pong_received.swap(false, std::sync::atomic::Ordering::SeqCst) {
                                             missed_pongs += 1;
@@ -725,9 +751,30 @@ impl ConnectionManager {
                                         } else {
                                             missed_pongs = 0;
                                         }
+                                        pending_pong = false;
+                                        deferred_ping = true;
                                     }
-                                    pending_pong = false;
-                                    deferred_ping = true;
+
+                                    // --- Send-stall trip-wire ---
+                                    // Independent of pong state: if the socket has
+                                    // been unable to accept a single write for
+                                    // MAX_MISSED_PONGS heartbeat intervals the
+                                    // OS TCP buffer is persistently full, which
+                                    // indicates a dead or completely saturated
+                                    // connection.
+                                    send_stall_ticks += 1;
+                                    if send_stall_ticks >= MAX_MISSED_PONGS {
+                                        error!(
+                                            stall_ticks = send_stall_ticks,
+                                            threshold = MAX_MISSED_PONGS,
+                                            "Send stalled for {} heartbeat intervals -- \
+                                             connection appears dead, triggering shutdown",
+                                            send_stall_ticks,
+                                        );
+                                        metrics::counter(MetricNames::MESSAGES_RECEIVED, 0, &[("dead_connection", "true")]);
+                                        let _ = shutdown_tx.send(());
+                                        break 'task;
+                                    }
                                     // Keep polling the in-flight send.
                                 }
 

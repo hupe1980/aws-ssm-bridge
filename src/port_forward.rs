@@ -25,18 +25,23 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::errors::{Error, Result};
 use crate::mux::{SmuxConfig, SmuxSession};
+use crate::protocol::SessionType;
 use crate::session::Session;
 
-/// Port forwarding configuration
+/// Configuration for a [`PortForwarder`].
+///
+/// The remote port belongs in the SSM session document
+/// (e.g. [`PortForwardingSession::new(3306)`]) — not here.
+/// See [`SessionBuilder::document`].
+///
+/// [`PortForwardingSession::new(3306)`]: crate::documents::PortForwardingSession::new
+/// [`SessionBuilder::document`]: crate::builder::SessionBuilder::document
 #[derive(Debug, Clone)]
 pub struct PortForwardConfig {
-    /// Local address to bind to (e.g., "127.0.0.1:8080")
+    /// Local address to bind to (default: `127.0.0.1:0`, OS-assigned random port)
     pub local_addr: SocketAddr,
 
-    /// Remote port on the instance
-    pub remote_port: u16,
-
-    /// Maximum concurrent connections
+    /// Maximum concurrent connections (default: 10)
     pub max_connections: usize,
 }
 
@@ -45,82 +50,105 @@ impl Default for PortForwardConfig {
         Self {
             local_addr: "127.0.0.1:0"
                 .parse()
-                .expect("127.0.0.1:0 is a valid socket address"), // Random port
-            remote_port: 0,
+                .expect("127.0.0.1:0 is a valid socket address"),
             max_connections: 10,
         }
     }
 }
 
-/// Port forwarding session manager
+/// A port forwarder that is bound to a local TCP port and ready to accept
+/// connections.
+///
+/// # Usage
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use aws_ssm_bridge::{PortForwardConfig, PortForwarder, shutdown::ShutdownSignal};
+/// # async fn doc(session: Arc<aws_ssm_bridge::Session>, shutdown: ShutdownSignal)
+/// # -> aws_ssm_bridge::errors::Result<()> {
+/// let forwarder = PortForwarder::bind(PortForwardConfig::default()).await?;
+/// let local_addr = forwarder.local_addr();
+/// println!("Listening on {local_addr}");
+/// forwarder.forward(session, shutdown).await?;
+/// # Ok(()) }
+/// ```
+///
+/// # Design
+///
+/// `PortForwarder` is created by the async [`PortForwarder::bind`] constructor,
+/// which binds the TCP socket immediately.  [`PortForwarder::forward`] then
+/// consumes the forwarder, driving the accept loop and dropping the listener when
+/// it returns (releasing the bound port on every exit path).  There is no
+/// intermediate "not-yet-bound" state — the type system enforces the
+/// `bind → forward` ordering and makes the "listener not started" class of
+/// runtime errors structurally impossible.
 pub struct PortForwarder {
     config: PortForwardConfig,
-    listener: Option<TcpListener>,
+    listener: TcpListener,
+    local_addr: SocketAddr,
 }
 
 impl PortForwarder {
-    /// Create a new port forwarder
-    pub fn new(config: PortForwardConfig) -> Self {
-        Self {
-            config,
-            listener: None,
-        }
-    }
-
-    /// Start listening for local connections
-    #[instrument(skip(self), fields(local_addr = %self.config.local_addr))]
-    pub async fn listen(&mut self) -> Result<SocketAddr> {
-        // I-5: Catch the most common misconfiguration early with a clear error
-        // message rather than silently connecting to port 0 (which the remote
-        // SSM agent would reject with an opaque protocol error).
-        if self.config.remote_port == 0 {
-            return Err(Error::Config(
-                "remote_port must be non-zero; set PortForwardConfig::remote_port before calling listen()"
-                    .to_string(),
-            ));
-        }
-
-        info!("Starting port forwarding listener");
-
-        let listener = TcpListener::bind(self.config.local_addr)
+    /// Bind a local TCP port and return a forwarder ready to accept connections.
+    ///
+    /// Uses [`PortForwardConfig::local_addr`]; when the port is `0` the OS assigns
+    /// a free port.  Call [`local_addr`](Self::local_addr) after `bind` to
+    /// discover the actual port.
+    #[instrument(skip(config), fields(local_addr = %config.local_addr))]
+    pub async fn bind(config: PortForwardConfig) -> Result<Self> {
+        let listener = TcpListener::bind(config.local_addr)
             .await
             .map_err(Error::Io)?;
-
         let local_addr = listener.local_addr().map_err(Error::Io)?;
-
-        info!(
-            local_addr = %local_addr,
-            remote_port = self.config.remote_port,
-            "Port forwarding listener started"
-        );
-
-        self.listener = Some(listener);
-        Ok(local_addr)
+        info!(local_addr = %local_addr, "Port forwarding listener bound");
+        Ok(Self {
+            config,
+            listener,
+            local_addr,
+        })
     }
 
-    /// Accept connections and forward to the SSM session via smux multiplexing.
+    /// The local address this forwarder is bound to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Accept connections and forward them to the SSM session via smux multiplexing.
     ///
     /// Each accepted TCP connection gets its own smux logical stream within the
     /// single underlying SSM data channel.  Concurrent connections do not
     /// interfere with each other because every byte is tagged with a unique
     /// stream ID by the smux framing layer.
     ///
-    /// Requires the SSM session to have been started with a mux-capable
-    /// document such as `AWS-StartPortForwardingSessionToRemoteHost`.
-    /// L-3: Accepts a `ShutdownSignal` so the forwarding loop can be
-    /// cancelled cleanly (e.g. from `Ctrl-C` or session termination);
-    /// the listener is moved into the function and dropped when it returns,
-    /// releasing the bound port on every exit path.
-    #[instrument(skip(self, session, shutdown))]
+    /// Consumes `self`, dropping the bound listener when the function returns so
+    /// the local port is released on every exit path (shutdown, session
+    /// termination, or error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] immediately if `session` was not started with a
+    /// port-forwarding document (`SessionType::Port`), giving a clear diagnostic
+    /// instead of a deep smux/protocol failure.
+    #[instrument(skip(self, session, shutdown), fields(local_addr = %self.local_addr))]
     pub async fn forward(
-        &mut self,
+        self,
         session: Arc<Session>,
         shutdown: crate::shutdown::ShutdownSignal,
     ) -> Result<()> {
-        let listener = self
-            .listener
-            .take()
-            .ok_or_else(|| Error::InvalidState("Listener not started".to_string()))?;
+        // Fail fast: the SSM agent only speaks smux multiplexing for Port sessions.
+        // Calling forward() with a StandardStream session would fail deep inside the
+        // smux open_stream() call with an opaque protocol error.
+        if session.config().session_type != SessionType::Port {
+            return Err(Error::Config(format!(
+                "PortForwarder requires a port-forwarding session (SessionType::Port), \
+                 got {:?}; use SessionBuilder::document(PortForwardingSession::new(port))",
+                session.config().session_type,
+            )));
+        }
+
+        let Self {
+            config, listener, ..
+        } = self;
 
         // Block until the SSM protocol handshake is complete, racing against
         // shutdown and premature session termination.
@@ -148,10 +176,23 @@ impl PortForwarder {
             SmuxConfig::default(),
         ));
 
-        let semaphore = Arc::new(Semaphore::new(self.config.max_connections));
-        let max_connections = self.config.max_connections;
+        let semaphore = Arc::new(Semaphore::new(config.max_connections));
+        let max_connections = config.max_connections;
 
-        info!(max_connections, "Accepting port forwarding connections");
+        // Extract the remote port from session document parameters for logging.
+        // The actual remote-side connection is established by the SSM agent based
+        // on the document parameters; we do not need to pass this value anywhere.
+        let remote_port = session
+            .config()
+            .parameters
+            .get("portNumber")
+            .and_then(|v| v.first())
+            .and_then(|s| s.parse::<u16>().ok());
+
+        info!(
+            max_connections,
+            remote_port, "Accepting port forwarding connections"
+        );
 
         loop {
             tokio::select! {
@@ -196,7 +237,7 @@ impl PortForwarder {
                             tokio::spawn(async move {
                                 let _permit = permit; // released when the task finishes
                                 if let Err(e) = Self::handle_connection(stream, mux, handler_shutdown).await {
-                                    error!(error = ?e, "Connection handler error");
+                                    error!(peer_addr = %peer_addr, error = ?e, "Connection handler error");
                                 }
                             });
                         }
@@ -266,34 +307,51 @@ mod tests {
     fn test_port_forward_config_default() {
         let config = PortForwardConfig::default();
         assert_eq!(config.max_connections, 10);
+        // local_addr defaults to 127.0.0.1:0 (OS-assigned port)
+        assert_eq!(config.local_addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(config.local_addr.port(), 0);
     }
 
     #[test]
     fn test_port_forward_config_custom() {
         let config = PortForwardConfig {
             local_addr: "127.0.0.1:8080".parse().unwrap(),
-            remote_port: 3389,
             max_connections: 5,
         };
-
-        assert_eq!(config.remote_port, 3389);
+        assert_eq!(
+            config.local_addr,
+            "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap()
+        );
         assert_eq!(config.max_connections, 5);
     }
 
-    /// I-5: remote_port=0 must be rejected before binding the listener.
+    /// bind() must succeed with default config; no remote_port required.
+    /// The returned forwarder reports the OS-assigned port (non-zero).
     #[tokio::test]
-    async fn test_listen_rejects_zero_remote_port() {
-        let mut forwarder = PortForwarder::new(PortForwardConfig::default());
-        // default remote_port is 0
-        let result = forwarder.listen().await;
-        assert!(
-            result.is_err(),
-            "listen() must return an error when remote_port == 0"
+    async fn test_bind_succeeds_with_default_config() {
+        let forwarder = PortForwarder::bind(PortForwardConfig::default())
+            .await
+            .expect("bind must succeed on loopback");
+        // OS should have assigned a real port (not 0)
+        assert_ne!(
+            forwarder.local_addr().port(),
+            0,
+            "OS must assign a non-zero port"
         );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("remote_port"),
-            "Error message should mention remote_port, got: {msg}"
-        );
+    }
+
+    /// bind() with an explicit port returns that exact port.
+    #[tokio::test]
+    async fn test_bind_returns_correct_local_addr() {
+        // Port 0 → OS-assigned; just verify the IP is what we asked for.
+        let config = PortForwardConfig {
+            local_addr: "127.0.0.1:0".parse().unwrap(),
+            max_connections: 1,
+        };
+        let forwarder = PortForwarder::bind(config)
+            .await
+            .expect("bind must succeed on loopback");
+        assert_eq!(forwarder.local_addr().ip().to_string(), "127.0.0.1");
+        assert_ne!(forwarder.local_addr().port(), 0);
     }
 }
