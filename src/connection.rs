@@ -605,6 +605,13 @@ impl ConnectionManager {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
             let mut missed_pongs: u32 = 0;
+            // Track whether we have an outstanding ping awaiting a pong reply.
+            // We only evaluate pong receipt when we actually sent a ping the
+            // previous interval; this prevents both false positives (counting a
+            // skipped ping as a missed pong) and false negatives (fabricating a
+            // pong receipt to suppress missed-pong tracking when the writer is
+            // persistently congested).
+            let mut pending_pong = false;
 
             loop {
                 tokio::select! {
@@ -615,39 +622,44 @@ impl ConnectionManager {
                         break;
                     }
                     _ = interval.tick() => {
-                        // Check if previous pong was received
-                        if !pong_received.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                            missed_pongs += 1;
-                            warn!(missed = missed_pongs, "Missed pong response");
-                            if missed_pongs >= MAX_MISSED_PONGS {
-                                error!(
-                                    missed = missed_pongs,
-                                    threshold = MAX_MISSED_PONGS,
-                                    "Connection appears dead -- triggering session shutdown"
-                                );
-                                metrics::counter(MetricNames::MESSAGES_RECEIVED, 0, &[("dead_connection", "true")]);
-                                // C-1: Propagate dead-connection to all tasks so callers
-                                // see EOF instead of hanging on a zombie connection.
-                                let _ = shutdown_tx.send(());
-                                break;
+                        // Only check for a pong if we actually sent a ping last interval.
+                        if pending_pong {
+                            if !pong_received.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                missed_pongs += 1;
+                                warn!(missed = missed_pongs, "Missed pong response");
+                                if missed_pongs >= MAX_MISSED_PONGS {
+                                    error!(
+                                        missed = missed_pongs,
+                                        threshold = MAX_MISSED_PONGS,
+                                        "Connection appears dead -- triggering session shutdown"
+                                    );
+                                    metrics::counter(MetricNames::MESSAGES_RECEIVED, 0, &[("dead_connection", "true")]);
+                                    // C-1: Propagate dead-connection to all tasks so callers
+                                    // see EOF instead of hanging on a zombie connection.
+                                    let _ = shutdown_tx.send(());
+                                    break;
+                                }
+                            } else {
+                                missed_pongs = 0;
                             }
-                        } else {
-                            missed_pongs = 0;
                         }
 
-                        trace!("Sending heartbeat ping");
-                        // try_send: only break on Closed (channel gone); on Full the
-                        // queue is congested so we skip this ping.  To prevent false
-                        // dead-connection detection under sustained backpressure, restore
-                        // pong_received unconditionally when we cannot send: if we can't
-                        // enqueue the ping, we shouldn't count its absence next tick.
+                        // Attempt to enqueue a ping.  `try_send` keeps the heartbeat
+                        // task non-blocking; the writer task owns the actual I/O.
+                        //
+                        // * Full  — writer is congested; skip this ping tick.  Do NOT
+                        //           fabricate a pong receipt: sustained backpressure is
+                        //           itself a sign of a troubled connection and must remain
+                        //           visible to dead-connection detection.
+                        // * Closed — writer task has exited; stop heartbeats.
+                        pending_pong = false;
                         match writer_tx.try_send(Message::Ping(Bytes::new())) {
-                            Ok(_) => {}
+                            Ok(_) => {
+                                pending_pong = true;
+                                trace!("Sending heartbeat ping");
+                            }
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 debug!("Writer channel full, skipping heartbeat ping");
-                                // Restore the flag unconditionally: a skipped ping should
-                                // not increment missed_pongs on the next interval.
-                                pong_received.store(true, std::sync::atomic::Ordering::SeqCst);
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 debug!("Writer channel closed, stopping heartbeat");

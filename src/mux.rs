@@ -258,6 +258,14 @@ fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) -> bool {
 /// writer does not keep the task alive after session teardown.
 async fn send_task(session: Arc<Session>, mut frame_rx: mpsc::Receiver<Bytes>, inner: Arc<Inner>) {
     loop {
+        // Fast-path latch check: `Notify` is edge-triggered — if `inner.close()`
+        // fires `notify_waiters()` between loop iterations (after we return from
+        // the inner select! but before we register the next `notified()` future),
+        // the wakeup is missed and the task can block on `frame_rx.recv()`
+        // indefinitely, keeping the `Arc<Inner>` and `frame_tx` alive.
+        if inner.is_closed() {
+            break;
+        }
         tokio::select! {
             biased;
             _ = inner.die.notified() => break,
