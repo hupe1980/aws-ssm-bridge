@@ -367,7 +367,15 @@ impl HandshakeHandler {
     /// Process KMS encryption action
     fn process_kms_action(&mut self, action: &RequestedClientAction) -> ProcessedClientAction {
         if !self.config.support_kms {
-            debug!("KMS encryption not supported, marking as unsupported");
+            // Emit a visible warning so operators know KMS is being silently
+            // downgraded.  In environments with mandatory KMS session encryption
+            // this is a policy-relevant event, not just a debug detail.
+            warn!(
+                "Agent requested KMS session encryption but this client does not support it. \
+                 Session data is NOT KMS-encrypted (transport TLS only). \
+                 Set HandshakeConfig::support_kms = true and implement KMS key generation \
+                 if end-to-end KMS encryption is required by your security policy."
+            );
             return ProcessedClientAction {
                 action_type: ActionType::KmsEncryption,
                 action_status: ActionStatus::Unsupported,

@@ -25,6 +25,7 @@ _prompts/
 BACKLOG*.md
 CONCEPT.md
 FINDINGS.md
+.DS_Store
 .venv/
 
 # Maturin build artifacts

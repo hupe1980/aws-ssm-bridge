@@ -1,0 +1,588 @@
+//! smux v1 stream multiplexer over an SSM data channel.
+//!
+//! Implements the [xtaci/smux v1 protocol][smux] as a framing layer on top of
+//! an SSM [`Session`], enabling multiple independent TCP connections to share a
+//! single SSM data channel without corrupting each other.
+//!
+//! This is the same multiplexing scheme used by the official
+//! `session-manager-plugin` binary for port-forwarding sessions.
+//!
+//! [smux]: https://github.com/xtaci/smux
+//!
+//! # Frame wire format (8-byte header, little-endian)
+//!
+//! ```text
+//! ┌────────┬────────┬─────────────┬───────────────────────┐
+//! │ ver(1) │ cmd(1) │  length(2)  │     stream_id(4)      │
+//! ├────────┴────────┴─────────────┴───────────────────────┤
+//! │               payload  (length bytes)                  │
+//! └────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! Commands: `SYN=0`, `FIN=1`, `PSH=2`, `NOP=3`
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures::StreamExt;
+use std::collections::HashMap;
+use std::io;
+use std::pin::Pin;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc, Mutex,
+};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{mpsc, Notify};
+use tokio::time::interval;
+use tracing::{debug, warn};
+
+use crate::errors::{Error, Result};
+use crate::session::Session;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Protocol constants – must match xtaci/smux v1
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VERSION: u8 = 1;
+const CMD_SYN: u8 = 0;
+const CMD_FIN: u8 = 1;
+const CMD_PSH: u8 = 2;
+const CMD_NOP: u8 = 3;
+
+/// Fixed header size in bytes.
+const HEADER_SIZE: usize = 8;
+
+/// Maximum PSH payload per frame (32 KiB – matches xtaci/smux default).
+const MAX_PAYLOAD: usize = 32 * 1024;
+
+/// Keep-alive NOP interval (10 s – matches xtaci/smux default).
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Frame encode / decode
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn encode_frame(cmd: u8, stream_id: u32, payload: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(HEADER_SIZE + payload.len());
+    buf.put_u8(VERSION);
+    buf.put_u8(cmd);
+    buf.put_u16_le(payload.len() as u16);
+    buf.put_u32_le(stream_id);
+    buf.put_slice(payload);
+    buf.freeze()
+}
+
+#[inline]
+fn encode_ctrl(cmd: u8, stream_id: u32) -> Bytes {
+    encode_frame(cmd, stream_id, &[])
+}
+
+/// Try to decode one complete frame from `buf`.
+///
+/// Consumes the frame bytes on success; returns `None` when there are not
+/// enough bytes for a complete frame yet.
+///
+/// Frames with an unexpected version byte are discarded with a warning so
+/// the stream stays synchronised even if a future agent adds a v2 frame.
+fn decode_frame(buf: &mut BytesMut) -> Option<(u8, u32, Bytes)> {
+    if buf.len() < HEADER_SIZE {
+        return None;
+    }
+    // Peek at version and length fields without consuming.
+    let version = buf[0];
+    let length = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+    if buf.len() < HEADER_SIZE + length {
+        return None;
+    }
+    // M-8: Validate version byte — discard unknown-version frames to avoid
+    // mis-routing a future smux v2 command byte as a v1 command.
+    if version != VERSION {
+        warn!(version, "Unexpected smux version byte — discarding frame");
+        buf.advance(HEADER_SIZE + length);
+        return None;
+    }
+    buf.advance(1); // version (validated above)
+    let cmd = buf.get_u8();
+    buf.advance(2); // length (already peeked)
+    let stream_id = buf.get_u32_le();
+    let payload = buf.split_to(length).freeze();
+    Some((cmd, stream_id, payload))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared inner state
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct Inner {
+    /// Active streams: stream_id → sender for inbound data.
+    streams: Mutex<HashMap<u32, mpsc::UnboundedSender<Bytes>>>,
+    /// Outbound frame queue consumed by the send task.
+    frame_tx: mpsc::UnboundedSender<Bytes>,
+    /// Next stream ID for client-initiated streams (odd: 1, 3, 5 …).
+    next_id: AtomicU32,
+    /// Set once the mux session is torn down.
+    closed: AtomicBool,
+    /// Notified on session close so background tasks wake up promptly.
+    die: Notify,
+}
+
+impl Inner {
+    /// Close the session, wake all background tasks, and clear stream channels.
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.die.notify_waiters();
+        }
+        self.streams.lock().unwrap().clear();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Dispatch an inbound PSH frame to its stream, evicting a dead entry if needed.
+    fn route_psh(&self, stream_id: u32, data: Bytes) {
+        let tx = self.streams.lock().unwrap().get(&stream_id).cloned();
+        if let Some(tx) = tx {
+            if tx.send(data).is_err() {
+                self.streams.lock().unwrap().remove(&stream_id);
+            }
+        }
+    }
+
+    /// Drop the stream sender so the stream's `data_rx` sees EOF.
+    fn route_fin(&self, stream_id: u32) {
+        self.streams.lock().unwrap().remove(&stream_id);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Background tasks
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reads raw bytes from the SSM session, reassembles smux frames, and routes
+/// them to the appropriate per-stream channels.
+async fn recv_task(session: Arc<Session>, inner: Arc<Inner>) {
+    let mut output = session.output();
+    let mut buf = BytesMut::new();
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = inner.die.notified() => break,
+            chunk = output.next() => {
+                match chunk {
+                    Some(bytes) => {
+                        buf.extend_from_slice(&bytes);
+                        dispatch_frames(&mut buf, &inner);
+                    }
+                    None => break, // SSM session closed
+                }
+            }
+        }
+    }
+
+    // Flush any remaining complete frames before terminating.
+    dispatch_frames(&mut buf, &inner);
+    inner.close();
+}
+
+fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) {
+    while let Some((cmd, stream_id, data)) = decode_frame(buf) {
+        match cmd {
+            CMD_PSH => inner.route_psh(stream_id, data),
+            CMD_FIN => inner.route_fin(stream_id),
+            CMD_NOP | CMD_SYN => {} // NOP = keepalive; SYN from server not expected here
+            _ => warn!(cmd, stream_id, "Unknown smux command – ignoring"),
+        }
+    }
+}
+
+/// Drains the outbound frame queue and writes each frame to the SSM session.
+///
+/// Exits immediately when `inner.die` is notified so that a stalled WebSocket
+/// writer does not keep the task alive after session teardown.
+async fn send_task(
+    session: Arc<Session>,
+    mut frame_rx: mpsc::UnboundedReceiver<Bytes>,
+    inner: Arc<Inner>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = inner.die.notified() => break,
+            frame = frame_rx.recv() => {
+                match frame {
+                    Some(f) => {
+                        if let Err(e) = session.send(f).await {
+                            warn!(error = ?e, "smux send task: session error");
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    inner.close();
+}
+
+/// Sends a NOP keep-alive frame at `KEEPALIVE_INTERVAL` to prevent the SSM
+/// agent from timing out an idle multiplexed session.
+///
+/// **Note**: The official `session-manager-plugin` disables smux keepalive
+/// (`KeepAliveDisabled = true`) to let SSM's own idle-timeout mechanism work
+/// correctly.  Only enable this when you have confirmed the target agent
+/// does not interpret NOP frames as activity.
+async fn keepalive_task(inner: Arc<Inner>) {
+    let mut ticker = interval(KEEPALIVE_INTERVAL);
+    ticker.tick().await; // skip the immediate first tick
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = inner.die.notified() => break,
+            _ = ticker.tick() => {
+                if inner.is_closed() {
+                    break;
+                }
+                let nop = encode_ctrl(CMD_NOP, 0);
+                if inner.frame_tx.send(nop).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SmuxSession
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Configuration for the smux multiplexer.
+#[derive(Debug, Clone)]
+pub struct SmuxConfig {
+    /// Enable NOP keepalive frames.
+    ///
+    /// Defaults to `false` to match the official `session-manager-plugin`
+    /// behaviour (`KeepAliveDisabled = true`).  Enabling keepalive can
+    /// interfere with SSM's idle-timeout enforcement.
+    pub keepalive: bool,
+}
+
+impl Default for SmuxConfig {
+    fn default() -> Self {
+        Self { keepalive: false }
+    }
+}
+
+/// smux v1 client session multiplexing multiple TCP connections over a single
+/// SSM data channel.
+///
+/// Create once when the SSM session is ready, then call
+/// [`open_stream`](SmuxSession::open_stream) for each accepted TCP connection.
+/// The returned [`SmuxStream`] implements [`AsyncRead`] and [`AsyncWrite`] and
+/// can be passed directly to [`tokio::io::copy_bidirectional`].
+///
+/// # Background tasks
+///
+/// `SmuxSession::new` spawns three lightweight tasks:
+///
+/// * **recv** – reads raw bytes from the SSM session, reassembles smux frames,
+///   and routes each PSH frame to the correct per-stream channel.
+/// * **send** – drains the shared outbound frame queue and writes to the SSM
+///   session, preserving frame ordering.
+/// * **keepalive** – sends a NOP frame every 10 seconds so the remote SSM
+///   agent does not time out an idle session.
+pub struct SmuxSession {
+    inner: Arc<Inner>,
+}
+
+impl SmuxSession {
+    /// Wrap an existing, ready SSM session in a smux multiplexer.
+    ///
+    /// The `session` should already be in the `Connected` state – i.e.
+    /// [`Session::wait_for_ready`] must have returned `true` before calling
+    /// this.
+    ///
+    /// Pass [`SmuxConfig::default()`] unless you have a specific reason to
+    /// deviate from the official plugin's defaults (keepalive disabled).
+    pub fn new(session: Arc<Session>, config: SmuxConfig) -> Self {
+        let (frame_tx, frame_rx) = mpsc::unbounded_channel::<Bytes>();
+
+        let inner = Arc::new(Inner {
+            streams: Mutex::new(HashMap::new()),
+            frame_tx,
+            next_id: AtomicU32::new(1), // client uses odd IDs (1, 3, 5 …)
+            closed: AtomicBool::new(false),
+            die: Notify::new(),
+        });
+
+        tokio::spawn(recv_task(Arc::clone(&session), Arc::clone(&inner)));
+        tokio::spawn(send_task(Arc::clone(&session), frame_rx, Arc::clone(&inner)));
+        if config.keepalive {
+            tokio::spawn(keepalive_task(Arc::clone(&inner)));
+        }
+
+        Self { inner }
+    }
+
+    /// Open a new logical stream for an accepted TCP connection.
+    ///
+    /// Allocates the next odd stream ID, registers a per-stream receive
+    /// channel, and sends a SYN frame to the remote SSM agent.
+    pub fn open_stream(&self) -> Result<SmuxStream> {
+        if self.inner.is_closed() {
+            return Err(Error::InvalidState("smux session is closed".to_string()));
+        }
+
+        let stream_id = self.inner.next_id.fetch_add(2, Ordering::SeqCst);
+        let (data_tx, data_rx) = mpsc::unbounded_channel::<Bytes>();
+
+        self.inner.streams.lock().unwrap().insert(stream_id, data_tx);
+
+        // Inform the remote agent of the new stream.
+        let _ = self.inner.frame_tx.send(encode_ctrl(CMD_SYN, stream_id));
+
+        debug!(stream_id, "Opened smux stream");
+
+        Ok(SmuxStream {
+            stream_id,
+            inner: Arc::clone(&self.inner),
+            data_rx,
+            current_chunk: None,
+            read_closed: false,
+            write_closed: false,
+        })
+    }
+
+    /// Returns `true` if the underlying SSM session has been torn down.
+    #[allow(dead_code)]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
+impl Drop for SmuxSession {
+    fn drop(&mut self) {
+        self.inner.close();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SmuxStream – AsyncRead + AsyncWrite
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single logical stream within a [`SmuxSession`].
+///
+/// Implements [`AsyncRead`] and [`AsyncWrite`]; pass it (mutably borrowed)
+/// directly to [`tokio::io::copy_bidirectional`] alongside the local
+/// [`TcpStream`].
+///
+/// Dropping the stream sends a FIN frame and removes it from the routing table
+/// even if [`AsyncWrite::poll_shutdown`] was never called.
+///
+/// [`TcpStream`]: tokio::net::TcpStream
+pub struct SmuxStream {
+    stream_id: u32,
+    inner: Arc<Inner>,
+    /// Incoming data dispatched by the recv task.
+    data_rx: mpsc::UnboundedReceiver<Bytes>,
+    /// Leftover bytes from a previous partial read.
+    current_chunk: Option<Bytes>,
+    read_closed: bool,
+    write_closed: bool,
+}
+
+impl AsyncRead for SmuxStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        if this.read_closed {
+            return Poll::Ready(Ok(())); // EOF
+        }
+        if this.inner.is_closed() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "smux session closed",
+            )));
+        }
+
+        // Drain leftover bytes from a previous partial read first.
+        if let Some(ref mut chunk) = this.current_chunk {
+            let n = chunk.len().min(buf.remaining());
+            buf.put_slice(&chunk[..n]);
+            chunk.advance(n);
+            if chunk.is_empty() {
+                this.current_chunk = None;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        match this.data_rx.poll_recv(cx) {
+            Poll::Ready(Some(mut chunk)) => {
+                let n = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..n]);
+                chunk.advance(n);
+                if !chunk.is_empty() {
+                    this.current_chunk = Some(chunk);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => {
+                // Sender dropped: FIN received or session closed → EOF.
+                this.read_closed = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for SmuxStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+
+        if this.write_closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stream is write-closed",
+            )));
+        }
+        if this.inner.is_closed() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "smux session closed",
+            )));
+        }
+
+        // Respect MAX_PAYLOAD; the caller retries for the remainder.
+        let n = buf.len().min(MAX_PAYLOAD);
+        let frame = encode_frame(CMD_PSH, this.stream_id, &buf[..n]);
+
+        match this.inner.frame_tx.send(frame) {
+            Ok(()) => Poll::Ready(Ok(n)),
+            Err(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "smux session closed",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(())) // frames are queued immediately on write
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if !this.write_closed {
+            this.write_closed = true;
+            this.inner
+                .frame_tx
+                .send(encode_ctrl(CMD_FIN, this.stream_id))
+                .ok();
+            debug!(stream_id = this.stream_id, "Sent FIN");
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for SmuxStream {
+    fn drop(&mut self) {
+        // Best-effort FIN on early drop (e.g. handler error path).
+        if !self.write_closed {
+            self.write_closed = true;
+            self.inner
+                .frame_tx
+                .send(encode_ctrl(CMD_FIN, self.stream_id))
+                .ok();
+        }
+        self.inner.streams.lock().unwrap().remove(&self.stream_id);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify the 8-byte frame header is encoded correctly (little-endian).
+    #[test]
+    fn test_encode_decode_frame() {
+        let payload = b"hello";
+        let frame = encode_frame(CMD_PSH, 0x0000_0003, payload);
+
+        assert_eq!(frame.len(), HEADER_SIZE + payload.len());
+        assert_eq!(frame[0], VERSION);
+        assert_eq!(frame[1], CMD_PSH);
+        // length = 5, little-endian
+        assert_eq!(&frame[2..4], &[5u8, 0]);
+        // stream_id = 3, little-endian
+        assert_eq!(&frame[4..8], &[3u8, 0, 0, 0]);
+        assert_eq!(&frame[8..], payload);
+    }
+
+    /// Verify decode_frame is the left-inverse of encode_frame.
+    #[test]
+    fn test_roundtrip() {
+        let original = b"smux test payload";
+        let stream_id = 7u32;
+        let encoded = encode_frame(CMD_PSH, stream_id, original);
+
+        let mut buf = BytesMut::from(&encoded[..]);
+        let (cmd, sid, data) = decode_frame(&mut buf).expect("should decode");
+
+        assert_eq!(cmd, CMD_PSH);
+        assert_eq!(sid, stream_id);
+        assert_eq!(&data[..], original);
+        assert!(buf.is_empty());
+    }
+
+    /// Partial frame should return None (more bytes needed).
+    #[test]
+    fn test_partial_frame_returns_none() {
+        let frame = encode_frame(CMD_PSH, 1, b"data");
+        // Feed only the header, not the payload.
+        let mut buf = BytesMut::from(&frame[..HEADER_SIZE]);
+        assert!(decode_frame(&mut buf).is_none());
+    }
+
+    /// A control frame (no payload) round-trips cleanly.
+    #[test]
+    fn test_ctrl_frame() {
+        let frame = encode_ctrl(CMD_SYN, 5);
+        assert_eq!(frame.len(), HEADER_SIZE);
+
+        let mut buf = BytesMut::from(&frame[..]);
+        let (cmd, sid, data) = decode_frame(&mut buf).expect("should decode");
+
+        assert_eq!(cmd, CMD_SYN);
+        assert_eq!(sid, 5);
+        assert!(data.is_empty());
+    }
+
+    /// M-8: An unknown version byte must cause the frame to be discarded
+    /// without corrupting the stream position.
+    #[test]
+    fn test_unknown_version_discarded() {
+        // Build a well-formed frame then corrupt the version byte.
+        let mut frame = BytesMut::from(&encode_frame(CMD_PSH, 3, b"payload")[..]);
+        frame[0] = 0x02; // version 2 — not supported
+
+        let mut buf = frame;
+        // decode_frame must discard the frame and return None.
+        assert!(decode_frame(&mut buf).is_none(), "Unknown version must be discarded");
+        // Buffer must be fully consumed (no desync).
+        assert!(buf.is_empty(), "Buffer must be drained after discard");
+    }
+}

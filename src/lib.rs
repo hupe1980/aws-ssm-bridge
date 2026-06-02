@@ -139,6 +139,7 @@ pub mod tracing_ext;
 
 mod channels;
 mod connection;
+mod mux;
 
 // ============================================================================
 // Feature-Gated Modules

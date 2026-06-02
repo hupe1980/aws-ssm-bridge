@@ -48,8 +48,9 @@ const MAX_MESSAGES_PER_SECOND: f64 = 5000.0;
 /// Message schema version
 const MESSAGE_SCHEMA_VERSION: &str = "1.0";
 
-/// Client version - use AWS plugin version format for compatibility
-const CLIENT_VERSION: &str = "1.2.707.0";
+/// Client version — identifies this library to the SSM service.
+/// Format mirrors aws/session-manager-plugin for protocol compatibility.
+const CLIENT_VERSION: &str = concat!("aws-ssm-bridge/", env!("CARGO_PKG_VERSION"));
 
 /// Buffer capacity for out-of-order messages (matches AWS default)
 const INCOMING_BUFFER_CAPACITY: usize = 10000;
@@ -63,10 +64,15 @@ const RETRANSMIT_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// Maximum retransmission attempts (3000 per AWS = 5 minutes / 200ms interval)
 const MAX_RETRANSMIT_ATTEMPTS: u32 = 3000;
 
+/// Buffer capacity for the lock-free WebSocket writer channel.
+///
+/// Bounded at 2× the retransmit buffer so heavy retransmit storms do not
+/// cause unbounded memory growth when the remote end stalls.  Callers that
+/// exceed this capacity receive backpressure via `SendError`.
+const WRITER_CHANNEL_CAPACITY: usize = OUTGOING_BUFFER_CAPACITY * 2;
+
 /// Maximum consecutive missed pong responses before declaring connection dead
 const MAX_MISSED_PONGS: u32 = 3;
-
-/// Type aliases for split WebSocket streams
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type WsWriter = SplitSink<WsStream, Message>;
 type WsReader = SplitStream<WsStream>;
@@ -75,7 +81,8 @@ type WsReader = SplitStream<WsStream>;
 ///
 /// **Security**: Debug impl is removed to prevent accidental token leakage in logs.
 /// Implements `Zeroize` to scrub `token_value` from memory on drop.
-#[derive(Clone, Serialize, Deserialize, Zeroize)]
+/// `Clone` is intentionally absent — no copies of the session token should exist.
+#[derive(Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 #[serde(rename_all = "PascalCase")]
 struct OpenDataChannelInput {
@@ -109,8 +116,8 @@ pub struct ConnectionManager {
     /// Session ID
     session_id: String,
 
-    /// Write channel — all tasks send WebSocket frames here (lock-free)
-    writer_tx: mpsc::UnboundedSender<Message>,
+    /// Write channel — all tasks send WebSocket frames here (lock-free, bounded)
+    writer_tx: mpsc::Sender<Message>,
 
     /// Channel multiplexer
     channels: Arc<ChannelMultiplexer>,
@@ -164,7 +171,7 @@ pub enum ManagerCommand {
 /// from 7 to 3.
 struct ReceiverContext {
     channels: Arc<ChannelMultiplexer>,
-    writer_tx: mpsc::UnboundedSender<Message>,
+    writer_tx: mpsc::Sender<Message>,
     can_send: Arc<std::sync::atomic::AtomicBool>,
     ready_notify: Arc<tokio::sync::Notify>,
     sequence: Arc<std::sync::atomic::AtomicI64>,
@@ -255,7 +262,7 @@ impl ConnectionManager {
 
         info!("Data channel handshake sent");
 
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(16);
         let channels = Arc::new(ChannelMultiplexer::new());
         let can_send = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pong_received = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -264,8 +271,9 @@ impl ConnectionManager {
         // Create outgoing message buffer for reliable delivery (before receiver task)
         let outgoing_buffer = Arc::new(OutgoingMessageBuffer::new(OUTGOING_BUFFER_CAPACITY));
 
-        // Create lock-free write channel — all tasks push frames here
-        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<Message>();
+        // Create bounded write channel — provides backpressure when the
+        // WebSocket writer stalls (prevents OOM under slow remote endpoints).
+        let (writer_tx, writer_rx) = mpsc::channel::<Message>(WRITER_CHANNEL_CAPACITY);
 
         // Spawn dedicated writer task (owns the WsWriter sink)
         let writer_task = Self::spawn_writer_task(writer, writer_rx, shutdown_tx.subscribe());
@@ -337,8 +345,7 @@ impl ConnectionManager {
                         ManagerCommand::SendData(data) => {
                             debug!(len = data.len(), "Processing SendData command");
                             if let Err(e) = self.send_data(data).await {
-                                // Downgrade to debug for shutdown-related errors
-                                if e.to_string().contains("closing") || e.to_string().contains("closed") {
+                                if e.is_shutdown_related() {
                                     debug!(error = ?e, "Send failed (connection closing)");
                                 } else {
                                     error!(error = ?e, "Failed to send data");
@@ -348,8 +355,7 @@ impl ConnectionManager {
                         ManagerCommand::SendMessage { data, payload_type } => {
                             debug!(len = data.len(), ?payload_type, "Processing SendMessage command");
                             if let Err(e) = self.send_message(data, payload_type).await {
-                                // Downgrade to debug for shutdown-related errors
-                                if e.to_string().contains("closing") || e.to_string().contains("closed") {
+                                if e.is_shutdown_related() {
                                     debug!(error = ?e, "Send failed (connection closing)");
                                 } else {
                                     error!(error = ?e, "Failed to send message");
@@ -535,12 +541,12 @@ impl ConnectionManager {
 
     /// Spawn dedicated writer task that owns the WebSocket sink.
     ///
-    /// All other tasks send `Message` values through an unbounded mpsc channel.
+    /// All other tasks send `Message` values through a bounded mpsc channel.
     /// This eliminates mutex contention between heartbeat, retransmit,
     /// receiver ACKs, and the main command loop.
     fn spawn_writer_task(
         mut writer: WsWriter,
-        mut rx: mpsc::UnboundedReceiver<Message>,
+        mut rx: mpsc::Receiver<Message>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
@@ -578,6 +584,7 @@ impl ConnectionManager {
     fn spawn_heartbeat_task(&self) -> JoinHandle<()> {
         let writer_tx = self.writer_tx.clone();
         let pong_received = Arc::clone(&self.pong_received);
+        let shutdown_tx = self.shutdown_tx.clone();
         let mut shutdown_rx = self.shutdown_rx();
 
         tokio::spawn(async move {
@@ -601,9 +608,12 @@ impl ConnectionManager {
                                 error!(
                                     missed = missed_pongs,
                                     threshold = MAX_MISSED_PONGS,
-                                    "Connection appears dead, stopping heartbeat"
+                                    "Connection appears dead -- triggering session shutdown"
                                 );
                                 metrics::counter(MetricNames::MESSAGES_RECEIVED, 0, &[("dead_connection", "true")]);
+                                // C-1: Propagate dead-connection to all tasks so callers
+                                // see EOF instead of hanging on a zombie connection.
+                                let _ = shutdown_tx.send(());
                                 break;
                             }
                         } else {
@@ -611,8 +621,10 @@ impl ConnectionManager {
                         }
 
                         trace!("Sending heartbeat ping");
-                        if writer_tx.send(Message::Ping(Bytes::new())).is_err() {
-                            debug!("Writer channel closed, stopping heartbeat");
+                        // try_send: a full queue means we're already in trouble;
+                        // a missed ping just increments missed_pongs on the next tick.
+                        if writer_tx.try_send(Message::Ping(Bytes::new())).is_err() {
+                            debug!("Writer channel closed or full, stopping heartbeat");
                             break;
                         }
                     }
@@ -629,6 +641,7 @@ impl ConnectionManager {
         let writer_tx = self.writer_tx.clone();
         let outgoing_buffer = Arc::clone(&self.outgoing_buffer);
         let can_send = Arc::clone(&self.can_send);
+        let shutdown_tx = self.shutdown_tx.clone();
         let mut shutdown_rx = self.shutdown_rx();
         let session_id = self.session_id.clone();
 
@@ -676,32 +689,35 @@ impl ConnectionManager {
                         // Get candidates for retransmission
                         let candidates = outgoing_buffer.get_retransmit_candidates(MAX_RETRANSMIT_ATTEMPTS).await;
 
+                        let mut fatal = false;
                         for (seq, data, timed_out) in candidates {
                             if timed_out {
-                                // Message timed out after max retries - signal session termination
+                                // C-2: Propagate to all tasks so callers see an error
+                                // instead of hanging forever on an unresponsive endpoint.
                                 error!(
                                     session_id = %session_id,
-                                    "Stream data retransmission timed out, terminating session"
+                                    seq,
+                                    "Stream data retransmission timed out -- triggering session shutdown"
                                 );
-                                // In production, we'd signal session termination here
-                                // For now, log the error
+                                let _ = shutdown_tx.send(());
+                                fatal = true;
                                 break;
                             }
 
                             // Record retransmission metric
                             metrics::counter(MetricNames::RETRANSMISSIONS, 1, &[]);
 
-                            // Retransmit the message
-                            if let Err(e) = writer_tx.send(Message::Binary(data)) {
+                            if let Err(e) = writer_tx.try_send(Message::Binary(data)) {
                                 warn!(
                                     seq,
                                     error = ?e,
-                                    "Failed to retransmit message"
+                                    "Failed to retransmit message (writer channel full or closed)"
                                 );
                             } else {
                                 trace!(seq, "Retransmitted message");
                             }
                         }
+                        if fatal { break; }
                     }
                 }
             }
@@ -740,17 +756,19 @@ impl ConnectionManager {
             )));
         }
 
-        // Send via lock-free writer channel
+        // H-4: Buffer BEFORE sending — ensures the retransmit scheduler always
+        // has the message in its buffer even if the send fails or is reordered.
+        self.outgoing_buffer.add(msg_bytes.clone(), sequence).await;
+
+        // Send via bounded writer channel (backpressure: await when full)
         self.writer_tx
             .send(Message::Binary(msg_bytes.clone()))
+            .await
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         // Record send metrics
         metrics::counter(MetricNames::MESSAGES_SENT, 1, &[]);
         metrics::counter(MetricNames::BYTES_SENT, msg_bytes.len() as u64, &[]);
-
-        // Track in OutgoingMessageBuffer for reliable delivery
-        self.outgoing_buffer.add(msg_bytes, sequence).await;
 
         debug!(
             sequence,
@@ -786,17 +804,19 @@ impl ConnectionManager {
             )));
         }
 
-        // Send via lock-free writer channel
+        // H-4: Buffer BEFORE sending — ensures the retransmit scheduler always
+        // has the message in its buffer even if the send fails or is reordered.
+        self.outgoing_buffer.add(msg_bytes.clone(), sequence).await;
+
+        // Send via bounded writer channel (backpressure: await when full)
         self.writer_tx
             .send(Message::Binary(msg_bytes.clone()))
+            .await
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         // Record send metrics
         metrics::counter(MetricNames::MESSAGES_SENT, 1, &[]);
         metrics::counter(MetricNames::BYTES_SENT, msg_bytes.len() as u64, &[]);
-
-        // Track in OutgoingMessageBuffer for reliable delivery
-        self.outgoing_buffer.add(msg_bytes, sequence).await;
 
         debug!(
             sequence,
@@ -1001,7 +1021,7 @@ impl ConnectionManager {
                 // Normal output data - send to output channel
                 if !msg.payload.is_empty() {
                     trace!(len = msg.payload.len(), payload_type = ?msg.payload_type, "Routing output data");
-                    ctx.channels.send_output(msg.payload.clone()).await?;
+                    ctx.channels.send_output(msg.payload.clone())?;
                 }
             }
             PayloadType::HandshakeRequest => {
@@ -1111,7 +1131,7 @@ impl ConnectionManager {
 
     /// Send handshake response via writer channel
     fn send_handshake_response(
-        writer_tx: &mpsc::UnboundedSender<Message>,
+        writer_tx: &mpsc::Sender<Message>,
         response: &HandshakeResponse,
         sequence: &Arc<std::sync::atomic::AtomicI64>,
     ) -> Result<()> {
@@ -1139,7 +1159,7 @@ impl ConnectionManager {
         );
 
         writer_tx
-            .send(Message::Binary(msg_bytes))
+            .try_send(Message::Binary(msg_bytes))
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         debug!("HandshakeResponse sent to WebSocket");
@@ -1148,7 +1168,7 @@ impl ConnectionManager {
 
     /// Send acknowledge message for a received message (sequential)
     fn send_acknowledge(
-        writer_tx: &mpsc::UnboundedSender<Message>,
+        writer_tx: &mpsc::Sender<Message>,
         received_msg: &ClientMessage,
     ) -> Result<()> {
         // Create acknowledgment message using AckTracker helper
@@ -1165,7 +1185,7 @@ impl ConnectionManager {
         let msg_bytes = ack_msg.serialize()?;
 
         writer_tx
-            .send(Message::Binary(msg_bytes))
+            .try_send(Message::Binary(msg_bytes))
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         Ok(())
@@ -1173,7 +1193,7 @@ impl ConnectionManager {
 
     /// Send acknowledge message for an out-of-order message (non-sequential)
     fn send_acknowledge_non_sequential(
-        writer_tx: &mpsc::UnboundedSender<Message>,
+        writer_tx: &mpsc::Sender<Message>,
         received_msg: &ClientMessage,
     ) -> Result<()> {
         // Create acknowledgment with IsSequentialMessage=false
@@ -1190,7 +1210,7 @@ impl ConnectionManager {
         let msg_bytes = ack_msg.serialize()?;
 
         writer_tx
-            .send(Message::Binary(msg_bytes))
+            .try_send(Message::Binary(msg_bytes))
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         Ok(())

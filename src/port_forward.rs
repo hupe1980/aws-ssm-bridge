@@ -8,20 +8,23 @@
 //! # Architecture
 //!
 //! ```text
-//! Local App → TCP Listener → SSM Session → Remote Port
-//!     ↓           ↓              ↓            ↓
-//!   :8080    127.0.0.1:8080  WebSocket   instance:3389
+//! Local App → TCP Listener → smux stream → SSM Session → Remote Port
+//!     ↓           ↓               ↓              ↓            ↓
+//!  :8080    127.0.0.1:8080   stream N/M      WebSocket  instance:3389
 //! ```
+//!
+//! Multiple concurrent TCP connections are multiplexed over a single SSM data
+//! channel via smux framing, matching the behaviour of the official
+//! `session-manager-plugin` binary.
 
-use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::errors::{Error, Result};
+use crate::mux::{SmuxConfig, SmuxSession};
 use crate::session::Session;
 
 /// Port forwarding configuration
@@ -67,6 +70,16 @@ impl PortForwarder {
     /// Start listening for local connections
     #[instrument(skip(self), fields(local_addr = %self.config.local_addr))]
     pub async fn listen(&mut self) -> Result<SocketAddr> {
+        // I-5: Catch the most common misconfiguration early with a clear error
+        // message rather than silently connecting to port 0 (which the remote
+        // SSM agent would reject with an opaque protocol error).
+        if self.config.remote_port == 0 {
+            return Err(Error::Config(
+                "remote_port must be non-zero; set PortForwardConfig::remote_port before calling listen()"
+                    .to_string(),
+            ));
+        }
+
         info!("Starting port forwarding listener");
 
         let listener = TcpListener::bind(self.config.local_addr)
@@ -85,49 +98,77 @@ impl PortForwarder {
         Ok(local_addr)
     }
 
-    /// Accept connections and forward to SSM session
+    /// Accept connections and forward to the SSM session via smux multiplexing.
     ///
-    /// This runs in a loop, accepting connections and spawning handlers.
-    #[instrument(skip(self, session))]
-    pub async fn forward(&mut self, session: Arc<Session>) -> Result<()> {
+    /// Each accepted TCP connection gets its own smux logical stream within the
+    /// single underlying SSM data channel.  Concurrent connections do not
+    /// interfere with each other because every byte is tagged with a unique
+    /// stream ID by the smux framing layer.
+    ///
+    /// Requires the SSM session to have been started with a mux-capable
+    /// document such as `AWS-StartPortForwardingSessionToRemoteHost`.
+    /// L-3: Accepts a `ShutdownSignal` so the forwarding loop can be
+    /// cancelled cleanly (e.g. from `Ctrl-C` or session termination) without
+    /// leaving a dangling `TcpListener` open.
+    #[instrument(skip(self, session, shutdown))]
+    pub async fn forward(
+        &mut self,
+        session: Arc<Session>,
+        shutdown: crate::shutdown::ShutdownSignal,
+    ) -> Result<()> {
         let listener = self
             .listener
             .as_ref()
             .ok_or_else(|| Error::InvalidState("Listener not started".to_string()))?;
 
-        let (connection_tx, mut connection_rx): (mpsc::Sender<()>, _) =
-            mpsc::channel(self.config.max_connections);
+        // Block until the SSM protocol handshake is complete.
+        let connect_timeout = session.config().connect_timeout;
+        if !session.wait_for_ready(connect_timeout).await {
+            return Err(Error::InvalidState(
+                "SSM session not ready: handshake timed out".to_string(),
+            ));
+        }
+
+        // Wrap the session in a smux multiplexer (one per PortForwarder lifetime).
+        let mux = Arc::new(SmuxSession::new(Arc::clone(&session), SmuxConfig::default()));
+
+        let semaphore = Arc::new(Semaphore::new(self.config.max_connections));
         let max_connections = self.config.max_connections;
 
-        info!("Accepting port forwarding connections");
+        info!(max_connections, "Accepting port forwarding connections");
 
         loop {
             tokio::select! {
-                // Accept new connection
+                biased;
+
+                _ = shutdown.cancelled() => {
+                    info!("Port forwarder shutdown requested");
+                    return Ok(());
+                }
+
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
                             debug!(peer_addr = %peer_addr, "Accepted connection");
 
-                            // Check connection limit
-                            if connection_tx.capacity() == 0 {
-                                warn!(
-                                    max_connections,
-                                    "Connection limit reached, rejecting connection"
-                                );
-                                drop(stream);
-                                continue;
-                            }
+                            let permit = match Arc::clone(&semaphore).try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    warn!(
+                                        max_connections,
+                                        "Connection limit reached, rejecting connection"
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
 
-                            // Spawn connection handler
-                            let session = Arc::clone(&session);
-                            let tx = connection_tx.clone();
-
+                            let mux = Arc::clone(&mux);
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection(stream, session).await {
+                                let _permit = permit; // released when the task finishes
+                                if let Err(e) = Self::handle_connection(stream, mux).await {
                                     error!(error = ?e, "Connection handler error");
                                 }
-                                drop(tx); // Release connection slot
                             });
                         }
                         Err(e) => {
@@ -136,67 +177,20 @@ impl PortForwarder {
                         }
                     }
                 }
-
-                // Handle connection cleanup
-                _ = connection_rx.recv() => {
-                    // Connection ended, slot freed
-                }
             }
         }
     }
 
-    /// Handle a single port forwarding connection
-    #[instrument(skip(stream, session))]
-    async fn handle_connection(mut stream: TcpStream, session: Arc<Session>) -> Result<()> {
-        use futures::StreamExt;
-
+    /// Bidirectionally copy between a local TCP connection and a smux stream.
+    #[instrument(skip(stream, mux))]
+    async fn handle_connection(mut stream: TcpStream, mux: Arc<SmuxSession>) -> Result<()> {
         debug!("Starting connection handler");
 
-        let mut buffer = vec![0u8; 8192];
+        let mut smux_stream = mux.open_stream()?;
 
-        // Get output stream from session
-        let mut output = session.output();
-
-        loop {
-            tokio::select! {
-                // Read from local socket
-                result = stream.read(&mut buffer) => {
-                    match result {
-                        Ok(0) => {
-                            debug!("Local connection closed");
-                            break;
-                        }
-                        Ok(n) => {
-                            debug!(bytes = n, "Read from local socket");
-
-                            // Send to SSM session
-                            let data = Bytes::copy_from_slice(&buffer[..n]);
-                            session.send(data).await?;
-                        }
-                        Err(e) => {
-                            error!(error = ?e, "Error reading from local socket");
-                            return Err(Error::Io(e));
-                        }
-                    }
-                }
-
-                // Read from SSM session
-                data = output.next() => {
-                    match data {
-                        Some(bytes) => {
-                            debug!(bytes = bytes.len(), "Received from SSM session");
-
-                            // Write to local socket
-                            stream.write_all(&bytes).await.map_err(Error::Io)?;
-                        }
-                        None => {
-                            debug!("SSM session closed");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        tokio::io::copy_bidirectional(&mut stream, &mut smux_stream)
+            .await
+            .map_err(Error::Io)?;
 
         info!("Connection handler completed");
         Ok(())
@@ -223,5 +217,22 @@ mod tests {
 
         assert_eq!(config.remote_port, 3389);
         assert_eq!(config.max_connections, 5);
+    }
+
+    /// I-5: remote_port=0 must be rejected before binding the listener.
+    #[tokio::test]
+    async fn test_listen_rejects_zero_remote_port() {
+        let mut forwarder = PortForwarder::new(PortForwardConfig::default());
+        // default remote_port is 0
+        let result = forwarder.listen().await;
+        assert!(
+            result.is_err(),
+            "listen() must return an error when remote_port == 0"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("remote_port"),
+            "Error message should mention remote_port, got: {msg}"
+        );
     }
 }

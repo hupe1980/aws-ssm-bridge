@@ -29,6 +29,20 @@ impl OutputStream {
             closed,
         }
     }
+
+    /// Return a stream that immediately yields `None` (already-closed multiplexer).
+    ///
+    /// Used by `output_stream()` when called after `close()` to avoid panicking.
+    fn closed(closed: Arc<AtomicBool>) -> Self {
+        // Create a one-shot channel and immediately drop the sender so the
+        // receiver side yields None on its first poll.
+        let (tx, rx) = broadcast::channel(1);
+        drop(tx);
+        Self {
+            inner: BroadcastStream::new(rx),
+            closed,
+        }
+    }
 }
 
 impl Stream for OutputStream {
@@ -78,9 +92,12 @@ pub struct ChannelMultiplexer {
 
 impl ChannelMultiplexer {
     /// Create a new channel multiplexer.
-    /// Uses broadcast channel with capacity of 1024 messages.
+    ///
+    /// Uses a broadcast channel with capacity of 8192 messages — large enough
+    /// for high-throughput shell output without silently dropping data for
+    /// typical consumers.
     pub fn new() -> Self {
-        let (output_tx, _) = broadcast::channel(1024);
+        let (output_tx, _) = broadcast::channel(8192);
 
         Self {
             output_tx: std::sync::Mutex::new(Some(output_tx)),
@@ -89,14 +106,17 @@ impl ChannelMultiplexer {
     }
 
     /// Create an output stream that receives broadcasted data.
-    /// Each call creates a new subscriber to the broadcast channel.
+    ///
+    /// If called after `close()`, returns a stream that immediately yields
+    /// `None` rather than panicking.  This prevents a process-killing race
+    /// during concurrent shutdown.
     pub fn output_stream(&self) -> OutputStream {
         let guard = self.output_tx.lock().expect("output_tx lock poisoned");
-        let rx = guard
-            .as_ref()
-            .expect("output_stream() called after close()")
-            .subscribe();
-        OutputStream::new(rx, Arc::clone(&self.closed))
+        match guard.as_ref() {
+            Some(tx) => OutputStream::new(tx.subscribe(), Arc::clone(&self.closed)),
+            // Multiplexer already closed — return an immediately-terminated stream.
+            None => OutputStream::closed(Arc::clone(&self.closed)),
+        }
     }
 
     /// Close the output channel, causing all output streams to return None.
@@ -115,7 +135,9 @@ impl ChannelMultiplexer {
     }
 
     /// Send output data to all subscribed output streams.
-    pub async fn send_output(&self, data: Bytes) -> Result<()> {
+    ///
+    /// Synchronous — no async overhead (broadcast send is non-blocking).
+    pub fn send_output(&self, data: Bytes) -> Result<()> {
         let guard = self.output_tx.lock().expect("output_tx lock poisoned");
         if let Some(tx) = guard.as_ref() {
             if tx.send(data).is_err() {
@@ -143,8 +165,8 @@ mod tests {
         let mut stream = mux.output_stream();
 
         // Send some data
-        mux.send_output(Bytes::from("test1")).await.unwrap();
-        mux.send_output(Bytes::from("test2")).await.unwrap();
+        mux.send_output(Bytes::from("test1")).unwrap();
+        mux.send_output(Bytes::from("test2")).unwrap();
 
         // BroadcastStream properly wakes — no sleep needed
         let data1 = stream.next().await.unwrap();
@@ -160,7 +182,7 @@ mod tests {
         let mut stream1 = mux.output_stream();
         let mut stream2 = mux.output_stream();
 
-        mux.send_output(Bytes::from("broadcast")).await.unwrap();
+        mux.send_output(Bytes::from("broadcast")).unwrap();
 
         let data1 = stream1.next().await.unwrap();
         let data2 = stream2.next().await.unwrap();
@@ -174,7 +196,7 @@ mod tests {
         let mux = ChannelMultiplexer::new();
         let mut stream = mux.output_stream();
 
-        mux.send_output(Bytes::from("before_close")).await.unwrap();
+        mux.send_output(Bytes::from("before_close")).unwrap();
         let data = stream.next().await.unwrap();
         assert_eq!(data, Bytes::from("before_close"));
 
@@ -186,6 +208,18 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
         assert!(result.is_ok(), "Stream should terminate after close");
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_output_stream_after_close_returns_none() {
+        // H-1: output_stream() after close() must return a closed stream, not panic.
+        let mux = ChannelMultiplexer::new();
+        mux.close();
+        let mut stream = mux.output_stream(); // must not panic
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "Post-close stream should be empty");
     }
 
     #[tokio::test]

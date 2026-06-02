@@ -149,7 +149,17 @@ impl Error {
             Error::Transport(TransportError::HeartbeatTimeout) => true,
             Error::Transport(TransportError::ConnectionFailed(_)) => true,
             Error::Transport(TransportError::WebSocket(_)) => true,
-            Error::AwsSdk(_) => true, // Some AWS errors are transient
+            // Only retry *transient* AWS errors — permanent failures (AccessDenied,
+            // InvalidInstanceId, TargetNotConnected) must propagate immediately.
+            Error::AwsSdk(msg) => {
+                msg.contains("ThrottlingException")
+                    || msg.contains("ServiceUnavailableException")
+                    || msg.contains("InternalServerError")
+                    || msg.contains("InternalFailure")
+                    || msg.contains("ServiceUnavailable")
+                    || msg.contains("RequestTimeout")
+                    || msg.contains("Throttling")
+            }
             _ => false,
         }
     }
@@ -162,6 +172,21 @@ impl Error {
                 | Error::Transport(TransportError::ConnectionClosed { .. })
                 | Error::Session(SessionError::InvalidState { .. })
         )
+    }
+
+    /// Check if error indicates the connection is shutting down or already closed.
+    ///
+    /// Used to downgrade send errors to `debug!` level during graceful shutdown,
+    /// avoiding spurious `error!` log lines.
+    pub fn is_shutdown_related(&self) -> bool {
+        match self {
+            Error::Transport(TransportError::ConnectionClosed { .. }) => true,
+            Error::Transport(TransportError::Channel(_)) => true,
+            Error::Transport(TransportError::WebSocket(msg)) => {
+                msg.contains("closed") || msg.contains("closing")
+            }
+            _ => false,
+        }
     }
 }
 
@@ -187,7 +212,17 @@ mod tests {
         assert!(Error::Transport(TransportError::HeartbeatTimeout).is_retriable());
         assert!(Error::Transport(TransportError::ConnectionFailed("test".into())).is_retriable());
         assert!(Error::Transport(TransportError::WebSocket("test".into())).is_retriable());
-        assert!(Error::AwsSdk("transient".into()).is_retriable());
+        assert!(Error::AwsSdk("ThrottlingException: request rate exceeded".into()).is_retriable());
+
+        // Permanent AWS errors — must NOT be retried
+        assert!(!Error::AwsSdk("AccessDeniedException: ...".into()).is_retriable());
+        assert!(!Error::AwsSdk("InvalidInstanceId: ...".into()).is_retriable());
+        assert!(!Error::AwsSdk("TargetNotConnected: ...".into()).is_retriable());
+
+        // Transient AWS errors — must be retried
+        assert!(Error::AwsSdk("ThrottlingException: ...".into()).is_retriable());
+        assert!(Error::AwsSdk("ServiceUnavailableException: ...".into()).is_retriable());
+        assert!(Error::AwsSdk("InternalServerError: ...".into()).is_retriable());
 
         // Non-retriable errors
         assert!(!Error::Cancelled.is_retriable());

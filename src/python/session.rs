@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::RwLock;
 
 use super::to_py_err;
@@ -110,6 +111,12 @@ pub struct PySession {
     inner: Arc<tokio::sync::Mutex<crate::Session>>,
     /// Cached session ID (avoids async lock for a read-only field)
     session_id: String,
+    /// Cached ready signal — avoids holding the session lock during wait_for_ready.
+    protocol_can_send: Arc<std::sync::atomic::AtomicBool>,
+    /// Cached ready notify — avoids holding the session lock in __aenter__.
+    ready_notify: Arc<tokio::sync::Notify>,
+    /// Cached terminated notify — avoids holding the lock in wait_terminated.
+    terminated_notify: Arc<tokio::sync::Notify>,
 }
 
 #[pymethods]
@@ -138,36 +145,35 @@ impl PySession {
 
     /// Check if the session is ready to send data (synchronous — no await needed).
     ///
-    /// The session is ready once the SSM agent has completed the handshake
-    /// and sent the start_publication message.
+    /// Reads a cached `AtomicBool` — no lock, no false negatives under contention.
     fn is_ready(&self) -> bool {
-        // is_ready() only reads an AtomicBool — no lock needed
-        // We access it through a short lock, but since we cached session_id
-        // and is_ready is atomic, we can use try_lock for a non-blocking check
-        if let Ok(guard) = self.inner.try_lock() {
-            guard.is_ready()
-        } else {
-            false
-        }
+        self.protocol_can_send.load(Ordering::SeqCst)
     }
 
     /// Wait for the session to become ready.
     ///
-    /// Blocks until the session is ready or timeout expires.
-    /// Call this after start_session() before sending data.
+    /// Does **not** acquire the session lock — uses a cached `Notify` and
+    /// `AtomicBool` so all other Python operations on this session remain
+    /// unblocked during the wait.
     #[pyo3(signature = (timeout_secs = 30.0))]
     fn wait_for_ready<'py>(
         &self,
         py: Python<'py>,
         timeout_secs: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let session = Arc::clone(&self.inner);
+        let can_send = Arc::clone(&self.protocol_can_send);
+        let ready_notify = Arc::clone(&self.ready_notify);
         future_into_py(py, async move {
+            // Fast path: already ready.
+            if can_send.load(Ordering::SeqCst) {
+                return Ok(true);
+            }
             let timeout = std::time::Duration::from_secs_f64(timeout_secs);
-            // Acquire lock briefly to call wait_for_ready, which uses Notify
-            // internally (no spin-polling, so holding the lock is fine now)
-            let session_guard = session.lock().await;
-            Ok(session_guard.wait_for_ready(timeout).await)
+            match tokio::time::timeout(timeout, ready_notify.notified()).await {
+                Ok(_) => Ok(true),
+                // Timeout — check once more (notification may have raced with timeout)
+                Err(_) => Ok(can_send.load(Ordering::SeqCst)),
+            }
         })
     }
 
@@ -212,34 +218,30 @@ impl PySession {
         })
     }
 
-    /// Wait for session to terminate
+    /// Wait for session to terminate.
+    ///
+    /// Does **not** hold the session lock while waiting.
     fn wait_terminated<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let session = Arc::clone(&self.inner);
+        let terminated_notify = Arc::clone(&self.terminated_notify);
         future_into_py(py, async move {
-            let session_guard = session.lock().await;
-            session_guard.wait_terminated().await;
+            terminated_notify.notified().await;
             Ok(())
         })
     }
 
-    /// Async context manager entry — returns `self` (preserves object identity).
-    ///
-    /// Allows using `async with` syntax:
-    /// ```python
-    /// async with await manager.start_session("i-xxx") as session:
-    ///     await session.send(b"ls\n")
-    /// # Session automatically terminated
-    /// ```
+    /// Async context manager entry — waits for ready without holding the lock.
     fn __aenter__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let session = Arc::clone(&slf.inner);
+        let can_send = Arc::clone(&slf.protocol_can_send);
+        let ready_notify = Arc::clone(&slf.ready_notify);
         let self_obj: Py<PySession> = slf.into();
         future_into_py(py, async move {
-            // Wait for ready with default timeout
-            let session_guard = session.lock().await;
-            let _ = session_guard
-                .wait_for_ready(std::time::Duration::from_secs(30))
+            if !can_send.load(Ordering::SeqCst) {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    ready_notify.notified(),
+                )
                 .await;
-            drop(session_guard);
+            }
             Ok(self_obj)
         })
     }
@@ -348,9 +350,15 @@ impl PySessionManager {
                 .map_err(to_py_err)?;
 
             let session_id = session.id().to_string();
+            let protocol_can_send = session.can_send_signal();
+            let ready_notify = session.ready_signal();
+            let terminated_notify = session.terminated_signal();
             Ok(PySession {
                 inner: Arc::new(tokio::sync::Mutex::new(session)),
                 session_id,
+                protocol_can_send,
+                ready_notify,
+                terminated_notify,
             })
         })
     }
@@ -371,9 +379,15 @@ impl PySessionManager {
                 .map_err(to_py_err)?;
 
             let session_id = session.id().to_string();
+            let protocol_can_send = session.can_send_signal();
+            let ready_notify = session.ready_signal();
+            let terminated_notify = session.terminated_signal();
             Ok(PySession {
                 inner: Arc::new(tokio::sync::Mutex::new(session)),
                 session_id,
+                protocol_can_send,
+                ready_notify,
+                terminated_notify,
             })
         })
     }

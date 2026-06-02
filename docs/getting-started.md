@@ -42,7 +42,7 @@ nav_order: 2
 
 ```toml
 [dependencies]
-aws-ssm-bridge = "0.3"
+aws-ssm-bridge = "0.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -62,11 +62,10 @@ pip install aws-ssm-bridge
 use aws_ssm_bridge::interactive::{InteractiveShell, InteractiveConfig};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = InteractiveConfig::default();
     let mut shell = InteractiveShell::new(config)?;
-    
-    // Connect and run interactive session
+
     // Handles raw mode, resize (SIGWINCH), signals (Ctrl+C/D/Z)
     shell.connect("i-0123456789abcdef0").await?;
     shell.run().await?;
@@ -77,21 +76,30 @@ async fn main() -> anyhow::Result<()> {
 ### Port Forwarding
 
 ```rust
-use aws_ssm_bridge::{SessionManager, PortForwardConfig, PortForwarder};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use aws_ssm_bridge::{SessionManager, SessionConfig, PortForwardConfig, PortForwarder,
+                     install_signal_handlers};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (signal, _guard) = install_signal_handlers()?;
     let manager = SessionManager::new().await?;
-    
-    let forwarder = PortForwarder::new(&manager, PortForwardConfig {
+
+    let session = Arc::new(manager.start_session(SessionConfig {
         target: "i-0123456789abcdef0".into(),
-        local_port: 8080,
+        ..Default::default()
+    }).await?);
+
+    let config = PortForwardConfig {
+        local_addr: "127.0.0.1:8080".parse::<SocketAddr>()?,
         remote_port: 80,
         ..Default::default()
-    }).await?;
-    
-    println!("Forwarding localhost:8080 -> remote:80");
-    forwarder.wait().await?;
+    };
+    let mut forwarder = PortForwarder::new(config);
+    let local_addr = forwarder.listen().await?;
+    println!("Forwarding {local_addr} -> remote:80");
+    forwarder.forward(session, signal).await?;
     Ok(())
 }
 ```
@@ -136,7 +144,7 @@ let config = SessionConfig {
 
 ```toml
 [dependencies]
-aws-ssm-bridge = { version = "0.3", default-features = false, features = ["interactive"] }
+aws-ssm-bridge = { version = "0.4", default-features = false, features = ["interactive"] }
 ```
 
 | Feature | Description | Default |

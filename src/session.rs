@@ -198,6 +198,29 @@ impl Session {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Return a clone of the protocol-ready signal for lock-free polling.
+    ///
+    /// Callers (e.g. Python bindings) can cache this and call
+    /// `load(Ordering::SeqCst)` directly without acquiring the session lock.
+    pub fn can_send_signal(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.protocol_can_send)
+    }
+
+    /// Return a clone of the ready [`Notify`] for lock-free waiting.
+    ///
+    /// Callers can `tokio::time::timeout(t, notify.notified()).await` without
+    /// ever holding the session lock.
+    pub fn ready_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.ready_notify)
+    }
+
+    /// Return a clone of the terminated [`Notify`].
+    ///
+    /// Callers can await `notify.notified()` without holding the session lock.
+    pub fn terminated_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.terminated_notify)
+    }
+
     /// Wait for the session to be ready (start_publication or handshake complete)
     ///
     /// This should be called before sending data to ensure the agent is ready.
