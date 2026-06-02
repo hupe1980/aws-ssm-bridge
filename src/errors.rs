@@ -183,7 +183,8 @@ impl Error {
             Error::Transport(TransportError::ConnectionClosed { .. }) => true,
             Error::Transport(TransportError::Channel(_)) => true,
             Error::Transport(TransportError::WebSocket(msg)) => {
-                msg.contains("closed") || msg.contains("closing")
+                let lower = msg.to_lowercase();
+                lower.contains("closed") || lower.contains("closing")
             }
             _ => false,
         }

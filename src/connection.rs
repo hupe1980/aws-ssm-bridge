@@ -67,8 +67,9 @@ const MAX_RETRANSMIT_ATTEMPTS: u32 = 3000;
 /// Buffer capacity for the lock-free WebSocket writer channel.
 ///
 /// Bounded at 2× the retransmit buffer so heavy retransmit storms do not
-/// cause unbounded memory growth when the remote end stalls.  Callers that
-/// exceed this capacity receive backpressure via `SendError`.
+/// cause unbounded memory growth when the remote end stalls.  Senders that
+/// exceed this capacity will block (`.await`) until capacity is available;
+/// an error is only returned when the receiver has been dropped.
 const WRITER_CHANNEL_CAPACITY: usize = OUTGOING_BUFFER_CAPACITY * 2;
 
 /// Maximum consecutive missed pong responses before declaring connection dead
@@ -562,9 +563,20 @@ impl ConnectionManager {
                     msg = rx.recv() => {
                         match msg {
                             Some(msg) => {
-                                if let Err(e) = writer.send(msg).await {
-                                    error!(error = ?e, "Writer task: WebSocket send failed");
-                                    break;
+                                // Race the potentially-blocking socket send against
+                                // shutdown so a stalled remote cannot prevent teardown.
+                                tokio::select! {
+                                    biased;
+                                    _ = shutdown_rx.recv() => {
+                                        debug!("Writer task shutting down during send");
+                                        break;
+                                    }
+                                    result = writer.send(msg) => {
+                                        if let Err(e) = result {
+                                            error!(error = ?e, "Writer task: WebSocket send failed");
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             None => {
@@ -716,10 +728,18 @@ impl ConnectionManager {
                             metrics::counter(MetricNames::RETRANSMISSIONS, 1, &[]);
 
                             // `get_retransmit_candidates` already advanced last_sent_time and
-                            // resend_attempt for this entry, so we must deliver it — use
-                            // send().await (backpressure) rather than try_send which can silently
-                            // drop the frame and leave the buffer believing it was sent.
-                            if writer_tx.send(Message::Binary(data)).await.is_err() {
+                            // resend_attempt for this entry, so we must deliver it.  Race the
+                            // send with shutdown so a stalled socket cannot block teardown.
+                            let send_ok = tokio::select! {
+                                biased;
+                                _ = shutdown_rx.recv() => {
+                                    debug!("Retransmit task shutting down during send");
+                                    fatal = true;
+                                    break;
+                                }
+                                result = writer_tx.send(Message::Binary(data)) => result.is_ok(),
+                            };
+                            if !send_ok {
                                 warn!(
                                     seq,
                                     "Writer channel closed during retransmit — stopping"
