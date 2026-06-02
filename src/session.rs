@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -92,6 +92,7 @@ impl Default for SessionConfig {
 }
 
 /// Represents an active SSM session with proper lifecycle management
+#[must_use = "dropping a Session terminates the connection without cleanup; call terminate() explicitly"]
 pub struct Session {
     /// Session ID from AWS
     session_id: SessionId,
@@ -109,7 +110,7 @@ pub struct Session {
     channels: Arc<ChannelMultiplexer>,
 
     /// Connection manager task handle
-    manager_task: Option<JoinHandle<Result<()>>>,
+    manager_task: Mutex<Option<JoinHandle<Result<()>>>>,
 
     /// Publication state from connection manager (protocol-level can_send)
     protocol_can_send: Arc<std::sync::atomic::AtomicBool>,
@@ -168,7 +169,7 @@ impl Session {
             state: Arc::new(RwLock::new(SessionState::Initializing)),
             command_tx,
             channels,
-            manager_task: Some(manager_task),
+            manager_task: Mutex::new(Some(manager_task)),
             protocol_can_send,
             ready_notify,
             terminated_notify: Arc::new(Notify::new()),
@@ -348,7 +349,7 @@ impl Session {
     /// Terminate the session
     ///
     /// Terminates both the WebSocket connection and the AWS-side session.
-    pub async fn terminate(&mut self) -> Result<()> {
+    pub async fn terminate(&self) -> Result<()> {
         info!(session_id = %self.session_id, "Terminating session");
 
         self.set_state(SessionState::Disconnecting).await;
@@ -358,7 +359,7 @@ impl Session {
             .map_err(|_| Error::InvalidState("Session command channel closed".to_string()))?;
 
         // Wait for manager task to complete
-        if let Some(task) = self.manager_task.take() {
+        if let Some(task) = self.manager_task.lock().await.take() {
             match task.await {
                 Ok(Ok(())) => debug!("Manager task completed successfully"),
                 Ok(Err(e)) => warn!(error = ?e, "Manager task completed with error"),
@@ -403,9 +404,12 @@ impl Session {
 // Implement Drop to ensure cleanup
 impl Drop for Session {
     fn drop(&mut self) {
-        // If manager task still exists, abort it
-        if let Some(task) = self.manager_task.take() {
-            task.abort();
+        // If manager task still exists, abort it.
+        // Use try_lock (non-async) since we hold &mut self — no one else can lock.
+        if let Ok(mut guard) = self.manager_task.try_lock() {
+            if let Some(task) = guard.take() {
+                task.abort();
+            }
         }
     }
 }
@@ -501,17 +505,17 @@ impl SessionManager {
         // Extract session details
         let session_id = response
             .session_id()
-            .ok_or_else(|| Error::AwsSdk("No session ID in response".to_string()))?
+            .ok_or_else(|| Error::aws_sdk_msg("No session ID in response"))?
             .to_string();
 
         let stream_url = response
             .stream_url()
-            .ok_or_else(|| Error::AwsSdk("No stream URL in response".to_string()))?
+            .ok_or_else(|| Error::aws_sdk_msg("No stream URL in response"))?
             .to_string();
 
         let token_value = response
             .token_value()
-            .ok_or_else(|| Error::AwsSdk("No token value in response".to_string()))?
+            .ok_or_else(|| Error::aws_sdk_msg("No token value in response"))?
             .to_string();
 
         info!(session_id = %session_id, "SSM session started");

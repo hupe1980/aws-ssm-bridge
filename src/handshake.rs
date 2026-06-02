@@ -34,6 +34,17 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
+/// SSM session-manager-plugin protocol version this library advertises.
+///
+/// The AWS SSM agent uses the client version reported in the `HandshakeResponse` to select
+/// the appropriate port-forwarding mode:
+/// - `>= "1.1.70"` enables smux multiplexed port forwarding (`LocalPortForwardingMux`)
+/// - `> "1.2.331.0"` additionally disables agent-side smux keepalive NOP frames
+///
+/// This value matches the locally installed `session-manager-plugin` (1.2.814.0) and is
+/// intentionally decoupled from the `aws-ssm-bridge` crate version.
+pub const SSM_PLUGIN_PROTOCOL_VERSION: &str = "1.2.814.0";
+
 use crate::binary_protocol::{ClientMessage, PayloadType};
 use crate::errors::{Error, ProtocolError, Result};
 use crate::protocol::MessageType;
@@ -233,8 +244,6 @@ pub enum HandshakeState {
 pub struct HandshakeConfig {
     /// Client version to report
     pub client_version: String,
-    /// Whether to support KMS encryption
-    pub support_kms: bool,
     /// Supported session types
     pub supported_session_types: Vec<SessionTypeValue>,
     /// Timeout for handshake completion
@@ -244,8 +253,7 @@ pub struct HandshakeConfig {
 impl Default for HandshakeConfig {
     fn default() -> Self {
         Self {
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            support_kms: false, // We support our own encryption, not KMS by default
+            client_version: SSM_PLUGIN_PROTOCOL_VERSION.to_string(),
             supported_session_types: vec![
                 SessionTypeValue::StandardStream,
                 SessionTypeValue::InteractiveCommands,
@@ -262,7 +270,6 @@ pub struct HandshakeHandler {
     state: HandshakeState,
     negotiated_session_type: Option<SessionTypeValue>,
     agent_version: Option<String>,
-    kms_enabled: bool,
 }
 
 impl HandshakeHandler {
@@ -273,7 +280,6 @@ impl HandshakeHandler {
             state: HandshakeState::AwaitingRequest,
             negotiated_session_type: None,
             agent_version: None,
-            kms_enabled: false,
         }
     }
 
@@ -290,11 +296,6 @@ impl HandshakeHandler {
     /// Get agent version (after handshake request received)
     pub fn agent_version(&self) -> Option<&str> {
         self.agent_version.as_deref()
-    }
-
-    /// Check if KMS encryption was negotiated
-    pub fn is_kms_enabled(&self) -> bool {
-        self.kms_enabled
     }
 
     /// Process a handshake request and generate response
@@ -365,52 +366,24 @@ impl HandshakeHandler {
     }
 
     /// Process KMS encryption action
-    fn process_kms_action(&mut self, action: &RequestedClientAction) -> ProcessedClientAction {
-        if !self.config.support_kms {
-            // Emit a visible warning so operators know KMS is being silently
-            // downgraded.  In environments with mandatory KMS session encryption
-            // this is a policy-relevant event, not just a debug detail.
-            warn!(
-                "Agent requested KMS session encryption but this client does not support it. \
-                 Session data is NOT KMS-encrypted (transport TLS only). \
-                 Set HandshakeConfig::support_kms = true and implement KMS key generation \
-                 if end-to-end KMS encryption is required by your security policy."
-            );
-            return ProcessedClientAction {
-                action_type: ActionType::KmsEncryption,
-                action_status: ActionStatus::Unsupported,
-                action_result: None,
-                error: Some("KMS encryption not supported by this client".to_string()),
-            };
-        }
-
-        // Parse KMS request
-        let kms_request: std::result::Result<KmsEncryptionRequest, _> =
-            serde_json::from_value(action.action_parameters.clone());
-
-        match kms_request {
-            Ok(req) => {
-                info!(kms_key_id = %req.kms_key_id, "KMS encryption requested");
-
-                // In a real implementation, we would:
-                // 1. Call AWS KMS to generate a data key
-                // 2. Return the encrypted key to the agent
-                // For now, we mark as unsupported
-                warn!("KMS key generation not implemented yet");
-
-                ProcessedClientAction {
-                    action_type: ActionType::KmsEncryption,
-                    action_status: ActionStatus::Unsupported,
-                    action_result: None,
-                    error: Some("KMS key generation not implemented".to_string()),
-                }
-            }
-            Err(e) => ProcessedClientAction {
-                action_type: ActionType::KmsEncryption,
-                action_status: ActionStatus::Failed,
-                action_result: None,
-                error: Some(format!("Failed to parse KMS request: {}", e)),
-            },
+    fn process_kms_action(&mut self, _action: &RequestedClientAction) -> ProcessedClientAction {
+        // KMS session encryption is not implemented.  Rather than silently
+        // downgrading to unencrypted transport (which would violate an operator
+        // policy that mandated KMS), we surface a hard error so the caller can
+        // decide whether to abort or reconfigure the SSM session preference.
+        // The caller (`process_request`) propagates this via the `Failed` status
+        // in the HandshakeResponse; the agent will then terminate the session.
+        ProcessedClientAction {
+            action_type: ActionType::KmsEncryption,
+            action_status: ActionStatus::Failed,
+            action_result: None,
+            error: Some(
+                "KMS session encryption is required by the SSM agent but is not implemented \
+                 in this client. To connect without KMS encryption, change the SSM session \
+                 preference document to omit KMS key configuration. Alternatively, use the \
+                 official AWS session-manager-plugin for KMS-encrypted sessions."
+                    .to_string(),
+            ),
         }
     }
 
@@ -645,10 +618,7 @@ mod tests {
 
     #[test]
     fn test_kms_unsupported() {
-        let config = HandshakeConfig {
-            support_kms: false,
-            ..Default::default()
-        };
+        let config = HandshakeConfig::default();
         let mut handler = HandshakeHandler::new(config);
 
         let request = HandshakeRequest {
@@ -665,10 +635,12 @@ mod tests {
             .process_request(request)
             .unwrap()
             .expect("Should return response");
+        // KMS is never supported — always returns Failed so the agent terminates the session.
         assert_eq!(
             response.processed_client_actions[0].action_status,
-            ActionStatus::Unsupported
+            ActionStatus::Failed
         );
+        assert!(response.processed_client_actions[0].error.is_some());
     }
 
     #[test]

@@ -62,6 +62,23 @@ impl MetricsRecorder for PrintMetricsRecorder {
     }
 }
 
+/// Newtype so we can implement `MetricsRecorder` for a shared `Arc`.
+struct SharedRecorder(Arc<PrintMetricsRecorder>);
+
+impl MetricsRecorder for SharedRecorder {
+    fn increment_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
+        self.0.increment_counter(name, value, labels);
+    }
+
+    fn set_gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        self.0.set_gauge(name, value, labels);
+    }
+
+    fn record_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        self.0.record_histogram(name, value, labels);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging with tracing
@@ -82,10 +99,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let instance_id = &args[1];
     let region = args.get(2).cloned();
 
-    // Create and register metrics recorder
+    // Create and register metrics recorder.  We share the same Arc so the
+    // summary printed at the end reflects the actual counters incremented by
+    // the library — not a separate dead instance.
     let recorder = Arc::new(PrintMetricsRecorder::new());
-    let recorder_for_print = Arc::clone(&recorder);
-    register_metrics(Box::new(PrintMetricsRecorder::new()));
+    register_metrics(Box::new(SharedRecorder(Arc::clone(&recorder))))
+        .unwrap_or_else(|_| panic!("a metrics recorder was already registered"));
 
     // Setup graceful shutdown
     let shutdown = ShutdownSignal::new();
@@ -109,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Start session
-    let mut session = manager.start_session(config).await?;
+    let session = manager.start_session(config).await?;
     let session_id = session.id().to_string();
     println!("✓ Session started: {}", session_id);
 
@@ -161,19 +180,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Metrics Summary ---");
     println!(
         "Messages sent: {}",
-        recorder_for_print.messages_sent.load(Ordering::Relaxed)
+        recorder.messages_sent.load(Ordering::Relaxed)
     );
     println!(
         "Messages received: {}",
-        recorder_for_print.messages_received.load(Ordering::Relaxed)
+        recorder.messages_received.load(Ordering::Relaxed)
     );
     println!(
         "Bytes sent: {}",
-        recorder_for_print.bytes_sent.load(Ordering::Relaxed)
+        recorder.bytes_sent.load(Ordering::Relaxed)
     );
     println!(
         "Bytes received: {}",
-        recorder_for_print.bytes_received.load(Ordering::Relaxed)
+        recorder.bytes_received.load(Ordering::Relaxed)
     );
     println!("-----------------------\n");
 

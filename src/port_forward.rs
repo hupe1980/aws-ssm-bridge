@@ -41,7 +41,11 @@ pub struct PortForwardConfig {
     /// Local address to bind to (default: `127.0.0.1:0`, OS-assigned random port)
     pub local_addr: SocketAddr,
 
-    /// Maximum concurrent connections (default: 10)
+    /// Maximum concurrent connections (default: 100).
+    ///
+    /// Tune this to match your downstream connection pool size.  Typical
+    /// database pools (SQLx, HikariCP) default to 10–50 connections; a value
+    /// of 100 leaves headroom without imposing a meaningful resource cost.
     pub max_connections: usize,
 }
 
@@ -51,7 +55,7 @@ impl Default for PortForwardConfig {
             local_addr: "127.0.0.1:0"
                 .parse()
                 .expect("127.0.0.1:0 is a valid socket address"),
-            max_connections: 10,
+            max_connections: 100,
         }
     }
 }
@@ -82,6 +86,7 @@ impl Default for PortForwardConfig {
 /// intermediate "not-yet-bound" state — the type system enforces the
 /// `bind → forward` ordering and makes the "listener not started" class of
 /// runtime errors structurally impossible.
+#[must_use = "dropping a PortForwarder stops port forwarding before any connections are accepted; call forward() to start forwarding"]
 pub struct PortForwarder {
     config: PortForwardConfig,
     listener: TcpListener,
@@ -306,7 +311,7 @@ mod tests {
     #[test]
     fn test_port_forward_config_default() {
         let config = PortForwardConfig::default();
-        assert_eq!(config.max_connections, 10);
+        assert_eq!(config.max_connections, 100);
         // local_addr defaults to 127.0.0.1:0 (OS-assigned port)
         assert_eq!(config.local_addr.ip().to_string(), "127.0.0.1");
         assert_eq!(config.local_addr.port(), 0);

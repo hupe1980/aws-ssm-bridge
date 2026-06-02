@@ -108,7 +108,7 @@ impl PySessionConfig {
 /// Python wrapper for Session
 #[pyclass(name = "Session")]
 pub struct PySession {
-    inner: Arc<tokio::sync::Mutex<crate::Session>>,
+    inner: Arc<crate::Session>,
     /// Cached session ID (avoids async lock for a read-only field)
     session_id: String,
     /// Cached ready signal — avoids holding the session lock during wait_for_ready.
@@ -133,8 +133,7 @@ impl PySession {
     fn state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            let session_guard = session.lock().await;
-            let state = session_guard.state().await;
+            let state = session.state().await;
             let state_str = match state {
                 SessionState::Initializing => "initializing",
                 SessionState::Connected => "connected",
@@ -201,14 +200,9 @@ impl PySession {
     /// Example:
     ///     async for chunk in session.output():
     ///         print(chunk.decode())
-    fn output<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let session = Arc::clone(&self.inner);
-        future_into_py(py, async move {
-            let session_guard = session.lock().await;
-            let stream = session_guard.output();
-            Ok(PyOutputStream {
-                inner: Arc::new(tokio::sync::Mutex::new(stream)),
-            })
+    fn output(&self) -> PyResult<PyOutputStream> {
+        Ok(PyOutputStream {
+            inner: Arc::new(tokio::sync::Mutex::new(self.inner.output())),
         })
     }
 
@@ -216,8 +210,7 @@ impl PySession {
     fn send<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            let session_guard = session.lock().await;
-            session_guard
+            session
                 .send(bytes::Bytes::from(data))
                 .await
                 .map_err(to_py_err)?;
@@ -229,8 +222,7 @@ impl PySession {
     fn terminate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            let mut session_guard = session.lock().await;
-            session_guard.terminate().await.map_err(to_py_err)?;
+            session.terminate().await.map_err(to_py_err)?;
             Ok(())
         })
     }
@@ -279,9 +271,8 @@ impl PySession {
     ) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            let mut session_guard = session.lock().await;
             // Best-effort termination, ignore errors on exit
-            let _ = session_guard.terminate().await;
+            let _ = session.terminate().await;
             Ok(false) // Don't suppress exceptions
         })
     }
@@ -377,7 +368,7 @@ impl PySessionManager {
             let terminated_notify = session.terminated_signal();
             let terminated_flag = session.terminated_flag();
             Ok(PySession {
-                inner: Arc::new(tokio::sync::Mutex::new(session)),
+                inner: Arc::new(session),
                 session_id,
                 protocol_can_send,
                 ready_notify,
@@ -408,7 +399,7 @@ impl PySessionManager {
             let terminated_notify = session.terminated_signal();
             let terminated_flag = session.terminated_flag();
             Ok(PySession {
-                inner: Arc::new(tokio::sync::Mutex::new(session)),
+                inner: Arc::new(session),
                 session_id,
                 protocol_can_send,
                 ready_notify,

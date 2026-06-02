@@ -125,6 +125,7 @@ pub struct ReconnectStats {
 /// This wraps a regular Session and monitors its health. When the session
 /// becomes disconnected, it automatically attempts to reconnect with
 /// exponential backoff.
+#[must_use = "dropping a ReconnectingSession terminates the underlying session; call terminate() explicitly"]
 pub struct ReconnectingSession {
     /// Target instance/document
     target: String,
@@ -408,7 +409,7 @@ impl ReconnectingSession {
         self.shutdown.shutdown();
 
         let mut guard = self.session.write().await;
-        if let Some(mut session) = guard.take() {
+        if let Some(session) = guard.take() {
             session.terminate().await?;
         }
 
@@ -423,7 +424,7 @@ impl ReconnectingSession {
         // Terminate current session
         {
             let mut guard = self.session.write().await;
-            if let Some(mut session) = guard.take() {
+            if let Some(session) = guard.take() {
                 let _ = session.terminate().await;
             }
         }

@@ -117,7 +117,7 @@ async def main():
     
     async with await manager.start_session(target="i-0123456789abcdef0") as session:
         await session.send(b"whoami\n")
-        async for chunk in await session.output():
+        async for chunk in session.output():
             print(chunk.decode(), end="")
 
 asyncio.run(main())

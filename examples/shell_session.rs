@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Start session
-    let mut session = manager.start_session(config).await?;
+    let session = manager.start_session(config).await?;
 
     println!("✓ Session started: {}", session.id());
 

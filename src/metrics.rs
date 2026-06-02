@@ -75,10 +75,18 @@ pub trait MetricsRecorder: Send + Sync + 'static {
 /// struct MyMetrics;
 /// impl MetricsRecorder for MyMetrics {}
 ///
-/// register_metrics(Box::new(MyMetrics));
+/// register_metrics(Box::new(MyMetrics)).expect("metrics already registered");
 /// ```
-pub fn register_metrics(recorder: Box<dyn MetricsRecorder>) {
-    let _ = METRICS.set(recorder);
+///
+/// # Errors
+///
+/// Returns the rejected recorder in `Err` if a recorder was already registered.
+/// This allows the caller to detect and handle double-registration instead of
+/// silently discarding the second recorder.
+pub fn register_metrics(
+    recorder: Box<dyn MetricsRecorder>,
+) -> Result<(), Box<dyn MetricsRecorder>> {
+    METRICS.set(recorder)
 }
 
 /// Get the registered metrics recorder, if any.
@@ -200,7 +208,8 @@ mod tests {
         };
 
         // Register the recorder
-        register_metrics(Box::new(recorder));
+        register_metrics(Box::new(recorder))
+            .unwrap_or_else(|_| panic!("metrics not yet registered"));
 
         // Call counter
         counter("test_metric", 5, &[("label", "value")]);

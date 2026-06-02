@@ -12,7 +12,7 @@ Example (context manager - recommended):
     ...     manager = await SessionManager.new()
     ...     async with await manager.start_session("i-1234567890abcdef0") as session:
     ...         await session.send(b"hostname\\n")
-    ...         async for chunk in await session.output():
+    ...         async for chunk in session.output():
     ...             print(chunk.decode(), end='')
     ...     # Session automatically terminated
     >>> 
@@ -48,6 +48,13 @@ from ._internal import (
     InteractiveConfig,
     run_shell,
     configure_logging,
+    AwsSsmBridgeError,
+    SsmSessionError,
+    SsmProtocolError,
+    SsmTransportError,
+    SsmAwsSdkError,
+    SsmTimeoutError,
+    SsmCancelledError,
     __version__,
 )
 
@@ -95,7 +102,7 @@ async def connect(
 
 __all__ = [
     "SessionManager",
-    "Session", 
+    "Session",
     "SessionConfig",
     "SessionType",
     "OutputStream",
@@ -104,5 +111,12 @@ __all__ = [
     "run_shell",
     "configure_logging",
     "connect",
+    "AwsSsmBridgeError",
+    "SsmSessionError",
+    "SsmProtocolError",
+    "SsmTransportError",
+    "SsmAwsSdkError",
+    "SsmTimeoutError",
+    "SsmCancelledError",
     "__version__",
 ]

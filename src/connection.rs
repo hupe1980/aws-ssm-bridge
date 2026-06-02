@@ -1053,7 +1053,7 @@ impl ConnectionManager {
 
                 if msg.sequence_number == state.expected_sequence {
                     // In-order message: process, ACK, then check buffer for consecutive messages
-                    if let Err(e) = Self::send_acknowledge(&ctx.writer_tx, &msg).await {
+                    if let Err(e) = Self::send_acknowledge(&ctx.writer_tx, &msg) {
                         error!(error = ?e, "Failed to send acknowledge");
                     } else {
                         debug!(
@@ -1095,7 +1095,7 @@ impl ConnectionManager {
                     if incoming_buffer.add(msg.clone(), raw_bytes).await {
                         // Successfully buffered - send ACK with IsSequentialMessage=false
                         if let Err(e) =
-                            Self::send_acknowledge_non_sequential(&ctx.writer_tx, &msg).await
+                            Self::send_acknowledge_non_sequential(&ctx.writer_tx, &msg)
                         {
                             error!(error = ?e, "Failed to send acknowledge for out-of-order message");
                         } else {
@@ -1362,8 +1362,14 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Send acknowledge message for a received message (sequential)
-    async fn send_acknowledge(
+    /// Send acknowledge message for a received message (sequential).
+    ///
+    /// Uses `try_send` so this never blocks the receiver loop.  If the writer
+    /// channel is momentarily full the ACK is dropped with a warning; the
+    /// remote end will retransmit and the next ACK attempt will succeed once
+    /// the writer drains.  Pong frames and other control messages therefore
+    /// remain unaffected.
+    fn send_acknowledge(
         writer_tx: &mpsc::Sender<Message>,
         received_msg: &ClientMessage,
     ) -> Result<()> {
@@ -1380,16 +1386,25 @@ impl ConnectionManager {
         );
         let msg_bytes = ack_msg.serialize()?;
 
-        writer_tx
-            .send(Message::Binary(msg_bytes))
-            .await
-            .map_err(|_| TransportError::Channel("writer channel closed".to_string()))?;
-
-        Ok(())
+        match writer_tx.try_send(Message::Binary(msg_bytes)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    original_seq = received_msg.sequence_number,
+                    "ACK dropped: writer channel full (remote will retransmit)"
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(TransportError::Channel("writer channel closed".to_string()).into())
+            }
+        }
     }
 
-    /// Send acknowledge message for an out-of-order message (non-sequential)
-    async fn send_acknowledge_non_sequential(
+    /// Send acknowledge message for an out-of-order message (non-sequential).
+    ///
+    /// Uses `try_send` — see [`Self::send_acknowledge`] for rationale.
+    fn send_acknowledge_non_sequential(
         writer_tx: &mpsc::Sender<Message>,
         received_msg: &ClientMessage,
     ) -> Result<()> {
@@ -1406,12 +1421,19 @@ impl ConnectionManager {
         );
         let msg_bytes = ack_msg.serialize()?;
 
-        writer_tx
-            .send(Message::Binary(msg_bytes))
-            .await
-            .map_err(|_| TransportError::Channel("writer channel closed".to_string()))?;
-
-        Ok(())
+        match writer_tx.try_send(Message::Binary(msg_bytes)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    original_seq = received_msg.sequence_number,
+                    "ACK (non-sequential) dropped: writer channel full (remote will retransmit)"
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(TransportError::Channel("writer channel closed".to_string()).into())
+            }
+        }
     }
 
     /// Shutdown the connection gracefully
@@ -1464,12 +1486,20 @@ impl ConnectionManager {
         // - ssmmessages.<region>.amazonaws.com
         // - ssmmessages-fips.<region>.amazonaws.com
         // - ssmmessages.<region>.amazonaws.com.cn (China regions)
-        let is_aws_domain = host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn");
-        let is_ssm_service = host.contains("ssmmessages");
+        //
+        // SSRF hardening: require the host to start with `ssmmessages` so that
+        // attacker-controlled hostnames like `evil.ssmmessages.com.amazonaws.com`
+        // or `s3.amazonaws.com` are rejected even though they end with the right
+        // suffix.
+        let is_ssm_prefix =
+            host.starts_with("ssmmessages.") || host.starts_with("ssmmessages-");
+        let is_aws_domain =
+            host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn");
 
-        if !is_aws_domain || !is_ssm_service {
+        if !is_ssm_prefix || !is_aws_domain {
             return Err(Error::Config(format!(
-                "Stream URL host '{}' is not a valid AWS SSM endpoint",
+                "Stream URL host '{}' is not a valid AWS SSM messages endpoint \
+                 (expected ssmmessages[‑fips].<region>.amazonaws.com[.cn])",
                 host
             )));
         }
@@ -1559,7 +1589,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("not a valid AWS SSM endpoint"));
+            .contains("not a valid AWS SSM messages endpoint"));
     }
 
     #[test]

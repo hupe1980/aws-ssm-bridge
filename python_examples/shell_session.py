@@ -33,9 +33,9 @@ async def main():
         region=region,
         session_type="standard_stream",
     ) as session:
-        print(f"✓ Session started: {await session.id}")
+        print(f"✓ Session started: {session.id}")
         print(f"  State: {await session.state()}")
-        print(f"  Ready: {await session.is_ready()}")
+        print(f"  Ready: {session.is_ready()}")
 
         # Send a simple command
         print("\nSending command: echo 'Hello from Python!'")

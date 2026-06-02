@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
     Arc, Mutex,
 };
 use std::task::{Context, Poll};
@@ -34,7 +34,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::interval;
 use tokio_util::sync::PollSender;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::errors::{Error, Result};
 use crate::session::Session;
@@ -120,12 +120,37 @@ fn decode_frame(buf: &mut BytesMut) -> Option<(u8, u32, Bytes)> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Stream close reason
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Why a [`SmuxStream`]'s read half reached EOF.
+///
+/// Available via [`SmuxStream::close_reason`] once `AsyncRead` returns
+/// `Poll::Ready(Ok(()))` with an empty buffer (i.e. EOF).
+///
+/// Distinguishing a clean close from a slow-consumer eviction lets callers
+/// log diagnostics or trigger metrics without having to instrument the entire
+/// mux pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCloseReason {
+    /// Normal close: remote sent a FIN frame or the session ended cleanly.
+    Clean = 0,
+    /// Slow consumer: the per-stream receive buffer was full when the mux
+    /// tried to deliver a frame.  The mux sent a FIN to the remote and evicted
+    /// this stream to prevent head-of-line blocking for other streams.
+    SlowConsumer = 1,
+}
+
+// Sentinel stored in `SmuxStream::close_reason_tag` while the stream is still open.
+const REASON_OPEN: u8 = 255;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Shared inner state
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct Inner {
-    /// Active streams: stream_id → sender for inbound data.
-    streams: Mutex<HashMap<u32, mpsc::Sender<Bytes>>>,
+    /// Active streams: stream_id → (sender for inbound data, close-reason tag).
+    streams: Mutex<HashMap<u32, (mpsc::Sender<Bytes>, Arc<AtomicU8>)>>,
     /// Outbound frame queue consumed by the send task.
     frame_tx: mpsc::Sender<Bytes>,
     /// Next stream ID for client-initiated streams (odd: 1, 3, 5 …).
@@ -142,7 +167,19 @@ impl Inner {
         if !self.closed.swap(true, Ordering::SeqCst) {
             self.die.notify_waiters();
         }
-        self.streams.lock().unwrap().clear();
+        // Mark all remaining open streams as Clean before dropping the senders.
+        // This ensures SmuxStream::close_reason() returns Clean for streams that
+        // are closed due to session teardown rather than slow-consumer eviction.
+        let mut streams = self.streams.lock().unwrap();
+        for (_, reason_tag) in streams.values() {
+            reason_tag.compare_exchange(
+                REASON_OPEN,
+                StreamCloseReason::Clean as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ).ok();
+        }
+        streams.clear();
     }
 
     fn is_closed(&self) -> bool {
@@ -156,18 +193,27 @@ impl Inner {
     /// other streams.  When the per-stream buffer is full the stream is closed
     /// (the consumer sees EOF) rather than blocking the entire mux.
     fn route_psh(&self, stream_id: u32, data: Bytes) {
-        let tx = self.streams.lock().unwrap().get(&stream_id).cloned();
-        if let Some(tx) = tx {
+        let entry = self
+            .streams
+            .lock()
+            .unwrap()
+            .get(&stream_id)
+            .map(|(tx, reason)| (tx.clone(), Arc::clone(reason)));
+        if entry.is_none() {
+            debug!(stream_id, "smux route_psh: no stream registered for id — dropping frame");
+        }
+        if let Some((tx, reason_tag)) = entry {
+            trace!(stream_id, bytes = data.len(), "smux route_psh: routing to stream");
             match tx.try_send(data) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Consumer too slow — close this stream to unblock other streams.
-                    warn!(stream_id, "Per-stream receive buffer full — closing stream");
+                    // Consumer too slow — tag and evict this stream so other streams
+                    // are not blocked.  The SmuxStream will observe SlowConsumer
+                    // via `close_reason()` after reading EOF.
+                    warn!(stream_id, "Per-stream receive buffer full — evicting slow consumer");
+                    reason_tag.store(StreamCloseReason::SlowConsumer as u8, Ordering::SeqCst);
                     self.streams.lock().unwrap().remove(&stream_id);
-                    // Best-effort FIN: inform the remote agent so it can release
-                    // its stream resources rather than continuing to push data into
-                    // a stream we've silently discarded.  Ignore send errors here
-                    // (the mux may already be closing).
+                    // Best-effort FIN to the remote agent so it can release resources.
                     let _ = self.frame_tx.try_send(encode_ctrl(CMD_FIN, stream_id));
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -178,9 +224,17 @@ impl Inner {
         }
     }
 
-    /// Drop the stream sender so the stream's `data_rx` sees EOF.
+    /// Drop the stream sender so the stream's `data_rx` sees EOF (clean close).
     fn route_fin(&self, stream_id: u32) {
-        self.streams.lock().unwrap().remove(&stream_id);
+        if let Some((_, reason_tag)) = self.streams.lock().unwrap().remove(&stream_id) {
+            // Only mark Clean if the reason hasn't already been set to SlowConsumer.
+            reason_tag.compare_exchange(
+                REASON_OPEN,
+                StreamCloseReason::Clean as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ).ok();
+        }
     }
 }
 
@@ -200,12 +254,16 @@ async fn recv_task(mut output_rx: mpsc::Receiver<Bytes>, inner: Arc<Inner>) {
             chunk = output_rx.recv() => {
                 match chunk {
                     Some(bytes) => {
+                        trace!(len = bytes.len(), "smux recv_task: chunk received");
                         buf.extend_from_slice(&bytes);
                         if !dispatch_frames(&mut buf, &inner) {
                             break; // protocol violation — mux torn down
                         }
                     }
-                    None => break, // SSM session closed
+                    None => {
+                        debug!("smux recv_task: output_rx closed (no more data)");
+                        break; // SSM session closed
+                    }
                 }
             }
         }
@@ -247,12 +305,18 @@ fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) -> bool {
         }
         match decode_frame(buf) {
             None => return true, // need more data
-            Some((cmd, stream_id, data)) => match cmd {
-                CMD_PSH => inner.route_psh(stream_id, data),
-                CMD_FIN => inner.route_fin(stream_id),
-                CMD_NOP | CMD_SYN => {} // NOP = keepalive; SYN from server not expected here
-                _ => warn!(cmd, stream_id, "Unknown smux command – ignoring"),
-            },
+            Some((cmd, stream_id, data)) => {
+                trace!(cmd, stream_id, payload_len = data.len(), "smux dispatch_frames: decoded frame");
+                match cmd {
+                    CMD_PSH => inner.route_psh(stream_id, data),
+                    CMD_FIN => {
+                        debug!(stream_id, "smux dispatch_frames: FIN received");
+                        inner.route_fin(stream_id);
+                    }
+                    CMD_NOP | CMD_SYN => {}
+                    _ => warn!(cmd, stream_id, "Unknown smux command – ignoring"),
+                }
+            }
         }
     }
 }
@@ -401,6 +465,7 @@ impl SmuxSession {
         });
 
         let output_rx = session.subscribe_output();
+        debug!("Subscribed to session output (direct_subs)");
 
         tokio::spawn(recv_task(output_rx, Arc::clone(&inner)));
         tokio::spawn(send_task(
@@ -426,12 +491,13 @@ impl SmuxSession {
 
         let stream_id = self.inner.next_id.fetch_add(2, Ordering::SeqCst);
         let (data_tx, data_rx) = mpsc::channel::<Bytes>(STREAM_CHANNEL_CAP);
+        let close_reason_tag = Arc::new(AtomicU8::new(REASON_OPEN));
 
         self.inner
             .streams
             .lock()
             .unwrap()
-            .insert(stream_id, data_tx);
+            .insert(stream_id, (data_tx, Arc::clone(&close_reason_tag)));
 
         // Inform the remote agent of the new stream.
         // Use try_send: open_stream is sync and the channel has ample capacity.
@@ -466,6 +532,7 @@ impl SmuxSession {
             current_chunk: None,
             read_closed: false,
             write_closed: false,
+            close_reason_tag,
             frame_sink,
         })
     }
@@ -506,8 +573,31 @@ pub struct SmuxStream {
     current_chunk: Option<Bytes>,
     read_closed: bool,
     write_closed: bool,
+    /// Shared atomic set by the mux when it evicts this stream.
+    /// `REASON_OPEN` while open; `StreamCloseReason` discriminant when closed.
+    close_reason_tag: Arc<AtomicU8>,
     /// Backpressured sender for outbound PSH frames.
     frame_sink: PollSender<Bytes>,
+}
+
+impl SmuxStream {
+    /// Returns the reason the read half reached EOF, or `None` if the stream
+    /// is still open.
+    ///
+    /// This is only meaningful after `AsyncRead` has returned an empty read
+    /// (i.e. EOF).  Calling it while the stream is still live always returns
+    /// `None`.
+    pub fn close_reason(&self) -> Option<StreamCloseReason> {
+        if !self.read_closed {
+            return None;
+        }
+        match self.close_reason_tag.load(Ordering::SeqCst) {
+            x if x == StreamCloseReason::SlowConsumer as u8 => {
+                Some(StreamCloseReason::SlowConsumer)
+            }
+            _ => Some(StreamCloseReason::Clean),
+        }
+    }
 }
 
 impl AsyncRead for SmuxStream {

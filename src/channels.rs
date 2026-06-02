@@ -9,9 +9,9 @@ use std::task::{Context, Poll};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
-use crate::errors::{Error, Result, TransportError};
+use crate::errors::Result;
 
 /// Capacity of the bounded lossless-tap channel.
 ///
@@ -161,27 +161,35 @@ impl ChannelMultiplexer {
         }
         drop(guard);
         // Fan out to lossless direct subscribers.
-        // try_send keeps send_output synchronous; a Full result means the
-        // consumer is hopelessly behind — treat it as a fatal overload.
-        let mut overflow = false;
+        // try_send keeps send_output synchronous.
+        //
+        // Overflow policy: if a single subscriber's channel is full, evict
+        // *only that subscriber* — do NOT close the entire multiplexer.  The
+        // smux recv_task will detect its channel closure (Closed variant) and
+        // initiate its own teardown, which keeps the shutdown path contained to
+        // the one component that actually overflowed.  Closing the whole mux
+        // here would abruptly cancel every other active stream for what is
+        // essentially a single slow consumer.
+        let direct_sub_count = self
+            .direct_subs
+            .lock()
+            .expect("direct_subs lock poisoned")
+            .len();
+        debug!(direct_sub_count, bytes = data.len(), "send_output: fanning out to direct subscribers");
         self.direct_subs
             .lock()
             .expect("direct_subs lock poisoned")
             .retain(|tx| match tx.try_send(data.clone()) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    overflow = true;
-                    false // evict so we don't block future sends
+                    warn!(
+                        bytes = data.len(),
+                        "Lossless subscriber channel full — evicting slow subscriber"
+                    );
+                    false // evict this subscriber only
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => false, // dead subscriber
             });
-        if overflow {
-            error!("Lossless subscriber channel full — session overloaded, closing multiplexer");
-            self.close();
-            return Err(Error::Transport(TransportError::Channel(
-                "lossless subscriber channel full".to_string(),
-            )));
-        }
         Ok(())
     }
 

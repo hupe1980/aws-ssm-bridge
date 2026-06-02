@@ -23,7 +23,7 @@ Unlike the [official AWS Session Manager Plugin](https://github.com/aws/session-
 
 ### Features
 
-- **Binary Protocol**: Full 120-byte AWS header, SHA-256 digest validation
+- **Binary Protocol**: Full 120-byte AWS header, SHA-256 digest checking (advisory — mismatches warn but do not fail the session, to handle known SSM agent quirks)
 - **Reliable Delivery**: Sequence tracking, ACK/retransmission, RTT estimation (Jacobson/Karels)
 - **Bounded Writer Channel**: Dedicated writer task with backpressure — no mutex contention, no OOM under slow remotes
 - **Dead Connection Detection**: Pong-based heartbeat with auto-shutdown on missed responses
@@ -144,7 +144,7 @@ async def main():
 
     async with await manager.start_session(target="i-0123456789abcdef0") as session:
         await session.send(b"hostname\n")
-        output = await session.output()
+        output = session.output()
         async for chunk in output:
             print(chunk.decode(), end="")
 

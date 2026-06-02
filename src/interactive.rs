@@ -138,7 +138,7 @@ impl InteractiveShell {
     #[instrument(skip(self))]
     pub async fn run(&mut self) -> Result<()> {
         // Take session out for the duration of run()
-        let mut session = self
+        let session = self
             .session
             .take()
             .ok_or_else(|| Error::Config("Not connected".to_string()))?;

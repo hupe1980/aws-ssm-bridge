@@ -38,7 +38,8 @@
 //! let doc = PortForwardingSession::builder()
 //!     .remote_port(3306)
 //!     .local_port(13306)
-//!     .build();
+//!     .build()?;
+//! # Ok::<(), aws_ssm_bridge::errors::Error>(())
 //! ```
 
 use crate::protocol::SessionType;
@@ -85,7 +86,8 @@ pub trait SsmDocument: Send + Sync {
 /// let doc = PortForwardingSession::builder()
 ///     .remote_port(3306)
 ///     .local_port(13306)
-///     .build();
+///     .build()?;
+/// # Ok::<(), aws_ssm_bridge::errors::Error>(())
 /// ```
 #[derive(Debug, Clone)]
 pub struct PortForwardingSession {
@@ -152,19 +154,17 @@ impl PortForwardingSessionBuilder {
         self
     }
 
-    /// Build the document configuration
+    /// Build the document configuration.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if remote_port is not set. Use `try_build()` for fallible construction.
-    pub fn build(self) -> PortForwardingSession {
-        self.try_build().expect("remote_port is required")
-    }
-
-    /// Try to build the document configuration
-    pub fn try_build(self) -> Option<PortForwardingSession> {
-        Some(PortForwardingSession {
-            remote_port: self.remote_port?,
+    /// Returns [`Error::Config`] if `remote_port` was not set.
+    pub fn build(self) -> crate::errors::Result<PortForwardingSession> {
+        let remote_port = self.remote_port.ok_or_else(|| {
+            crate::errors::Error::Config("remote_port is required for PortForwardingSession".into())
+        })?;
+        Ok(PortForwardingSession {
+            remote_port,
             local_port: self.local_port,
         })
     }
@@ -414,7 +414,8 @@ mod tests {
         let doc = PortForwardingSession::builder()
             .remote_port(3306)
             .local_port(13306)
-            .build();
+            .build()
+            .unwrap();
 
         let params = doc.parameters();
         assert_eq!(params.get("portNumber"), Some(&vec!["3306".to_string()]));
