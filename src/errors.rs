@@ -151,14 +151,16 @@ impl Error {
             Error::Transport(TransportError::WebSocket(_)) => true,
             // Only retry *transient* AWS errors — permanent failures (AccessDenied,
             // InvalidInstanceId, TargetNotConnected) must propagate immediately.
+            // Normalize to lowercase once so casing variations in SdkError debug
+            // strings don't silently suppress retries.  Deduplicate overlapping
+            // patterns (e.g. "throttling" subsumes "throttlingexception").
             Error::AwsSdk(msg) => {
-                msg.contains("ThrottlingException")
-                    || msg.contains("ServiceUnavailableException")
-                    || msg.contains("InternalServerError")
-                    || msg.contains("InternalFailure")
-                    || msg.contains("ServiceUnavailable")
-                    || msg.contains("RequestTimeout")
-                    || msg.contains("Throttling")
+                let lower = msg.to_lowercase();
+                lower.contains("throttling")
+                    || lower.contains("serviceunavailable")
+                    || lower.contains("internalservererror")
+                    || lower.contains("internalfailure")
+                    || lower.contains("requesttimeout")
             }
             _ => false,
         }
@@ -181,7 +183,11 @@ impl Error {
     pub fn is_shutdown_related(&self) -> bool {
         match self {
             Error::Transport(TransportError::ConnectionClosed { .. }) => true,
-            Error::Transport(TransportError::Channel(_)) => true,
+            // Only treat Channel errors whose message indicates the channel was
+            // *closed* (connection shutting down) as shutdown-related.  Other
+            // Channel messages (e.g. "lossless subscriber channel full") signal
+            // overload conditions and must remain visible as real errors.
+            Error::Transport(TransportError::Channel(msg)) => msg.to_lowercase().contains("closed"),
             Error::Transport(TransportError::WebSocket(msg)) => {
                 let lower = msg.to_lowercase();
                 lower.contains("closed") || lower.contains("closing")
