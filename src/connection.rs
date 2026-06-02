@@ -571,6 +571,13 @@ impl ConnectionManager {
     /// Pings via `try_send` would set `pending_pong = true` at enqueue time,
     /// which can trigger false "missed pong" counts when the writer is backlogged
     /// but the queue is not yet full.
+    ///
+    /// **Heartbeat during backpressure**: the message-send path pins its future
+    /// and polls it in a 3-way select (shutdown | heartbeat | send-complete).
+    /// When a heartbeat tick fires while the socket is stalled, pong detection
+    /// runs immediately and `deferred_ping` is set; the Ping is sent once the
+    /// socket becomes free again.  This guarantees dead-connection detection is
+    /// never delayed by a slow or stalled remote.
     fn spawn_writer_task(
         mut writer: WsWriter,
         mut rx: mpsc::Receiver<Message>,
@@ -595,8 +602,36 @@ impl ConnectionManager {
             // Set only after writer.send(Ping) returns — guarantees the Ping
             // reached the OS send buffer before we start waiting for a Pong.
             let mut pending_pong = false;
+            // Set when a heartbeat tick fires during a message send (socket busy).
+            // The deferred Ping is sent at the top of the next outer-loop iteration
+            // once the socket is free, preserving the pending_pong correctness
+            // invariant while still running detection on schedule.
+            let mut deferred_ping = false;
 
             'task: loop {
+                // --- Deferred Ping flush ---
+                // Send any Ping that was deferred because a heartbeat tick fired
+                // while a regular message send was occupying the socket.
+                if deferred_ping {
+                    deferred_ping = false;
+                    trace!("Sending deferred heartbeat ping");
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.recv() => break 'task,
+                        result = writer.send(Message::Ping(Bytes::new())) => {
+                            match result {
+                                Ok(()) => { pending_pong = true; }
+                                Err(e) => {
+                                    error!(error = ?e, "Deferred heartbeat ping send failed");
+                                    let _ = shutdown_tx.send(());
+                                    break 'task;
+                                }
+                            }
+                        }
+                    }
+                    continue 'task;
+                }
+
                 tokio::select! {
                     biased;
 
@@ -606,7 +641,7 @@ impl ConnectionManager {
                     }
 
                     _ = heartbeat.tick() => {
-                        // Only check for a pong if we actually sent a ping last interval.
+                        // Socket is idle — run detection then send Ping immediately.
                         if pending_pong {
                             if !pong_received.swap(false, std::sync::atomic::Ordering::SeqCst) {
                                 missed_pongs += 1;
@@ -625,13 +660,8 @@ impl ConnectionManager {
                                 missed_pongs = 0;
                             }
                         }
-
-                        // Send Ping directly to the socket; pending_pong is set
-                        // to true only after the send completes, avoiding the
-                        // enqueue-vs-write race that existed when Ping was queued
-                        // via try_send.  No `pending_pong = false` is needed here:
-                        // success immediately sets it to true, and any failure path
-                        // breaks out of the task so the value is irrelevant.
+                        // pending_pong = false not needed: success sets it to true,
+                        // all failure paths break out of 'task.
                         trace!("Sending heartbeat ping");
                         tokio::select! {
                             biased;
@@ -650,27 +680,64 @@ impl ConnectionManager {
                     }
 
                     msg = rx.recv() => {
-                        match msg {
-                            Some(msg) => {
-                                // Race the potentially-blocking socket send against
-                                // shutdown so a stalled remote cannot prevent teardown.
-                                tokio::select! {
-                                    biased;
-                                    _ = shutdown_rx.recv() => {
-                                        debug!("Writer task shutting down during send");
-                                        break 'task;
-                                    }
-                                    result = writer.send(msg) => {
-                                        if let Err(e) = result {
-                                            error!(error = ?e, "Writer task: WebSocket send failed");
-                                            break 'task;
-                                        }
-                                    }
-                                }
-                            }
+                        let msg = match msg {
+                            Some(m) => m,
                             None => {
                                 debug!("Writer channel closed");
                                 break 'task;
+                            }
+                        };
+
+                        // Pin the send future so it can be polled incrementally
+                        // inside the inner loop while heartbeat ticks are
+                        // interleaved.  Without pinning, a stalled socket send
+                        // would block heartbeat.tick() polling, delaying
+                        // missed-pong detection indefinitely under backpressure.
+                        let send_fut = writer.send(msg);
+                        tokio::pin!(send_fut);
+
+                        loop {
+                            tokio::select! {
+                                biased;
+
+                                _ = shutdown_rx.recv() => {
+                                    debug!("Writer task shutting down during send");
+                                    break 'task;
+                                }
+
+                                _ = heartbeat.tick() => {
+                                    // Socket is busy with the in-flight send; run
+                                    // pong detection now, defer the Ping send.
+                                    if pending_pong {
+                                        if !pong_received.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                            missed_pongs += 1;
+                                            warn!(missed = missed_pongs, "Missed pong response");
+                                            if missed_pongs >= MAX_MISSED_PONGS {
+                                                error!(
+                                                    missed = missed_pongs,
+                                                    threshold = MAX_MISSED_PONGS,
+                                                    "Connection appears dead -- triggering session shutdown"
+                                                );
+                                                metrics::counter(MetricNames::MESSAGES_RECEIVED, 0, &[("dead_connection", "true")]);
+                                                let _ = shutdown_tx.send(());
+                                                break 'task;
+                                            }
+                                        } else {
+                                            missed_pongs = 0;
+                                        }
+                                    }
+                                    pending_pong = false;
+                                    deferred_ping = true;
+                                    // Keep polling the in-flight send.
+                                }
+
+                                result = &mut send_fut => {
+                                    if let Err(e) = result {
+                                        error!(error = ?e, "Writer task: WebSocket send failed");
+                                        break 'task;
+                                    }
+                                    break; // send complete, return to outer loop
+                                }
                             }
                         }
                     }

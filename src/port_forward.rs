@@ -122,12 +122,17 @@ impl PortForwarder {
             .take()
             .ok_or_else(|| Error::InvalidState("Listener not started".to_string()))?;
 
-        // Block until the SSM protocol handshake is complete, racing against shutdown.
+        // Block until the SSM protocol handshake is complete, racing against
+        // shutdown and premature session termination.
         let connect_timeout = session.config().connect_timeout;
         let ready = tokio::select! {
             ready = session.wait_for_ready(connect_timeout) => ready,
             _ = shutdown.cancelled() => {
                 info!("Shutting down before session handshake completed");
+                return Ok(());
+            }
+            _ = session.wait_terminated() => {
+                info!("SSM session terminated before becoming ready");
                 return Ok(());
             }
         };
@@ -154,6 +159,18 @@ impl PortForwarder {
 
                 _ = shutdown.cancelled() => {
                     info!("Port forwarder shutdown requested");
+                    return Ok(());
+                }
+
+                // Bridge session termination: if the SSM session terminates
+                // independently of the caller's ShutdownSignal (e.g. the
+                // ConnectionManager detects a dead connection), trigger
+                // shutdown here so the accept loop exits and the bound port
+                // is released promptly.  Also cancels active connection
+                // handlers that share the same ShutdownSignal.
+                _ = session.wait_terminated() => {
+                    info!("SSM session terminated, stopping port forwarder");
+                    shutdown.shutdown();
                     return Ok(());
                 }
 
