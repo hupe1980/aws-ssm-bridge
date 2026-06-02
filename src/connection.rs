@@ -797,6 +797,7 @@ impl ConnectionManager {
                                 result = &mut send_fut => {
                                     if let Err(e) = result {
                                         error!(error = ?e, "Writer task: WebSocket send failed");
+                                        let _ = shutdown_tx.send(());
                                         break 'task;
                                     }
                                     break; // send complete, return to outer loop
@@ -1094,8 +1095,7 @@ impl ConnectionManager {
 
                     if incoming_buffer.add(msg.clone(), raw_bytes).await {
                         // Successfully buffered - send ACK with IsSequentialMessage=false
-                        if let Err(e) =
-                            Self::send_acknowledge_non_sequential(&ctx.writer_tx, &msg)
+                        if let Err(e) = Self::send_acknowledge_non_sequential(&ctx.writer_tx, &msg)
                         {
                             error!(error = ?e, "Failed to send acknowledge for out-of-order message");
                         } else {
@@ -1491,10 +1491,8 @@ impl ConnectionManager {
         // attacker-controlled hostnames like `evil.ssmmessages.com.amazonaws.com`
         // or `s3.amazonaws.com` are rejected even though they end with the right
         // suffix.
-        let is_ssm_prefix =
-            host.starts_with("ssmmessages.") || host.starts_with("ssmmessages-");
-        let is_aws_domain =
-            host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn");
+        let is_ssm_prefix = host.starts_with("ssmmessages.") || host.starts_with("ssmmessages-");
+        let is_aws_domain = host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn");
 
         if !is_ssm_prefix || !is_aws_domain {
             return Err(Error::Config(format!(

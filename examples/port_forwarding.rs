@@ -30,7 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("Usage: {} <instance-id> <remote-port> <local-port> [region]", args[0]);
+        eprintln!(
+            "Usage: {} <instance-id> <remote-port> <local-port> [region]",
+            args[0]
+        );
         eprintln!("Example: {} i-1234567890abcdef0 80 8080", args[0]);
         std::process::exit(1);
     }
@@ -65,12 +68,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     println!("\n✓ Port forwarding session started: {}", session_arc.id());
-    println!("  Forwarding {}  →  remote:{}", forwarder.local_addr(), remote_port);
+    println!(
+        "  Forwarding {}  →  remote:{}",
+        forwarder.local_addr(),
+        remote_port
+    );
     println!("  Press Ctrl+C to stop\n");
 
     // forward() drives the accept loop until shutdown is signalled, the session
     // terminates, or an unrecoverable error occurs.
-    forwarder.forward(Arc::clone(&session_arc), shutdown).await?;
+    forwarder
+        .forward(Arc::clone(&session_arc), shutdown)
+        .await?;
 
     println!("\nTerminating session...");
     session_arc.terminate().await?;

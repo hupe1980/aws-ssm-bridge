@@ -272,5 +272,4 @@ mod tests {
         let duration = strategy.backoff_duration();
         assert!(duration <= Duration::from_secs(5));
     }
-
 }

@@ -34,7 +34,9 @@
 use bytes::Bytes;
 use crossterm::{
     cursor,
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{self, ClearType},
 };
@@ -158,7 +160,13 @@ impl RawModeGuard {
         // application receives them as a single Event::Paste instead of a
         // rapid burst of KeyCode::Char events.  Without this, many terminal
         // emulators suppress paste entirely in raw mode.
-        execute!(io::stdout(), EnableBracketedPaste)?;
+        if let Err(e) = execute!(io::stdout(), EnableBracketedPaste) {
+            // Roll back raw mode so we don't leave the terminal stuck.
+            if !was_raw {
+                let _ = terminal::disable_raw_mode();
+            }
+            return Err(e);
+        }
         Ok(Self { was_raw })
     }
 }
@@ -315,9 +323,8 @@ impl Terminal {
                                     std::mem::take(&mut buffer),
                                 )));
                             }
-                            let _ = tx.blocking_send(TerminalInput::Data(
-                                Bytes::from(text.into_bytes()),
-                            ));
+                            let _ = tx
+                                .blocking_send(TerminalInput::Data(Bytes::from(text.into_bytes())));
                         }
                         Ok(_) => {} // Ignore mouse, focus events
                         Err(e) => {

@@ -172,12 +172,14 @@ impl Inner {
         // are closed due to session teardown rather than slow-consumer eviction.
         let mut streams = self.streams.lock().unwrap();
         for (_, reason_tag) in streams.values() {
-            reason_tag.compare_exchange(
-                REASON_OPEN,
-                StreamCloseReason::Clean as u8,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ).ok();
+            reason_tag
+                .compare_exchange(
+                    REASON_OPEN,
+                    StreamCloseReason::Clean as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .ok();
         }
         streams.clear();
     }
@@ -200,17 +202,27 @@ impl Inner {
             .get(&stream_id)
             .map(|(tx, reason)| (tx.clone(), Arc::clone(reason)));
         if entry.is_none() {
-            debug!(stream_id, "smux route_psh: no stream registered for id — dropping frame");
+            debug!(
+                stream_id,
+                "smux route_psh: no stream registered for id — dropping frame"
+            );
         }
         if let Some((tx, reason_tag)) = entry {
-            trace!(stream_id, bytes = data.len(), "smux route_psh: routing to stream");
+            trace!(
+                stream_id,
+                bytes = data.len(),
+                "smux route_psh: routing to stream"
+            );
             match tx.try_send(data) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // Consumer too slow — tag and evict this stream so other streams
                     // are not blocked.  The SmuxStream will observe SlowConsumer
                     // via `close_reason()` after reading EOF.
-                    warn!(stream_id, "Per-stream receive buffer full — evicting slow consumer");
+                    warn!(
+                        stream_id,
+                        "Per-stream receive buffer full — evicting slow consumer"
+                    );
                     reason_tag.store(StreamCloseReason::SlowConsumer as u8, Ordering::SeqCst);
                     self.streams.lock().unwrap().remove(&stream_id);
                     // Best-effort FIN to the remote agent so it can release resources.
@@ -228,12 +240,14 @@ impl Inner {
     fn route_fin(&self, stream_id: u32) {
         if let Some((_, reason_tag)) = self.streams.lock().unwrap().remove(&stream_id) {
             // Only mark Clean if the reason hasn't already been set to SlowConsumer.
-            reason_tag.compare_exchange(
-                REASON_OPEN,
-                StreamCloseReason::Clean as u8,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ).ok();
+            reason_tag
+                .compare_exchange(
+                    REASON_OPEN,
+                    StreamCloseReason::Clean as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .ok();
         }
     }
 }
@@ -306,7 +320,12 @@ fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) -> bool {
         match decode_frame(buf) {
             None => return true, // need more data
             Some((cmd, stream_id, data)) => {
-                trace!(cmd, stream_id, payload_len = data.len(), "smux dispatch_frames: decoded frame");
+                trace!(
+                    cmd,
+                    stream_id,
+                    payload_len = data.len(),
+                    "smux dispatch_frames: decoded frame"
+                );
                 match cmd {
                     CMD_PSH => inner.route_psh(stream_id, data),
                     CMD_FIN => {

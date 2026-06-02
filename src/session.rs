@@ -295,8 +295,10 @@ impl Session {
     ///
     /// Unlike [`output`], this receiver never drops frames under load and is
     /// suitable for consumers that must not lose any bytes (e.g. the smux
-    /// `recv_task`).  Sustained consumer backpressure is treated as fatal and
-    /// will close the multiplexer.
+    /// `recv_task`).  If the consumer falls behind and its channel fills up,
+    /// only this subscriber is evicted; the session and all other consumers
+    /// remain alive.  The evicted receiver will return `None` on the next
+    /// `recv()`, signalling a framing-fatal overflow.
     pub fn subscribe_output(&self) -> mpsc::Receiver<bytes::Bytes> {
         self.channels.subscribe_lossless()
     }
@@ -349,7 +351,26 @@ impl Session {
     /// Terminate the session
     ///
     /// Terminates both the WebSocket connection and the AWS-side session.
+    /// Idempotent: safe to call multiple times or concurrently — subsequent
+    /// calls return `Ok(())` immediately once the session is already
+    /// `Disconnecting` or `Terminated`.
     pub async fn terminate(&self) -> Result<()> {
+        // Idempotency guard: if we're already tearing down, do nothing.
+        {
+            let state = self.state().await;
+            if matches!(
+                state,
+                SessionState::Disconnecting | SessionState::Terminated
+            ) {
+                debug!(
+                    session_id = %self.session_id,
+                    ?state,
+                    "terminate() called on session that is already shutting down — no-op"
+                );
+                return Ok(());
+            }
+        }
+
         info!(session_id = %self.session_id, "Terminating session");
 
         self.set_state(SessionState::Disconnecting).await;

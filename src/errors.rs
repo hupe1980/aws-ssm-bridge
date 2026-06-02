@@ -167,7 +167,10 @@ impl Error {
     /// be converted via the `From<SdkError<E, R>>` impl, which preserves the
     /// typed error code for accurate retriability classification.
     pub(crate) fn aws_sdk_msg(message: impl Into<String>) -> Self {
-        Error::AwsSdk { message: message.into(), code: None }
+        Error::AwsSdk {
+            message: message.into(),
+            code: None,
+        }
     }
 
     /// Check if error is retriable
@@ -270,12 +273,18 @@ mod tests {
 
     /// Helper: construct an AwsSdk error with a typed error code (simulates a real SDK error).
     fn sdk_code(code: &str) -> Error {
-        Error::AwsSdk { message: format!("{code}: request details"), code: Some(code.to_owned()) }
+        Error::AwsSdk {
+            message: format!("{code}: request details"),
+            code: Some(code.to_owned()),
+        }
     }
 
     /// Helper: construct an AwsSdk error with no typed code (simulates a hand-constructed error).
     fn sdk_msg(msg: &str) -> Error {
-        Error::AwsSdk { message: msg.to_owned(), code: None }
+        Error::AwsSdk {
+            message: msg.to_owned(),
+            code: None,
+        }
     }
 
     #[test]

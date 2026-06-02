@@ -96,9 +96,7 @@ fn env_params() -> EnvParams {
         )
     });
     let remote_port: u16 = remote_port_str.parse().unwrap_or_else(|_| {
-        panic!(
-            "SSM_TEST_REMOTE_PORT={remote_port_str} is not a valid port number"
-        )
+        panic!("SSM_TEST_REMOTE_PORT={remote_port_str} is not a valid port number")
     });
     EnvParams {
         instance_id,
@@ -185,9 +183,7 @@ async fn test_pf_tcp_connect() {
     init_tracing();
     let p = env_params();
 
-    let manager = SessionManager::new()
-        .await
-        .expect("create session manager");
+    let manager = SessionManager::new().await.expect("create session manager");
 
     let session = Arc::new(session_or_skip!(
         SessionBuilder::new(&p.instance_id)
@@ -198,9 +194,7 @@ async fn test_pf_tcp_connect() {
         "start SSM port forwarding session"
     ));
 
-    let ready = session
-        .wait_for_ready(Duration::from_secs(30))
-        .await;
+    let ready = session.wait_for_ready(Duration::from_secs(30)).await;
     assert!(ready, "session not ready");
 
     let (local_addr, shutdown, forward_handle) = spawn_forwarder(Arc::clone(&session)).await;
@@ -238,9 +232,7 @@ async fn test_pf_http_roundtrip() {
     init_tracing();
     let p = env_params();
 
-    let manager = SessionManager::new()
-        .await
-        .expect("create session manager");
+    let manager = SessionManager::new().await.expect("create session manager");
 
     let session = Arc::new(session_or_skip!(
         SessionBuilder::new(&p.instance_id)
@@ -251,9 +243,7 @@ async fn test_pf_http_roundtrip() {
         "start SSM port forwarding session"
     ));
 
-    let ready = session
-        .wait_for_ready(Duration::from_secs(30))
-        .await;
+    let ready = session.wait_for_ready(Duration::from_secs(30)).await;
     assert!(ready, "session not ready");
 
     let (local_addr, shutdown, forward_handle) = spawn_forwarder(Arc::clone(&session)).await;
@@ -291,7 +281,10 @@ async fn test_pf_http_roundtrip() {
     .expect("HTTP round-trip timed out after 15 s")
     .expect("I/O error during HTTP round-trip");
 
-    assert!(!result.is_empty(), "received zero bytes from remote — smux data path appears broken");
+    assert!(
+        !result.is_empty(),
+        "received zero bytes from remote — smux data path appears broken"
+    );
 
     // Loosely validate that something HTTP-shaped came back.
     let response_text = String::from_utf8_lossy(&result);
@@ -318,9 +311,7 @@ async fn test_pf_concurrent_connections() {
 
     const CONCURRENCY: usize = 5;
 
-    let manager = SessionManager::new()
-        .await
-        .expect("create session manager");
+    let manager = SessionManager::new().await.expect("create session manager");
 
     let session = Arc::new(session_or_skip!(
         SessionBuilder::new(&p.instance_id)
@@ -331,9 +322,7 @@ async fn test_pf_concurrent_connections() {
         "start SSM port forwarding session"
     ));
 
-    let ready = session
-        .wait_for_ready(Duration::from_secs(30))
-        .await;
+    let ready = session.wait_for_ready(Duration::from_secs(30)).await;
     assert!(ready, "session not ready");
 
     let (local_addr, shutdown, forward_handle) = spawn_forwarder(Arc::clone(&session)).await;
@@ -368,10 +357,7 @@ async fn test_pf_concurrent_connections() {
             .unwrap_or_else(|_| panic!("connection {i} timed out"))
             .unwrap_or_else(|e| panic!("connection {i} I/O error: {e}"));
 
-            assert!(
-                !result.is_empty(),
-                "connection {i} received zero bytes"
-            );
+            assert!(!result.is_empty(), "connection {i} received zero bytes");
             result
         }));
     }
@@ -380,7 +366,11 @@ async fn test_pf_concurrent_connections() {
         .await
         .expect("a concurrent connection task panicked");
 
-    assert_eq!(results.len(), CONCURRENCY, "expected {CONCURRENCY} responses");
+    assert_eq!(
+        results.len(),
+        CONCURRENCY,
+        "expected {CONCURRENCY} responses"
+    );
     for (i, r) in results.iter().enumerate() {
         let text = String::from_utf8_lossy(r);
         assert!(
@@ -404,9 +394,7 @@ async fn test_pf_graceful_shutdown() {
     init_tracing();
     let p = env_params();
 
-    let manager = SessionManager::new()
-        .await
-        .expect("create session manager");
+    let manager = SessionManager::new().await.expect("create session manager");
 
     let session = Arc::new(session_or_skip!(
         SessionBuilder::new(&p.instance_id)
@@ -417,9 +405,7 @@ async fn test_pf_graceful_shutdown() {
         "start SSM port forwarding session"
     ));
 
-    let ready = session
-        .wait_for_ready(Duration::from_secs(30))
-        .await;
+    let ready = session.wait_for_ready(Duration::from_secs(30)).await;
     assert!(ready, "session not ready");
 
     let (_local_addr, shutdown, forward_handle) = spawn_forwarder(Arc::clone(&session)).await;
@@ -449,9 +435,7 @@ async fn test_pf_session_terminate_unblocks_forwarder() {
     init_tracing();
     let p = env_params();
 
-    let manager = SessionManager::new()
-        .await
-        .expect("create session manager");
+    let manager = SessionManager::new().await.expect("create session manager");
 
     let session = Arc::new(session_or_skip!(
         SessionBuilder::new(&p.instance_id)
@@ -462,9 +446,7 @@ async fn test_pf_session_terminate_unblocks_forwarder() {
         "start SSM port forwarding session"
     ));
 
-    let ready = session
-        .wait_for_ready(Duration::from_secs(30))
-        .await;
+    let ready = session.wait_for_ready(Duration::from_secs(30)).await;
     assert!(ready, "session not ready");
 
     let (_local_addr, _shutdown, forward_handle) = spawn_forwarder(Arc::clone(&session)).await;

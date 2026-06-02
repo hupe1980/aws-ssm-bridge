@@ -175,7 +175,11 @@ impl ChannelMultiplexer {
             .lock()
             .expect("direct_subs lock poisoned")
             .len();
-        debug!(direct_sub_count, bytes = data.len(), "send_output: fanning out to direct subscribers");
+        debug!(
+            direct_sub_count,
+            bytes = data.len(),
+            "send_output: fanning out to direct subscribers"
+        );
         self.direct_subs
             .lock()
             .expect("direct_subs lock poisoned")
@@ -202,9 +206,11 @@ impl ChannelMultiplexer {
     ///
     /// **Backpressure policy**: the channel has a fixed capacity of
     /// `DIRECT_SUB_CHANNEL_CAP` messages.  If the consumer falls behind and the
-    /// channel fills up, `send_output` treats the overflow as a fatal condition,
-    /// closes the entire multiplexer, and returns an error — propagating a clean
-    /// shutdown instead of allowing unbounded memory growth.
+    /// channel fills up, `send_output` evicts this subscriber (drops the sender
+    /// for this receiver only) and emits a `warn!` log.  The multiplexer and all
+    /// other subscribers continue operating normally.  The evicted receiver will
+    /// see `None` on the next `recv()` call, signalling that it should treat the
+    /// gap as a fatal framing error and shut down its own pipeline.
     pub fn subscribe_lossless(&self) -> mpsc::Receiver<Bytes> {
         let (tx, rx) = mpsc::channel(DIRECT_SUB_CHANNEL_CAP);
         let mut guard = self.direct_subs.lock().expect("direct_subs lock poisoned");
