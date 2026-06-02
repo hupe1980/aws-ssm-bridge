@@ -286,12 +286,13 @@ impl Session {
         self.channels.output_stream()
     }
 
-    /// Subscribe to a lossless output stream backed by an unbounded mpsc channel.
+    /// Subscribe to a lossless output stream backed by a bounded mpsc channel.
     ///
     /// Unlike [`output`], this receiver never drops frames under load and is
     /// suitable for consumers that must not lose any bytes (e.g. the smux
-    /// `recv_task`).
-    pub fn subscribe_output(&self) -> mpsc::UnboundedReceiver<bytes::Bytes> {
+    /// `recv_task`).  Sustained consumer backpressure is treated as fatal and
+    /// will close the multiplexer.
+    pub fn subscribe_output(&self) -> mpsc::Receiver<bytes::Bytes> {
         self.channels.subscribe_lossless()
     }
 

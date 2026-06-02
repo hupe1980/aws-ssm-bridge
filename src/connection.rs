@@ -49,7 +49,8 @@ const MAX_MESSAGES_PER_SECOND: f64 = 5000.0;
 const MESSAGE_SCHEMA_VERSION: &str = "1.0";
 
 /// Client version — identifies this library to the SSM service.
-/// Format mirrors aws/session-manager-plugin for protocol compatibility.
+/// Treated as an opaque string by the SSM agent; the format is not required
+/// to match the official plugin's numeric version string.
 const CLIENT_VERSION: &str = concat!("aws-ssm-bridge/", env!("CARGO_PKG_VERSION"));
 
 /// Buffer capacity for out-of-order messages (matches AWS default)

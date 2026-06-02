@@ -9,9 +9,15 @@ use std::task::{Context, Poll};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
-use crate::errors::Result;
+use crate::errors::{Error, Result, TransportError};
+
+/// Capacity of the bounded lossless-tap channel.
+///
+/// If the smux `recv_task` falls more than this many messages behind,
+/// `send_output` treats it as a fatal overload and tears down the multiplexer.
+const DIRECT_SUB_CHANNEL_CAP: usize = 1024;
 
 /// Stream of output data.
 ///
@@ -85,9 +91,9 @@ pub struct ChannelMultiplexer {
     /// Wrapped in `Mutex<Option<_>>` so `close()` can drop it, which
     /// wakes all parked receivers instantly.
     output_tx: std::sync::Mutex<Option<broadcast::Sender<Bytes>>>,
-    /// Lossless direct subscribers (mpsc-backed, never drops frames).
+    /// Lossless direct subscribers (bounded mpsc-backed, never silently drops frames).
     /// Used by the smux `recv_task` to avoid broadcast-lag data corruption.
-    direct_subs: std::sync::Mutex<Vec<mpsc::UnboundedSender<Bytes>>>,
+    direct_subs: std::sync::Mutex<Vec<mpsc::Sender<Bytes>>>,
 
     /// Flag to signal channel closure (fast check without lock).
     closed: Arc<AtomicBool>,
@@ -154,29 +160,45 @@ impl ChannelMultiplexer {
             }
         }
         drop(guard);
-        // Fan out to lossless direct subscribers; drop dead ones.
+        // Fan out to lossless direct subscribers.
+        // try_send keeps send_output synchronous; a Full result means the
+        // consumer is hopelessly behind — treat it as a fatal overload.
+        let mut overflow = false;
         self.direct_subs
             .lock()
             .expect("direct_subs lock poisoned")
-            .retain(|tx| tx.send(data.clone()).is_ok());
+            .retain(|tx| match tx.try_send(data.clone()) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    overflow = true;
+                    false // evict so we don't block future sends
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false, // dead subscriber
+            });
+        if overflow {
+            error!("Lossless subscriber channel full — session overloaded, closing multiplexer");
+            self.close();
+            return Err(Error::Transport(TransportError::Channel(
+                "lossless subscriber channel full".to_string(),
+            )));
+        }
         Ok(())
     }
 
-    /// Subscribe to a lossless output tap backed by an unbounded mpsc channel.
+    /// Subscribe to a lossless output tap backed by a bounded mpsc channel.
     ///
     /// Unlike the broadcast-based [`output_stream`], this receiver never silently
     /// drops frames — every byte written by `send_output` is queued until the
     /// subscriber consumes it.  Use this for the smux `recv_task` where dropped
     /// bytes corrupt framing.
     ///
-    /// **WARNING**: The underlying channel is unbounded.  A slow subscriber or
-    /// any backpressure in the consumer loop (e.g., bounded per-stream channels
-    /// in the smux recv_task) can cause queue memory to grow without bound and
-    /// trigger OOM.  This is an acceptable tradeoff for the smux recv_task,
-    /// which must never drop frames; callers **must** ensure the consumer
-    /// processes data continuously without stalling.
-    pub fn subscribe_lossless(&self) -> mpsc::UnboundedReceiver<Bytes> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    /// **Backpressure policy**: the channel has a fixed capacity of
+    /// `DIRECT_SUB_CHANNEL_CAP` messages.  If the consumer falls behind and the
+    /// channel fills up, `send_output` treats the overflow as a fatal condition,
+    /// closes the entire multiplexer, and returns an error — propagating a clean
+    /// shutdown instead of allowing unbounded memory growth.
+    pub fn subscribe_lossless(&self) -> mpsc::Receiver<Bytes> {
+        let (tx, rx) = mpsc::channel(DIRECT_SUB_CHANNEL_CAP);
         let mut guard = self.direct_subs.lock().expect("direct_subs lock poisoned");
         // Check the closed flag *while holding the lock* to close the race
         // with close(), which sets `closed` before acquiring this same lock.

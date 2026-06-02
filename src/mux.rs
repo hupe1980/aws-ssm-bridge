@@ -150,13 +150,25 @@ impl Inner {
     }
 
     /// Dispatch an inbound PSH frame to its stream, evicting a dead entry if needed.
-    async fn route_psh(&self, stream_id: u32, data: Bytes) {
+    ///
+    /// Uses `try_send` rather than `send().await` to avoid head-of-line
+    /// blocking: a single slow consumer cannot stall frame delivery for all
+    /// other streams.  When the per-stream buffer is full the stream is closed
+    /// (the consumer sees EOF) rather than blocking the entire mux.
+    fn route_psh(&self, stream_id: u32, data: Bytes) {
         let tx = self.streams.lock().unwrap().get(&stream_id).cloned();
         if let Some(tx) = tx {
-            // Use send().await for backpressure: if the per-stream buffer is
-            // full we wait rather than dropping data.
-            if tx.send(data).await.is_err() {
-                self.streams.lock().unwrap().remove(&stream_id);
+            match tx.try_send(data) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Consumer too slow — close this stream to unblock other streams.
+                    warn!(stream_id, "Per-stream receive buffer full — closing stream");
+                    self.streams.lock().unwrap().remove(&stream_id);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Stream already gone — evict the dead entry.
+                    self.streams.lock().unwrap().remove(&stream_id);
+                }
             }
         }
     }
@@ -173,7 +185,7 @@ impl Inner {
 
 /// Reads raw bytes from the SSM session, reassembles smux frames, and routes
 /// them to the appropriate per-stream channels.
-async fn recv_task(mut output_rx: mpsc::UnboundedReceiver<Bytes>, inner: Arc<Inner>) {
+async fn recv_task(mut output_rx: mpsc::Receiver<Bytes>, inner: Arc<Inner>) {
     let mut buf = BytesMut::new();
 
     loop {
@@ -184,7 +196,7 @@ async fn recv_task(mut output_rx: mpsc::UnboundedReceiver<Bytes>, inner: Arc<Inn
                 match chunk {
                     Some(bytes) => {
                         buf.extend_from_slice(&bytes);
-                        if !dispatch_frames(&mut buf, &inner).await {
+                        if !dispatch_frames(&mut buf, &inner) {
                             break; // protocol violation — mux torn down
                         }
                     }
@@ -195,7 +207,7 @@ async fn recv_task(mut output_rx: mpsc::UnboundedReceiver<Bytes>, inner: Arc<Inn
     }
 
     // Flush any remaining complete frames before terminating.
-    dispatch_frames(&mut buf, &inner).await;
+    dispatch_frames(&mut buf, &inner);
     inner.close();
 }
 
@@ -204,7 +216,7 @@ async fn recv_task(mut output_rx: mpsc::UnboundedReceiver<Bytes>, inner: Arc<Inn
 /// Returns `true` when the buffer is exhausted (more data needed) and `false`
 /// when a protocol violation is detected (e.g. oversized length field).  On
 /// `false` the mux is already closed and `recv_task` should exit immediately.
-async fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) -> bool {
+fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) -> bool {
     loop {
         // Guard against garbled headers: a declared payload length that
         // exceeds MAX_PAYLOAD means the framing is corrupted.  Continuing to
@@ -231,7 +243,7 @@ async fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) -> bool {
         match decode_frame(buf) {
             None => return true, // need more data
             Some((cmd, stream_id, data)) => match cmd {
-                CMD_PSH => inner.route_psh(stream_id, data).await,
+                CMD_PSH => inner.route_psh(stream_id, data),
                 CMD_FIN => inner.route_fin(stream_id),
                 CMD_NOP | CMD_SYN => {} // NOP = keepalive; SYN from server not expected here
                 _ => warn!(cmd, stream_id, "Unknown smux command – ignoring"),
