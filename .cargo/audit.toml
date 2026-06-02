@@ -1,0 +1,11 @@
+[advisories]
+# rustls-webpki 0.101.7 is pulled in transitively by aws-smithy-http-client
+# via hyper-rustls 0.24.2 / rustls 0.21.12. No patch exists in the 0.101.x
+# semver range; the fix requires >=0.103.x which is a different semver series.
+# These can only be resolved by an upstream AWS SDK update that drops
+# the legacy hyper-rustls 0.24 stack.
+ignore = [
+    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+    "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints incorrectly accepted
+    "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints bypass
+]

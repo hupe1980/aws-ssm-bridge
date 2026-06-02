@@ -259,7 +259,7 @@ async fn keepalive_task(inner: Arc<Inner>) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Configuration for the smux multiplexer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SmuxConfig {
     /// Enable NOP keepalive frames.
     ///
@@ -267,12 +267,6 @@ pub struct SmuxConfig {
     /// behaviour (`KeepAliveDisabled = true`).  Enabling keepalive can
     /// interfere with SSM's idle-timeout enforcement.
     pub keepalive: bool,
-}
-
-impl Default for SmuxConfig {
-    fn default() -> Self {
-        Self { keepalive: false }
-    }
 }
 
 /// smux v1 client session multiplexing multiple TCP connections over a single
