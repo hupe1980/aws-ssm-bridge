@@ -147,9 +147,6 @@ pub struct ConnectionManager {
 
     /// Outgoing message buffer for reliable delivery with retransmission
     outgoing_buffer: Arc<OutgoingMessageBuffer>,
-
-    /// Pong tracking — set to true on pong receipt, swapped to false on each ping
-    pong_received: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Commands sent to the connection manager
@@ -279,8 +276,16 @@ impl ConnectionManager {
         // WebSocket writer stalls (prevents OOM under slow remote endpoints).
         let (writer_tx, writer_rx) = mpsc::channel::<Message>(WRITER_CHANNEL_CAPACITY);
 
-        // Spawn dedicated writer task (owns the WsWriter sink)
-        let writer_task = Self::spawn_writer_task(writer, writer_rx, shutdown_tx.subscribe());
+        // Spawn dedicated writer task (owns the WsWriter sink; also runs the
+        // heartbeat so pings are sent directly to the socket without going through
+        // the writer channel, eliminating the enqueue-vs-write pending_pong race).
+        let writer_task = Self::spawn_writer_task(
+            writer,
+            writer_rx,
+            shutdown_tx.subscribe(),
+            Arc::clone(&pong_received),
+            shutdown_tx.clone(),
+        );
 
         // Spawn receiver task immediately with the reader half
         // This task owns the reader and runs independently of send operations
@@ -309,7 +314,6 @@ impl ConnectionManager {
             can_send,
             ready_notify,
             outgoing_buffer,
-            pong_received,
         })
     }
 
@@ -331,10 +335,6 @@ impl ConnectionManager {
     /// Run the connection manager (spawns background tasks)
     pub async fn run(mut self) -> Result<()> {
         info!(session_id = %self.session_id, "Starting connection manager");
-
-        // Spawn heartbeat task
-        let heartbeat_task = self.spawn_heartbeat_task();
-        self.tasks.push(heartbeat_task);
 
         // Spawn retransmission scheduler task (matches AWS ResendStreamDataMessageScheduler)
         let retransmit_task = self.spawn_retransmit_task();
@@ -561,82 +561,44 @@ impl ConnectionManager {
     /// Spawn dedicated writer task that owns the WebSocket sink.
     ///
     /// All other tasks send `Message` values through a bounded mpsc channel.
-    /// This eliminates mutex contention between heartbeat, retransmit,
-    /// receiver ACKs, and the main command loop.
+    /// This eliminates mutex contention between retransmit, receiver ACKs,
+    /// and the main command loop.
+    ///
+    /// **Heartbeat co-location**: the ping/pong dead-connection detector runs
+    /// inside this task rather than in a separate task so that `pending_pong`
+    /// is set only *after* `writer.send(Ping)` returns — i.e. the Ping has
+    /// reached the OS send buffer.  A separate heartbeat task that enqueues
+    /// Pings via `try_send` would set `pending_pong = true` at enqueue time,
+    /// which can trigger false "missed pong" counts when the writer is backlogged
+    /// but the queue is not yet full.
     fn spawn_writer_task(
         mut writer: WsWriter,
         mut rx: mpsc::Receiver<Message>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        pong_received: Arc<std::sync::atomic::AtomicBool>,
+        shutdown_tx: tokio::sync::broadcast::Sender<()>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             debug!("Writer task started");
-            loop {
+
+            let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+            heartbeat.tick().await; // skip the immediate first tick
+
+            let mut missed_pongs: u32 = 0;
+            // Set only after writer.send(Ping) returns — guarantees the Ping
+            // reached the OS send buffer before we start waiting for a Pong.
+            let mut pending_pong = false;
+
+            'task: loop {
                 tokio::select! {
                     biased;
 
                     _ = shutdown_rx.recv() => {
                         debug!("Writer task shutting down");
-                        break;
+                        break 'task;
                     }
-                    msg = rx.recv() => {
-                        match msg {
-                            Some(msg) => {
-                                // Race the potentially-blocking socket send against
-                                // shutdown so a stalled remote cannot prevent teardown.
-                                tokio::select! {
-                                    biased;
-                                    _ = shutdown_rx.recv() => {
-                                        debug!("Writer task shutting down during send");
-                                        break;
-                                    }
-                                    result = writer.send(msg) => {
-                                        if let Err(e) = result {
-                                            error!(error = ?e, "Writer task: WebSocket send failed");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            None => {
-                                debug!("Writer channel closed");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            let _ = writer.close().await;
-            debug!("Writer task exited");
-        })
-    }
 
-    /// Spawn heartbeat task with pong-based dead connection detection
-    fn spawn_heartbeat_task(&self) -> JoinHandle<()> {
-        let writer_tx = self.writer_tx.clone();
-        let pong_received = Arc::clone(&self.pong_received);
-        let shutdown_tx = self.shutdown_tx.clone();
-        let mut shutdown_rx = self.shutdown_rx();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
-            let mut missed_pongs: u32 = 0;
-            // Track whether we have an outstanding ping awaiting a pong reply.
-            // We only evaluate pong receipt when we actually sent a ping the
-            // previous interval; this prevents both false positives (counting a
-            // skipped ping as a missed pong) and false negatives (fabricating a
-            // pong receipt to suppress missed-pong tracking when the writer is
-            // persistently congested).
-            let mut pending_pong = false;
-
-            loop {
-                tokio::select! {
-                    biased;
-
-                    _ = shutdown_rx.recv() => {
-                        debug!("Heartbeat task shutting down");
-                        break;
-                    }
-                    _ = interval.tick() => {
+                    _ = heartbeat.tick() => {
                         // Only check for a pong if we actually sent a ping last interval.
                         if pending_pong {
                             if !pong_received.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -649,41 +611,66 @@ impl ConnectionManager {
                                         "Connection appears dead -- triggering session shutdown"
                                     );
                                     metrics::counter(MetricNames::MESSAGES_RECEIVED, 0, &[("dead_connection", "true")]);
-                                    // C-1: Propagate dead-connection to all tasks so callers
-                                    // see EOF instead of hanging on a zombie connection.
                                     let _ = shutdown_tx.send(());
-                                    break;
+                                    break 'task;
                                 }
                             } else {
                                 missed_pongs = 0;
                             }
                         }
 
-                        // Attempt to enqueue a ping.  `try_send` keeps the heartbeat
-                        // task non-blocking; the writer task owns the actual I/O.
-                        //
-                        // * Full  — writer is congested; skip this ping tick.  Do NOT
-                        //           fabricate a pong receipt: sustained backpressure is
-                        //           itself a sign of a troubled connection and must remain
-                        //           visible to dead-connection detection.
-                        // * Closed — writer task has exited; stop heartbeats.
-                        pending_pong = false;
-                        match writer_tx.try_send(Message::Ping(Bytes::new())) {
-                            Ok(_) => {
-                                pending_pong = true;
-                                trace!("Sending heartbeat ping");
+                        // Send Ping directly to the socket; pending_pong is set
+                        // to true only after the send completes, avoiding the
+                        // enqueue-vs-write race that existed when Ping was queued
+                        // via try_send.  No `pending_pong = false` is needed here:
+                        // success immediately sets it to true, and any failure path
+                        // breaks out of the task so the value is irrelevant.
+                        trace!("Sending heartbeat ping");
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_rx.recv() => break 'task,
+                            result = writer.send(Message::Ping(Bytes::new())) => {
+                                match result {
+                                    Ok(()) => { pending_pong = true; }
+                                    Err(e) => {
+                                        error!(error = ?e, "Heartbeat ping send failed");
+                                        let _ = shutdown_tx.send(());
+                                        break 'task;
+                                    }
+                                }
                             }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                debug!("Writer channel full, skipping heartbeat ping");
+                        }
+                    }
+
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(msg) => {
+                                // Race the potentially-blocking socket send against
+                                // shutdown so a stalled remote cannot prevent teardown.
+                                tokio::select! {
+                                    biased;
+                                    _ = shutdown_rx.recv() => {
+                                        debug!("Writer task shutting down during send");
+                                        break 'task;
+                                    }
+                                    result = writer.send(msg) => {
+                                        if let Err(e) = result {
+                                            error!(error = ?e, "Writer task: WebSocket send failed");
+                                            break 'task;
+                                        }
+                                    }
+                                }
                             }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                debug!("Writer channel closed, stopping heartbeat");
-                                break;
+                            None => {
+                                debug!("Writer channel closed");
+                                break 'task;
                             }
                         }
                     }
                 }
             }
+            let _ = writer.close().await;
+            debug!("Writer task exited");
         })
     }
 

@@ -521,14 +521,11 @@ impl AsyncRead for SmuxStream {
         if this.read_closed {
             return Poll::Ready(Ok(())); // EOF
         }
-        if this.inner.is_closed() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "smux session closed",
-            )));
-        }
 
-        // Drain leftover bytes from a previous partial read first.
+        // Drain leftover bytes from a previous partial read BEFORE checking whether
+        // the mux has closed.  A closed mux does not invalidate already-buffered data;
+        // returning BrokenPipe here would silently drop buffered bytes and cause
+        // copy_bidirectional to fail with a noisy error on normal session teardown.
         if let Some(ref mut chunk) = this.current_chunk {
             let n = chunk.len().min(buf.remaining());
             buf.put_slice(&chunk[..n]);
@@ -537,6 +534,14 @@ impl AsyncRead for SmuxStream {
                 this.current_chunk = None;
             }
             return Poll::Ready(Ok(()));
+        }
+
+        // Treat a closed mux as clean EOF rather than BrokenPipe so that
+        // copy_bidirectional completes gracefully instead of propagating a
+        // spurious error on normal shutdown.
+        if this.inner.is_closed() {
+            this.read_closed = true;
+            return Poll::Ready(Ok(())); // EOF
         }
 
         match this.data_rx.poll_recv(cx) {
