@@ -184,7 +184,9 @@ async fn recv_task(mut output_rx: mpsc::UnboundedReceiver<Bytes>, inner: Arc<Inn
                 match chunk {
                     Some(bytes) => {
                         buf.extend_from_slice(&bytes);
-                        dispatch_frames(&mut buf, &inner).await;
+                        if !dispatch_frames(&mut buf, &inner).await {
+                            break; // protocol violation — mux torn down
+                        }
                     }
                     None => break, // SSM session closed
                 }
@@ -197,13 +199,38 @@ async fn recv_task(mut output_rx: mpsc::UnboundedReceiver<Bytes>, inner: Arc<Inn
     inner.close();
 }
 
-async fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) {
-    while let Some((cmd, stream_id, data)) = decode_frame(buf) {
-        match cmd {
-            CMD_PSH => inner.route_psh(stream_id, data).await,
-            CMD_FIN => inner.route_fin(stream_id),
-            CMD_NOP | CMD_SYN => {} // NOP = keepalive; SYN from server not expected here
-            _ => warn!(cmd, stream_id, "Unknown smux command – ignoring"),
+/// Dispatches all complete frames from `buf` into their per-stream channels.
+///
+/// Returns `true` when the buffer is exhausted (more data needed) and `false`
+/// when a protocol violation is detected (e.g. oversized length field).  On
+/// `false` the mux is already closed and `recv_task` should exit immediately.
+async fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) -> bool {
+    loop {
+        // Guard against garbled headers: a declared payload length that
+        // exceeds MAX_PAYLOAD means the framing is corrupted.  Continuing to
+        // buffer would allow unbounded memory growth while waiting for a frame
+        // that may never arrive — treat it as a fatal protocol violation.
+        if buf.len() >= HEADER_SIZE {
+            let length = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+            if length > MAX_PAYLOAD {
+                warn!(
+                    length,
+                    MAX_PAYLOAD,
+                    "smux frame length exceeds MAX_PAYLOAD — protocol violation, tearing down mux"
+                );
+                buf.clear();
+                inner.close();
+                return false;
+            }
+        }
+        match decode_frame(buf) {
+            None => return true, // need more data
+            Some((cmd, stream_id, data)) => match cmd {
+                CMD_PSH => inner.route_psh(stream_id, data).await,
+                CMD_FIN => inner.route_fin(stream_id),
+                CMD_NOP | CMD_SYN => {} // NOP = keepalive; SYN from server not expected here
+                _ => warn!(cmd, stream_id, "Unknown smux command – ignoring"),
+            },
         }
     }
 }
@@ -361,15 +388,24 @@ impl SmuxSession {
 
         // Inform the remote agent of the new stream.
         // Use try_send: open_stream is sync and the channel has ample capacity.
-        if self
+        match self
             .inner
             .frame_tx
             .try_send(encode_ctrl(CMD_SYN, stream_id))
-            .is_err()
         {
-            // send task has already exited or channel is full; clean up.
-            self.inner.streams.lock().unwrap().remove(&stream_id);
-            return Err(Error::InvalidState("smux send task has exited".to_string()));
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // send task has already exited — the session is gone.
+                self.inner.streams.lock().unwrap().remove(&stream_id);
+                return Err(Error::InvalidState("smux send task has exited".to_string()));
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Transient back-pressure — caller should retry shortly.
+                self.inner.streams.lock().unwrap().remove(&stream_id);
+                return Err(Error::InvalidState(
+                    "smux frame queue is full; retry open_stream".to_string(),
+                ));
+            }
         }
 
         debug!(stream_id, "Opened smux stream");
@@ -522,16 +558,30 @@ impl AsyncWrite for SmuxStream {
         Poll::Ready(Ok(())) // frames are queued immediately on write
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if !this.write_closed {
-            this.write_closed = true;
-            this.inner
-                .frame_tx
-                .try_send(encode_ctrl(CMD_FIN, this.stream_id))
-                .ok();
-            debug!(stream_id = this.stream_id, "Sent FIN");
+        if this.write_closed {
+            return Poll::Ready(Ok(()));
         }
+        // Reserve a slot for the FIN frame, applying backpressure if the
+        // outbound channel is full (same mechanism as poll_write).
+        match this.frame_sink.poll_reserve(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(_)) => {
+                // Mux is already closed; treat as a clean shutdown since the
+                // remote side observes channel close through other signals.
+                this.write_closed = true;
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Ok(())) => {}
+        }
+        this.write_closed = true;
+        // Ignore error: if the mux closed between poll_reserve and send_item
+        // the stream is already torn down on both sides.
+        this.frame_sink
+            .send_item(encode_ctrl(CMD_FIN, this.stream_id))
+            .ok();
+        debug!(stream_id = this.stream_id, "Sent FIN");
         Poll::Ready(Ok(()))
     }
 }

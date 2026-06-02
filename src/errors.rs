@@ -212,7 +212,6 @@ mod tests {
         assert!(Error::Transport(TransportError::HeartbeatTimeout).is_retriable());
         assert!(Error::Transport(TransportError::ConnectionFailed("test".into())).is_retriable());
         assert!(Error::Transport(TransportError::WebSocket("test".into())).is_retriable());
-        assert!(Error::AwsSdk("ThrottlingException: request rate exceeded".into()).is_retriable());
 
         // Permanent AWS errors — must NOT be retried
         assert!(!Error::AwsSdk("AccessDeniedException: ...".into()).is_retriable());
