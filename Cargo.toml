@@ -1,6 +1,6 @@
 [package]
 name = "aws-ssm-bridge"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.81"
 authors = ["hupe1980"]
@@ -46,7 +46,6 @@ serde_json = "1.0"
 
 # Error handling
 thiserror = "1.0"
-anyhow = "1.0"
 
 # Logging
 tracing = "0.1"

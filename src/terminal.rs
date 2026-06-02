@@ -34,7 +34,9 @@
 use bytes::Bytes;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{self, ClearType},
 };
@@ -154,12 +156,26 @@ impl RawModeGuard {
         if !was_raw {
             terminal::enable_raw_mode()?;
         }
+        // Bracketed paste wraps clipboard pastes in escape sequences so the
+        // application receives them as a single Event::Paste instead of a
+        // rapid burst of KeyCode::Char events.  Without this, many terminal
+        // emulators suppress paste entirely in raw mode.
+        if let Err(e) = execute!(io::stdout(), EnableBracketedPaste) {
+            // Roll back raw mode so we don't leave the terminal stuck.
+            if !was_raw {
+                let _ = terminal::disable_raw_mode();
+            }
+            return Err(e);
+        }
         Ok(Self { was_raw })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        // Always disable bracketed paste, regardless of whether we enabled raw
+        // mode, so the terminal is left in a clean state.
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
         if !self.was_raw {
             if let Err(e) = terminal::disable_raw_mode() {
                 // Can't panic in drop, just log
@@ -296,7 +312,21 @@ impl Terminal {
                             let _ = tx
                                 .blocking_send(TerminalInput::Resize(TerminalSize { cols, rows }));
                         }
-                        Ok(_) => {} // Ignore mouse, focus, paste events
+                        Ok(Event::Paste(text)) => {
+                            // Bracketed paste: the terminal emulator wrapped a
+                            // clipboard paste in ESC[?2004h/l markers and
+                            // crossterm decoded it into a single Event::Paste.
+                            // Flush any pending key-event buffer first, then
+                            // send the entire paste as one Data chunk.
+                            if !buffer.is_empty() {
+                                let _ = tx.blocking_send(TerminalInput::Data(Bytes::from(
+                                    std::mem::take(&mut buffer),
+                                )));
+                            }
+                            let _ = tx
+                                .blocking_send(TerminalInput::Data(Bytes::from(text.into_bytes())));
+                        }
+                        Ok(_) => {} // Ignore mouse, focus events
                         Err(e) => {
                             error!("Terminal read error: {}", e);
                             break;

@@ -75,10 +75,19 @@ pub trait MetricsRecorder: Send + Sync + 'static {
 /// struct MyMetrics;
 /// impl MetricsRecorder for MyMetrics {}
 ///
-/// register_metrics(Box::new(MyMetrics));
+/// // Err(_) means a recorder was already installed; ignore in this example.
+/// let _ = register_metrics(Box::new(MyMetrics));
 /// ```
-pub fn register_metrics(recorder: Box<dyn MetricsRecorder>) {
-    let _ = METRICS.set(recorder);
+///
+/// # Errors
+///
+/// Returns the rejected recorder in `Err` if a recorder was already registered.
+/// This allows the caller to detect and handle double-registration instead of
+/// silently discarding the second recorder.
+pub fn register_metrics(
+    recorder: Box<dyn MetricsRecorder>,
+) -> Result<(), Box<dyn MetricsRecorder>> {
+    METRICS.set(recorder)
 }
 
 /// Get the registered metrics recorder, if any.
@@ -199,14 +208,21 @@ mod tests {
             counter_calls: counter_calls.clone(),
         };
 
-        // Register the recorder
-        register_metrics(Box::new(recorder));
+        // METRICS is a process-global OnceCell: registration succeeds only once.
+        // If another test (or a prior run of this test) already registered a
+        // recorder we skip the assertion rather than panic, keeping the suite
+        // order-independent and non-flaky.
+        if register_metrics(Box::new(recorder)).is_err() {
+            // A recorder is already installed — the metric path still works;
+            // we just can't verify *our* recorder received the call.
+            counter("test_metric", 5, &[("label", "value")]);
+            return;
+        }
 
         // Call counter
         counter("test_metric", 5, &[("label", "value")]);
 
-        // Verify it was called (note: test isolation not guaranteed with global state)
-        // This test mainly verifies the recorder receives calls
+        // Verify our recorder received the calls.
         let calls = counter_calls.load(Ordering::Relaxed);
         assert!(
             calls >= 5,

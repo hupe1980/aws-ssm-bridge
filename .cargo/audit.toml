@@ -1,0 +1,15 @@
+[advisories]
+# Cargo.lock contains two concurrent rustls-webpki versions:
+#   - 0.103.13  (pulled by rustls 0.23.x / aws-smithy-http-client's modern TLS stack)
+#               → already at a patched revision; no advisory applies.
+#   - 0.101.7   (pulled transitively by hyper-rustls 0.24.2 / rustls 0.21.12
+#               inside aws-smithy-http-client's legacy HTTP/1 stack)
+#               → no patch exists in the 0.101.x semver series; the fix
+#               requires >=0.103.x which is a breaking semver change.
+#               Resolution requires an upstream AWS SDK update that drops
+#               the legacy hyper-rustls 0.24 dependency.
+ignore = [
+    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+    "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints incorrectly accepted
+    "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints bypass
+]

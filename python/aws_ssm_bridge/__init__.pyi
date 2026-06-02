@@ -101,7 +101,7 @@ class OutputStream:
     Yields chunks of bytes from the remote session's stdout/stderr.
     
     Example:
-        >>> async for chunk in await session.output():
+        >>> async for chunk in session.output():
         ...     print(chunk.decode('utf-8'), end='')
     """
     
@@ -132,7 +132,7 @@ class Session:
     Example (context manager - recommended):
         >>> async with await manager.start_session("i-xxx") as session:
         ...     await session.send(b"ls -la\\n")
-        ...     async for chunk in await session.output():
+        ...     async for chunk in session.output():
         ...         print(chunk.decode(), end='')
         ... # Session automatically terminated
     
@@ -211,15 +211,18 @@ class Session:
         """
         ...
     
-    async def output(self) -> OutputStream:
+    def output(self) -> OutputStream:
         """
         Get output stream for reading session output.
-        
+
+        This is a synchronous method — no ``await`` needed.
+        The returned :class:`OutputStream` is an async iterator.
+
         Returns:
             OutputStream: Async iterator yielding output bytes
-        
+
         Example:
-            >>> stream = await session.output()
+            >>> stream = session.output()
             >>> async for chunk in stream:
             ...     print(chunk.decode(), end='')
         """
@@ -279,7 +282,7 @@ class SessionManager:
         ...     session = await manager.start_session("i-1234567890abcdef0")
         ...     if await session.wait_for_ready():
         ...         await session.send(b"hostname\\n")
-        ...         async for chunk in await session.output():
+        ...         async for chunk in session.output():
         ...             print(chunk.decode(), end='')
         ...     await session.terminate()
         >>> 

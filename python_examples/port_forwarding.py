@@ -43,7 +43,7 @@ async def main():
         },
     )
 
-    print(f"\n✓ Port forwarding session started: {await session.id}")
+    print(f"\n✓ Port forwarding session started: {session.id}")
     
     # Wait for the session to be ready
     print("  Waiting for session to be ready...")

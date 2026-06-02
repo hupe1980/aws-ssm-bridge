@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -92,6 +92,7 @@ impl Default for SessionConfig {
 }
 
 /// Represents an active SSM session with proper lifecycle management
+#[must_use = "dropping a Session terminates the connection without cleanup; call terminate() explicitly"]
 pub struct Session {
     /// Session ID from AWS
     session_id: SessionId,
@@ -109,7 +110,7 @@ pub struct Session {
     channels: Arc<ChannelMultiplexer>,
 
     /// Connection manager task handle
-    manager_task: Option<JoinHandle<Result<()>>>,
+    manager_task: Mutex<Option<JoinHandle<Result<()>>>>,
 
     /// Publication state from connection manager (protocol-level can_send)
     protocol_can_send: Arc<std::sync::atomic::AtomicBool>,
@@ -119,6 +120,10 @@ pub struct Session {
 
     /// Notified when session transitions to Terminated
     terminated_notify: Arc<Notify>,
+
+    /// Latching flag set when session transitions to Terminated.
+    /// Allows `wait_terminated` to return immediately if called after termination.
+    terminated_flag: Arc<std::sync::atomic::AtomicBool>,
 
     /// SSM client for API-side termination (optional — None for bare connections)
     ssm_client: Option<Arc<aws_sdk_ssm::Client>>,
@@ -164,10 +169,11 @@ impl Session {
             state: Arc::new(RwLock::new(SessionState::Initializing)),
             command_tx,
             channels,
-            manager_task: Some(manager_task),
+            manager_task: Mutex::new(Some(manager_task)),
             protocol_can_send,
             ready_notify,
             terminated_notify: Arc::new(Notify::new()),
+            terminated_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ssm_client,
         };
 
@@ -198,11 +204,50 @@ impl Session {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Return a clone of the protocol-ready signal for lock-free polling.
+    ///
+    /// Callers (e.g. Python bindings) can cache this and call
+    /// `load(Ordering::SeqCst)` directly without acquiring the session lock.
+    #[cfg(feature = "python")]
+    pub(crate) fn can_send_signal(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.protocol_can_send)
+    }
+
+    /// Return a clone of the ready [`Notify`] for lock-free waiting.
+    ///
+    /// Callers can `tokio::time::timeout(t, notify.notified()).await` without
+    /// ever holding the session lock.
+    #[cfg(feature = "python")]
+    pub(crate) fn ready_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.ready_notify)
+    }
+
+    /// Return a clone of the terminated [`Notify`].
+    ///
+    /// Callers can await `notify.notified()` without holding the session lock.
+    #[cfg(feature = "python")]
+    pub(crate) fn terminated_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.terminated_notify)
+    }
+
+    /// Return a clone of the terminated latch flag.
+    ///
+    /// Callers can `load(Ordering::SeqCst)` to check termination without a lock.
+    #[cfg(feature = "python")]
+    pub(crate) fn terminated_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.terminated_flag)
+    }
+
     /// Wait for the session to be ready (start_publication or handshake complete)
     ///
     /// This should be called before sending data to ensure the agent is ready.
     /// Returns `true` if ready, `false` if timeout expired.
     pub async fn wait_for_ready(&self, timeout: std::time::Duration) -> bool {
+        // Subscribe to notification BEFORE checking the flag so that a
+        // notification fired between the check and the subscribe is not lost
+        // (Notify only wakes registered subscribers).
+        let notified = self.ready_notify.notified();
+
         // Fast path: already ready
         if self
             .protocol_can_send
@@ -212,7 +257,7 @@ impl Session {
         }
 
         // Wait for notification or timeout
-        match tokio::time::timeout(timeout, self.ready_notify.notified()).await {
+        match tokio::time::timeout(timeout, notified).await {
             Ok(_) => true,
             Err(_) => {
                 // Timeout — check once more (notification may have raced)
@@ -233,6 +278,10 @@ impl Session {
         );
         *state = new_state;
         if new_state == SessionState::Terminated {
+            // Store the flag BEFORE notify_waiters so any racer that wakes and
+            // checks the flag will see it set.
+            self.terminated_flag
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             self.terminated_notify.notify_waiters();
         }
     }
@@ -240,6 +289,18 @@ impl Session {
     /// Get output stream for reading stdout/stderr
     pub fn output(&self) -> OutputStream {
         self.channels.output_stream()
+    }
+
+    /// Subscribe to a lossless output stream backed by a bounded mpsc channel.
+    ///
+    /// Unlike [`output`], this receiver never drops frames under load and is
+    /// suitable for consumers that must not lose any bytes (e.g. the smux
+    /// `recv_task`).  If the consumer falls behind and its channel fills up,
+    /// only this subscriber is evicted; the session and all other consumers
+    /// remain alive.  The evicted receiver will return `None` on the next
+    /// `recv()`, signalling a framing-fatal overflow.
+    pub fn subscribe_output(&self) -> mpsc::Receiver<bytes::Bytes> {
+        self.channels.subscribe_lossless()
     }
 
     /// Send data to the session (stdin)
@@ -290,7 +351,26 @@ impl Session {
     /// Terminate the session
     ///
     /// Terminates both the WebSocket connection and the AWS-side session.
-    pub async fn terminate(&mut self) -> Result<()> {
+    /// Idempotent: safe to call multiple times or concurrently — subsequent
+    /// calls return `Ok(())` immediately once the session is already
+    /// `Disconnecting` or `Terminated`.
+    pub async fn terminate(&self) -> Result<()> {
+        // Idempotency guard: if we're already tearing down, do nothing.
+        {
+            let state = self.state().await;
+            if matches!(
+                state,
+                SessionState::Disconnecting | SessionState::Terminated
+            ) {
+                debug!(
+                    session_id = %self.session_id,
+                    ?state,
+                    "terminate() called on session that is already shutting down — no-op"
+                );
+                return Ok(());
+            }
+        }
+
         info!(session_id = %self.session_id, "Terminating session");
 
         self.set_state(SessionState::Disconnecting).await;
@@ -300,7 +380,7 @@ impl Session {
             .map_err(|_| Error::InvalidState("Session command channel closed".to_string()))?;
 
         // Wait for manager task to complete
-        if let Some(task) = self.manager_task.take() {
+        if let Some(task) = self.manager_task.lock().await.take() {
             match task.await {
                 Ok(Ok(())) => debug!("Manager task completed successfully"),
                 Ok(Err(e)) => warn!(error = ?e, "Manager task completed with error"),
@@ -329,20 +409,28 @@ impl Session {
 
     /// Wait for session to terminate
     pub async fn wait_terminated(&self) {
-        // Fast path
-        if *self.state.read().await == SessionState::Terminated {
+        // Create the notified() future BEFORE the flag check to avoid the race
+        // where termination happens between the load and the notified().await.
+        let notified = self.terminated_notify.notified();
+        if self
+            .terminated_flag
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
-        self.terminated_notify.notified().await;
+        notified.await;
     }
 }
 
 // Implement Drop to ensure cleanup
 impl Drop for Session {
     fn drop(&mut self) {
-        // If manager task still exists, abort it
-        if let Some(task) = self.manager_task.take() {
-            task.abort();
+        // If manager task still exists, abort it.
+        // Use try_lock (non-async) since we hold &mut self — no one else can lock.
+        if let Ok(mut guard) = self.manager_task.try_lock() {
+            if let Some(task) = guard.take() {
+                task.abort();
+            }
         }
     }
 }
@@ -438,17 +526,17 @@ impl SessionManager {
         // Extract session details
         let session_id = response
             .session_id()
-            .ok_or_else(|| Error::AwsSdk("No session ID in response".to_string()))?
+            .ok_or_else(|| Error::aws_sdk_msg("No session ID in response"))?
             .to_string();
 
         let stream_url = response
             .stream_url()
-            .ok_or_else(|| Error::AwsSdk("No stream URL in response".to_string()))?
+            .ok_or_else(|| Error::aws_sdk_msg("No stream URL in response"))?
             .to_string();
 
         let token_value = response
             .token_value()
-            .ok_or_else(|| Error::AwsSdk("No token value in response".to_string()))?
+            .ok_or_else(|| Error::aws_sdk_msg("No token value in response"))?
             .to_string();
 
         info!(session_id = %session_id, "SSM session started");

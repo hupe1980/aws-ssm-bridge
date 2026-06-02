@@ -42,7 +42,7 @@ nav_order: 2
 
 ```toml
 [dependencies]
-aws-ssm-bridge = "0.3"
+aws-ssm-bridge = "0.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -62,11 +62,10 @@ pip install aws-ssm-bridge
 use aws_ssm_bridge::interactive::{InteractiveShell, InteractiveConfig};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = InteractiveConfig::default();
     let mut shell = InteractiveShell::new(config)?;
-    
-    // Connect and run interactive session
+
     // Handles raw mode, resize (SIGWINCH), signals (Ctrl+C/D/Z)
     shell.connect("i-0123456789abcdef0").await?;
     shell.run().await?;
@@ -77,21 +76,32 @@ async fn main() -> anyhow::Result<()> {
 ### Port Forwarding
 
 ```rust
-use aws_ssm_bridge::{SessionManager, PortForwardConfig, PortForwarder};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use aws_ssm_bridge::{SessionBuilder, PortForwardConfig, PortForwarder,
+                     ShutdownSignal, install_signal_handlers};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let manager = SessionManager::new().await?;
-    
-    let forwarder = PortForwarder::new(&manager, PortForwardConfig {
-        target: "i-0123456789abcdef0".into(),
-        local_port: 8080,
-        remote_port: 80,
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let shutdown = ShutdownSignal::new();
+    install_signal_handlers(shutdown.clone());
+
+    // Remote port belongs in the session document, not PortForwardConfig.
+    let session = Arc::new(
+        SessionBuilder::new("i-0123456789abcdef0")
+            .port_forward(80)
+            .build()
+            .await?
+    );
+
+    // bind() binds the local TCP port immediately; local_addr() returns the
+    // actual address (useful when port 0 was requested for an OS-assigned port).
+    let forwarder = PortForwarder::bind(PortForwardConfig {
+        local_addr: "127.0.0.1:8080".parse::<SocketAddr>()?,
         ..Default::default()
     }).await?;
-    
-    println!("Forwarding localhost:8080 -> remote:80");
-    forwarder.wait().await?;
+    println!("Forwarding {} -> remote:80", forwarder.local_addr());
+    forwarder.forward(session, shutdown).await?;
     Ok(())
 }
 ```
@@ -107,7 +117,7 @@ async def main():
     
     async with await manager.start_session(target="i-0123456789abcdef0") as session:
         await session.send(b"whoami\n")
-        async for chunk in await session.output():
+        async for chunk in session.output():
             print(chunk.decode(), end="")
 
 asyncio.run(main())
@@ -136,7 +146,7 @@ let config = SessionConfig {
 
 ```toml
 [dependencies]
-aws-ssm-bridge = { version = "0.3", default-features = false, features = ["interactive"] }
+aws-ssm-bridge = { version = "0.4", default-features = false, features = ["interactive"] }
 ```
 
 | Feature | Description | Default |

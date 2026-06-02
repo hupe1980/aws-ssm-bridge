@@ -91,13 +91,23 @@ impl ShutdownSignal {
     /// This returns a future that completes when `shutdown()` is called.
     /// If shutdown was already triggered, this returns immediately.
     pub async fn cancelled(&self) {
-        // Fast path: already triggered
-        if self.is_shutdown() {
+        // IMPORTANT: create the Notified future BEFORE the flag check.
+        // `Notify::notify_waiters()` only wakes futures that are *currently*
+        // registered (i.e. already awaiting).  The wrong order is:
+        //   1. check triggered → false
+        //   2. shutdown() fires notify_waiters()   ← wakeup delivered but nobody is waiting
+        //   3. register notified()                 ← never woken, hangs indefinitely
+        // By pinning first we guarantee the wakeup is captured even if shutdown()
+        // fires between the pin and the select! arm.
+        let notified = self.inner.notify.notified();
+        tokio::pin!(notified);
+
+        // Fast path: already triggered (checked after registering to close the race).
+        if self.inner.triggered.load(Ordering::SeqCst) {
             return;
         }
 
-        // Wait for notification
-        self.inner.notify.notified().await;
+        notified.await;
     }
 
     /// Wait for shutdown or timeout.

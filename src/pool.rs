@@ -188,7 +188,7 @@ impl SessionPool {
                 // Pool filled while we were starting session - terminate and return error
                 // We already started the session so we need to clean it up
                 drop(sessions); // Release lock before async termination
-                let mut session = session;
+                let session = session;
                 let _ = session.terminate().await;
                 return Err(Error::Config(
                     "Pool limit reached while starting session (race condition)".to_string(),
@@ -203,7 +203,7 @@ impl SessionPool {
                     if !existing.is_empty() {
                         drop(sessions);
                         drop(by_target);
-                        let mut session = session;
+                        let session = session;
                         let _ = session.terminate().await;
                         return Err(Error::Config(format!(
                             "Session already exists for target: {} (race condition)",
@@ -278,7 +278,7 @@ impl SessionPool {
             sessions.remove(session_id)
         };
 
-        if let Some(mut entry) = entry {
+        if let Some(entry) = entry {
             // Remove from target index
             {
                 let mut by_target = self.by_target.write().await;

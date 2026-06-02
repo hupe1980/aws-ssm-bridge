@@ -40,7 +40,7 @@ async def main():
     async with await manager.start_session(target="i-0123456789abcdef0") as session:
         await session.send(b"whoami\n")
         
-        async for chunk in await session.output():
+        async for chunk in session.output():
             print(chunk.decode(), end="")
 
 asyncio.run(main())
@@ -76,7 +76,7 @@ async def main():
         print(f"Connected: {session.id}")  # id is a sync property
         print(f"Ready: {session.is_ready()}")  # is_ready() is sync
         await session.send(b"hostname\n")
-        async for chunk in await session.output():
+        async for chunk in session.output():
             print(chunk.decode(), end="")
     
     # Always terminate when done
@@ -94,7 +94,7 @@ Use the async context manager for automatic cleanup:
 ```python
 async with await manager.start_session(target="i-xxx") as session:
     await session.send(b"ls -la\n")
-    async for chunk in await session.output():
+    async for chunk in session.output():
         print(chunk.decode(), end="")
 # Session automatically terminated on exit
 ```
@@ -146,7 +146,7 @@ async def run_command(manager, instance_id: str, command: str) -> str:
     async with await manager.start_session(target=instance_id) as session:
         await session.send(f"{command}\n".encode())
         output = []
-        async for chunk in await session.output():
+        async for chunk in session.output():
             output.append(chunk.decode())
             if len(output) > 10:
                 break
@@ -234,7 +234,7 @@ async def example(manager: SessionManager) -> None:
     session_id: str = session.id
     ready: bool = session.is_ready()
     
-    stream: OutputStream = await session.output()
+    stream: OutputStream = session.output()
     
     async for chunk in stream:
         data: bytes = chunk

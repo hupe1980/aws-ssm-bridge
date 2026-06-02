@@ -23,10 +23,10 @@ Unlike the [official AWS Session Manager Plugin](https://github.com/aws/session-
 
 ### Features
 
-- **Binary Protocol**: Full 116-byte AWS header, SHA-256 digest validation
+- **Binary Protocol**: Full 120-byte AWS header, SHA-256 digest checking (advisory — mismatches warn but do not fail the session, to handle known SSM agent quirks)
 - **Reliable Delivery**: Sequence tracking, ACK/retransmission, RTT estimation (Jacobson/Karels)
-- **Lock-Free Architecture**: Dedicated writer task via mpsc channel, no mutex contention
-- **Dead Connection Detection**: Pong-based heartbeat tracking with configurable threshold
+- **Bounded Writer Channel**: Dedicated writer task with backpressure — no mutex contention, no OOM under slow remotes
+- **Dead Connection Detection**: Pong-based heartbeat with auto-shutdown on missed responses
 - **Interactive Shell**: Raw terminal mode, resize handling (SIGWINCH)
 - **Port Forwarding**: TCP tunneling via `PortForwarder`
 - **Python Bindings**: Async support via PyO3, type stubs included
@@ -40,7 +40,7 @@ Unlike the [official AWS Session Manager Plugin](https://github.com/aws/session-
 
 ```toml
 [dependencies]
-aws-ssm-bridge = "0.3"
+aws-ssm-bridge = "0.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -60,11 +60,10 @@ pip install aws-ssm-bridge
 use aws_ssm_bridge::interactive::{InteractiveShell, InteractiveConfig};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = InteractiveConfig::default();
     let mut shell = InteractiveShell::new(config)?;
-    
-    // Connect and run interactive session
+
     // Handles raw mode, resize (SIGWINCH), signals (Ctrl+C/D/Z)
     shell.connect("i-0123456789abcdef0").await?;
     shell.run().await?;
@@ -79,25 +78,24 @@ use aws_ssm_bridge::{SessionManager, SessionConfig};
 use futures::StreamExt;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = SessionManager::new().await?;
-    
+
     let mut session = manager.start_session(SessionConfig {
         target: "i-0123456789abcdef0".into(),
         ..Default::default()
     }).await?;
-    
+
     let mut output = session.output();
     tokio::spawn(async move {
         while let Some(data) = output.next().await {
             print!("{}", String::from_utf8_lossy(&data));
         }
     });
-    
+
     session.send(b"hostname\n").await?;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     session.terminate().await?;
-    
     Ok(())
 }
 ```
@@ -105,21 +103,32 @@ async fn main() -> anyhow::Result<()> {
 ### Port Forwarding
 
 ```rust
-use aws_ssm_bridge::{SessionManager, PortForwardConfig, PortForwarder};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use aws_ssm_bridge::{SessionBuilder, PortForwardConfig, PortForwarder,
+                     ShutdownSignal, install_signal_handlers};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let manager = SessionManager::new().await?;
-    
-    let forwarder = PortForwarder::new(&manager, PortForwardConfig {
-        target: "i-0123456789abcdef0".into(),
-        local_port: 8080,
-        remote_port: 80,
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let shutdown = ShutdownSignal::new();
+    install_signal_handlers(shutdown.clone());
+
+    // Remote port belongs in the session document, not PortForwardConfig.
+    let session = Arc::new(
+        SessionBuilder::new("i-0123456789abcdef0")
+            .port_forward(80)
+            .build()
+            .await?
+    );
+
+    // bind() binds the local TCP port immediately; local_addr() returns the
+    // actual address (useful when port 0 was requested for an OS-assigned port).
+    let forwarder = PortForwarder::bind(PortForwardConfig {
+        local_addr: "127.0.0.1:8080".parse::<SocketAddr>()?,
         ..Default::default()
     }).await?;
-    
-    println!("Forwarding localhost:8080 -> remote:80");
-    forwarder.wait().await?;
+    println!("Forwarding {} -> remote:80", forwarder.local_addr());
+    forwarder.forward(session, shutdown).await?;
     Ok(())
 }
 ```
@@ -132,10 +141,11 @@ from aws_ssm_bridge import SessionManager
 
 async def main():
     manager = await SessionManager.new()
-    
+
     async with await manager.start_session(target="i-0123456789abcdef0") as session:
         await session.send(b"hostname\n")
-        async for chunk in await session.output():
+        output = session.output()
+        async for chunk in output:
             print(chunk.decode(), end="")
 
 asyncio.run(main())
@@ -148,12 +158,9 @@ Use type-safe document wrappers instead of magic strings:
 ```rust
 use aws_ssm_bridge::{SessionBuilder, documents::*};
 
-// Port forwarding to instance
+// Port forwarding to instance (remote port 3306)
 let session = SessionBuilder::new("i-xxx")
-    .document(PortForwardingSession::builder()
-        .remote_port(3306)
-        .local_port(13306)
-        .build())
+    .document(PortForwardingSession::new(3306))
     .build().await?;
 
 // Port forwarding through bastion to RDS
@@ -218,12 +225,13 @@ Run with: `python python_examples/interactive_shell.py i-0123456789abcdef0`
 ```
 src/
 ├── lib.rs              # Public API
-├── binary_protocol.rs  # 116-byte header, SHA-256
+├── binary_protocol.rs  # 120-byte header, SHA-256
 ├── session.rs          # Session lifecycle, target validation
-├── connection.rs       # WebSocket, writer task, retransmit, pong tracking
+├── connection.rs       # WebSocket, bounded writer task, retransmit, heartbeat
 ├── channels.rs         # BroadcastStream-backed output multiplexer
 ├── ack.rs              # ACK tracking, RTT (Jacobson/Karels)
 ├── handshake.rs        # 3-phase handshake
+├── mux.rs              # smux v1 multiplexer (port forwarding)
 ├── port_forward.rs     # TCP tunneling
 ├── rate_limit.rs       # Token bucket
 └── python/             # PyO3 bindings

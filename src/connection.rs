@@ -48,8 +48,10 @@ const MAX_MESSAGES_PER_SECOND: f64 = 5000.0;
 /// Message schema version
 const MESSAGE_SCHEMA_VERSION: &str = "1.0";
 
-/// Client version - use AWS plugin version format for compatibility
-const CLIENT_VERSION: &str = "1.2.707.0";
+/// Client version — identifies this library to the SSM service.
+/// Treated as an opaque string by the SSM agent; the format is not required
+/// to match the official plugin's numeric version string.
+const CLIENT_VERSION: &str = concat!("aws-ssm-bridge/", env!("CARGO_PKG_VERSION"));
 
 /// Buffer capacity for out-of-order messages (matches AWS default)
 const INCOMING_BUFFER_CAPACITY: usize = 10000;
@@ -63,19 +65,28 @@ const RETRANSMIT_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// Maximum retransmission attempts (3000 per AWS = 5 minutes / 200ms interval)
 const MAX_RETRANSMIT_ATTEMPTS: u32 = 3000;
 
+/// Buffer capacity for the lock-free WebSocket writer channel.
+///
+/// Bounded at 2× the retransmit buffer so heavy retransmit storms do not
+/// cause unbounded memory growth when the remote end stalls.  Senders that
+/// exceed this capacity will block (`.await`) until capacity is available;
+/// an error is only returned when the receiver has been dropped.
+const WRITER_CHANNEL_CAPACITY: usize = OUTGOING_BUFFER_CAPACITY * 2;
+
 /// Maximum consecutive missed pong responses before declaring connection dead
 const MAX_MISSED_PONGS: u32 = 3;
-
-/// Type aliases for split WebSocket streams
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type WsWriter = SplitSink<WsStream, Message>;
 type WsReader = SplitStream<WsStream>;
 
 /// Open data channel input - sent as JSON after WebSocket connects.
 ///
-/// **Security**: Debug impl is removed to prevent accidental token leakage in logs.
+/// **Security**: Has a manual `Debug` implementation that redacts `token_value`
+/// to prevent accidental token leakage in logs.
 /// Implements `Zeroize` to scrub `token_value` from memory on drop.
-#[derive(Clone, Serialize, Deserialize, Zeroize)]
+/// `Clone` is intentionally absent — the struct itself cannot be cloned,
+/// preventing accidental duplication of this security-sensitive value.
+#[derive(Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 #[serde(rename_all = "PascalCase")]
 struct OpenDataChannelInput {
@@ -109,8 +120,8 @@ pub struct ConnectionManager {
     /// Session ID
     session_id: String,
 
-    /// Write channel — all tasks send WebSocket frames here (lock-free)
-    writer_tx: mpsc::UnboundedSender<Message>,
+    /// Write channel — all tasks send WebSocket frames here (lock-free, bounded)
+    writer_tx: mpsc::Sender<Message>,
 
     /// Channel multiplexer
     channels: Arc<ChannelMultiplexer>,
@@ -136,9 +147,6 @@ pub struct ConnectionManager {
 
     /// Outgoing message buffer for reliable delivery with retransmission
     outgoing_buffer: Arc<OutgoingMessageBuffer>,
-
-    /// Pong tracking — set to true on pong receipt, swapped to false on each ping
-    pong_received: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Commands sent to the connection manager
@@ -164,7 +172,7 @@ pub enum ManagerCommand {
 /// from 7 to 3.
 struct ReceiverContext {
     channels: Arc<ChannelMultiplexer>,
-    writer_tx: mpsc::UnboundedSender<Message>,
+    writer_tx: mpsc::Sender<Message>,
     can_send: Arc<std::sync::atomic::AtomicBool>,
     ready_notify: Arc<tokio::sync::Notify>,
     sequence: Arc<std::sync::atomic::AtomicI64>,
@@ -255,7 +263,7 @@ impl ConnectionManager {
 
         info!("Data channel handshake sent");
 
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(16);
         let channels = Arc::new(ChannelMultiplexer::new());
         let can_send = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pong_received = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -264,11 +272,20 @@ impl ConnectionManager {
         // Create outgoing message buffer for reliable delivery (before receiver task)
         let outgoing_buffer = Arc::new(OutgoingMessageBuffer::new(OUTGOING_BUFFER_CAPACITY));
 
-        // Create lock-free write channel — all tasks push frames here
-        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<Message>();
+        // Create bounded write channel — provides backpressure when the
+        // WebSocket writer stalls (prevents OOM under slow remote endpoints).
+        let (writer_tx, writer_rx) = mpsc::channel::<Message>(WRITER_CHANNEL_CAPACITY);
 
-        // Spawn dedicated writer task (owns the WsWriter sink)
-        let writer_task = Self::spawn_writer_task(writer, writer_rx, shutdown_tx.subscribe());
+        // Spawn dedicated writer task (owns the WsWriter sink; also runs the
+        // heartbeat so pings are sent directly to the socket without going through
+        // the writer channel, eliminating the enqueue-vs-write pending_pong race).
+        let writer_task = Self::spawn_writer_task(
+            writer,
+            writer_rx,
+            shutdown_tx.subscribe(),
+            Arc::clone(&pong_received),
+            shutdown_tx.clone(),
+        );
 
         // Spawn receiver task immediately with the reader half
         // This task owns the reader and runs independently of send operations
@@ -297,7 +314,6 @@ impl ConnectionManager {
             can_send,
             ready_notify,
             outgoing_buffer,
-            pong_received,
         })
     }
 
@@ -320,25 +336,34 @@ impl ConnectionManager {
     pub async fn run(mut self) -> Result<()> {
         info!(session_id = %self.session_id, "Starting connection manager");
 
-        // Spawn heartbeat task
-        let heartbeat_task = self.spawn_heartbeat_task();
-        self.tasks.push(heartbeat_task);
-
         // Spawn retransmission scheduler task (matches AWS ResendStreamDataMessageScheduler)
         let retransmit_task = self.spawn_retransmit_task();
         self.tasks.push(retransmit_task);
+
+        // Subscribe BEFORE entering the loop so that any shutdown_tx.send(())
+        // fired by heartbeat/retransmit tasks (dead-connection detection, retransmit
+        // timeout) wakes this select! promptly.  Without this arm the loop can
+        // be stuck waiting for the next command while all background tasks have
+        // already exited, leaving the session in a zombie state.
+        let mut shutdown_rx = self.shutdown_rx();
 
         // Main command processing loop
         debug!("Entering command processing loop");
         loop {
             tokio::select! {
+                biased;
+
+                _ = shutdown_rx.recv() => {
+                    info!("Internal shutdown triggered — exiting command loop");
+                    break;
+                }
+
                 Some(cmd) = self.command_rx.recv() => {
                     match cmd {
                         ManagerCommand::SendData(data) => {
                             debug!(len = data.len(), "Processing SendData command");
                             if let Err(e) = self.send_data(data).await {
-                                // Downgrade to debug for shutdown-related errors
-                                if e.to_string().contains("closing") || e.to_string().contains("closed") {
+                                if e.is_shutdown_related() {
                                     debug!(error = ?e, "Send failed (connection closing)");
                                 } else {
                                     error!(error = ?e, "Failed to send data");
@@ -348,8 +373,7 @@ impl ConnectionManager {
                         ManagerCommand::SendMessage { data, payload_type } => {
                             debug!(len = data.len(), ?payload_type, "Processing SendMessage command");
                             if let Err(e) = self.send_message(data, payload_type).await {
-                                // Downgrade to debug for shutdown-related errors
-                                if e.to_string().contains("closing") || e.to_string().contains("closed") {
+                                if e.is_shutdown_related() {
                                     debug!(error = ?e, "Send failed (connection closing)");
                                 } else {
                                     error!(error = ?e, "Failed to send message");
@@ -362,6 +386,7 @@ impl ConnectionManager {
                         }
                     }
                 }
+
                 else => {
                     warn!("Command channel closed");
                     break;
@@ -443,6 +468,22 @@ impl ConnectionManager {
                                 // data is already Bytes (reference counted) — clone is cheap
                                 match ClientMessage::deserialize(data.clone()) {
                                     Ok(msg) => {
+                                        // Advisory digest check: warn but still process.
+                                        // Some AWS SSM agent versions send messages where
+                                        // payload_digest was computed over a different byte
+                                        // sequence.  Dropping these messages can break the
+                                        // session (e.g. HandshakeComplete or start_publication
+                                        // gets silently lost).  Authentication is the TLS/SigV4
+                                        // layer, not this field.
+                                        if !msg.verify_digest() {
+                                            warn!(
+                                                message_type = %msg.message_type,
+                                                sequence = msg.sequence_number,
+                                                payload_type = ?msg.payload_type,
+                                                "Payload digest mismatch (known AWS agent quirk); \
+                                                 processing message anyway"
+                                            );
+                                        }
                                         debug!(
                                             message_type = %msg.message_type,
                                             sequence = msg.sequence_number,
@@ -535,35 +576,232 @@ impl ConnectionManager {
 
     /// Spawn dedicated writer task that owns the WebSocket sink.
     ///
-    /// All other tasks send `Message` values through an unbounded mpsc channel.
-    /// This eliminates mutex contention between heartbeat, retransmit,
-    /// receiver ACKs, and the main command loop.
+    /// All other tasks send `Message` values through a bounded mpsc channel.
+    /// This eliminates mutex contention between retransmit, receiver ACKs,
+    /// and the main command loop.
+    ///
+    /// **Heartbeat co-location**: the ping/pong dead-connection detector runs
+    /// inside this task rather than in a separate task so that `pending_pong`
+    /// is set only *after* `writer.send(Ping)` returns — i.e. the Ping has
+    /// reached the OS send buffer.  A separate heartbeat task that enqueues
+    /// Pings via `try_send` would set `pending_pong = true` at enqueue time,
+    /// which can trigger false "missed pong" counts when the writer is backlogged
+    /// but the queue is not yet full.
+    ///
+    /// **Heartbeat during backpressure**: the message-send path pins its future
+    /// and drives it in a 3-way inner `select!` (shutdown | heartbeat | send).
+    /// When a heartbeat tick fires while the socket is stalled:
+    ///
+    /// * **Pong detection** runs once (on the first stall tick) using the
+    ///   `pending_pong` / `pong_received` flags.  Subsequent ticks skip this
+    ///   check because `pending_pong` is cleared after the first detection;
+    ///   re-checking on later ticks would count false negatives for a Ping that
+    ///   hasn't been sent yet.
+    /// * **Send-stall trip-wire**: an independent `send_stall_ticks` counter
+    ///   increments on every stall tick.  After `MAX_MISSED_PONGS` intervals the
+    ///   connection is declared dead and shutdown is triggered.  This covers
+    ///   the case where the OS TCP buffer is permanently full (dead connection)
+    ///   yet the ping/pong path would only ever accumulate a single missed-pong
+    ///   count (because the deferred Ping is never sent while the socket is
+    ///   stuck).
     fn spawn_writer_task(
         mut writer: WsWriter,
-        mut rx: mpsc::UnboundedReceiver<Message>,
+        mut rx: mpsc::Receiver<Message>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        pong_received: Arc<std::sync::atomic::AtomicBool>,
+        shutdown_tx: tokio::sync::broadcast::Sender<()>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             debug!("Writer task started");
-            loop {
+
+            let mut heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+                HEARTBEAT_INTERVAL,
+            );
+            // After a writer.send stall the default Burst policy would fire
+            // multiple ticks back-to-back, falsely incrementing missed_pongs
+            // without a real 30 s gap.  Delay always waits a full interval
+            // from the last processed tick, guaranteeing genuine spacing.
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            let mut missed_pongs: u32 = 0;
+            // Set only after writer.send(Ping) returns — guarantees the Ping
+            // reached the OS send buffer before we start waiting for a Pong.
+            let mut pending_pong = false;
+            // Set when a heartbeat tick fires during a message send (socket busy).
+            // The deferred Ping is sent at the top of the next outer-loop iteration
+            // once the socket is free, preserving the pending_pong correctness
+            // invariant while still running detection on schedule.
+            let mut deferred_ping = false;
+
+            'task: loop {
+                // --- Deferred Ping flush ---
+                // Send any Ping that was deferred because a heartbeat tick fired
+                // while a regular message send was occupying the socket.
+                if deferred_ping {
+                    deferred_ping = false;
+                    trace!("Sending deferred heartbeat ping");
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.recv() => break 'task,
+                        result = writer.send(Message::Ping(Bytes::new())) => {
+                            match result {
+                                Ok(()) => { pending_pong = true; }
+                                Err(e) => {
+                                    error!(error = ?e, "Deferred heartbeat ping send failed");
+                                    let _ = shutdown_tx.send(());
+                                    break 'task;
+                                }
+                            }
+                        }
+                    }
+                    continue 'task;
+                }
+
                 tokio::select! {
                     biased;
 
                     _ = shutdown_rx.recv() => {
                         debug!("Writer task shutting down");
-                        break;
+                        break 'task;
                     }
-                    msg = rx.recv() => {
-                        match msg {
-                            Some(msg) => {
-                                if let Err(e) = writer.send(msg).await {
-                                    error!(error = ?e, "Writer task: WebSocket send failed");
-                                    break;
+
+                    _ = heartbeat.tick() => {
+                        // Socket is idle — run detection then send Ping immediately.
+                        if pending_pong {
+                            if !pong_received.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                missed_pongs += 1;
+                                warn!(missed = missed_pongs, "Missed pong response");
+                                if missed_pongs >= MAX_MISSED_PONGS {
+                                    error!(
+                                        missed = missed_pongs,
+                                        threshold = MAX_MISSED_PONGS,
+                                        "Connection appears dead -- triggering session shutdown"
+                                    );
+                                    metrics::counter(MetricNames::MESSAGES_RECEIVED, 0, &[("dead_connection", "true")]);
+                                    let _ = shutdown_tx.send(());
+                                    break 'task;
+                                }
+                            } else {
+                                missed_pongs = 0;
+                            }
+                        }
+                        // pending_pong = false not needed: success sets it to true,
+                        // all failure paths break out of 'task.
+                        trace!("Sending heartbeat ping");
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_rx.recv() => break 'task,
+                            result = writer.send(Message::Ping(Bytes::new())) => {
+                                match result {
+                                    Ok(()) => { pending_pong = true; }
+                                    Err(e) => {
+                                        error!(error = ?e, "Heartbeat ping send failed");
+                                        let _ = shutdown_tx.send(());
+                                        break 'task;
+                                    }
                                 }
                             }
+                        }
+                    }
+
+                    msg = rx.recv() => {
+                        let msg = match msg {
+                            Some(m) => m,
                             None => {
                                 debug!("Writer channel closed");
-                                break;
+                                break 'task;
+                            }
+                        };
+
+                        // Pin the send future so it can be polled incrementally
+                        // inside the inner loop while heartbeat ticks are
+                        // interleaved.  Without pinning, a stalled socket send
+                        // would block heartbeat.tick() polling, delaying
+                        // missed-pong detection indefinitely under backpressure.
+                        let send_fut = writer.send(msg);
+                        tokio::pin!(send_fut);
+
+                        // Counts heartbeat ticks that fired while the current
+                        // send was in progress.  Used as an independent dead-
+                        // connection trip-wire: if the OS send buffer stays
+                        // full for MAX_MISSED_PONGS consecutive heartbeat
+                        // intervals the connection is almost certainly dead
+                        // even if the TCP stack hasn't timed out yet, so we
+                        // declare it dead ourselves rather than waiting for the
+                        // OS retransmit timeout (which can be minutes).
+                        let mut send_stall_ticks: u32 = 0;
+
+                        loop {
+                            tokio::select! {
+                                biased;
+
+                                _ = shutdown_rx.recv() => {
+                                    debug!("Writer task shutting down during send");
+                                    break 'task;
+                                }
+
+                                _ = heartbeat.tick() => {
+                                    // --- Pong detection (runs once per stall, on the
+                                    // first tick only) ---
+                                    // After the first tick `pending_pong` is cleared,
+                                    // so subsequent ticks skip this block.  This is
+                                    // intentional: `pong_received` was consumed on the
+                                    // first tick; re-checking it on later ticks would
+                                    // count false negatives for a ping we haven't
+                                    // sent yet (the deferred one).
+                                    if pending_pong {
+                                        if !pong_received.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                            missed_pongs += 1;
+                                            warn!(missed = missed_pongs, "Missed pong response");
+                                            if missed_pongs >= MAX_MISSED_PONGS {
+                                                error!(
+                                                    missed = missed_pongs,
+                                                    threshold = MAX_MISSED_PONGS,
+                                                    "Connection appears dead -- triggering session shutdown"
+                                                );
+                                                metrics::counter(MetricNames::MESSAGES_RECEIVED, 0, &[("dead_connection", "true")]);
+                                                let _ = shutdown_tx.send(());
+                                                break 'task;
+                                            }
+                                        } else {
+                                            missed_pongs = 0;
+                                        }
+                                        pending_pong = false;
+                                        deferred_ping = true;
+                                    }
+
+                                    // --- Send-stall trip-wire ---
+                                    // Independent of pong state: if the socket has
+                                    // been unable to accept a single write for
+                                    // MAX_MISSED_PONGS heartbeat intervals the
+                                    // OS TCP buffer is persistently full, which
+                                    // indicates a dead or completely saturated
+                                    // connection.
+                                    send_stall_ticks += 1;
+                                    if send_stall_ticks >= MAX_MISSED_PONGS {
+                                        error!(
+                                            stall_ticks = send_stall_ticks,
+                                            threshold = MAX_MISSED_PONGS,
+                                            "Send stalled for {} heartbeat intervals -- \
+                                             connection appears dead, triggering shutdown",
+                                            send_stall_ticks,
+                                        );
+                                        metrics::counter(MetricNames::MESSAGES_RECEIVED, 0, &[("dead_connection", "true")]);
+                                        let _ = shutdown_tx.send(());
+                                        break 'task;
+                                    }
+                                    // Keep polling the in-flight send.
+                                }
+
+                                result = &mut send_fut => {
+                                    if let Err(e) = result {
+                                        error!(error = ?e, "Writer task: WebSocket send failed");
+                                        let _ = shutdown_tx.send(());
+                                        break 'task;
+                                    }
+                                    break; // send complete, return to outer loop
+                                }
                             }
                         }
                     }
@@ -571,53 +809,6 @@ impl ConnectionManager {
             }
             let _ = writer.close().await;
             debug!("Writer task exited");
-        })
-    }
-
-    /// Spawn heartbeat task with pong-based dead connection detection
-    fn spawn_heartbeat_task(&self) -> JoinHandle<()> {
-        let writer_tx = self.writer_tx.clone();
-        let pong_received = Arc::clone(&self.pong_received);
-        let mut shutdown_rx = self.shutdown_rx();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
-            let mut missed_pongs: u32 = 0;
-
-            loop {
-                tokio::select! {
-                    biased;
-
-                    _ = shutdown_rx.recv() => {
-                        debug!("Heartbeat task shutting down");
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        // Check if previous pong was received
-                        if !pong_received.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                            missed_pongs += 1;
-                            warn!(missed = missed_pongs, "Missed pong response");
-                            if missed_pongs >= MAX_MISSED_PONGS {
-                                error!(
-                                    missed = missed_pongs,
-                                    threshold = MAX_MISSED_PONGS,
-                                    "Connection appears dead, stopping heartbeat"
-                                );
-                                metrics::counter(MetricNames::MESSAGES_RECEIVED, 0, &[("dead_connection", "true")]);
-                                break;
-                            }
-                        } else {
-                            missed_pongs = 0;
-                        }
-
-                        trace!("Sending heartbeat ping");
-                        if writer_tx.send(Message::Ping(Bytes::new())).is_err() {
-                            debug!("Writer channel closed, stopping heartbeat");
-                            break;
-                        }
-                    }
-                }
-            }
         })
     }
 
@@ -629,6 +820,7 @@ impl ConnectionManager {
         let writer_tx = self.writer_tx.clone();
         let outgoing_buffer = Arc::clone(&self.outgoing_buffer);
         let can_send = Arc::clone(&self.can_send);
+        let shutdown_tx = self.shutdown_tx.clone();
         let mut shutdown_rx = self.shutdown_rx();
         let session_id = self.session_id.clone();
 
@@ -676,32 +868,44 @@ impl ConnectionManager {
                         // Get candidates for retransmission
                         let candidates = outgoing_buffer.get_retransmit_candidates(MAX_RETRANSMIT_ATTEMPTS).await;
 
+                        let mut fatal = false;
                         for (seq, data, timed_out) in candidates {
                             if timed_out {
-                                // Message timed out after max retries - signal session termination
+                                // C-2: Propagate to all tasks so callers see an error
+                                // instead of hanging forever on an unresponsive endpoint.
                                 error!(
                                     session_id = %session_id,
-                                    "Stream data retransmission timed out, terminating session"
+                                    seq,
+                                    "Stream data retransmission timed out -- triggering session shutdown"
                                 );
-                                // In production, we'd signal session termination here
-                                // For now, log the error
+                                let _ = shutdown_tx.send(());
+                                fatal = true;
                                 break;
                             }
 
                             // Record retransmission metric
                             metrics::counter(MetricNames::RETRANSMISSIONS, 1, &[]);
 
-                            // Retransmit the message
-                            if let Err(e) = writer_tx.send(Message::Binary(data)) {
+                            // `get_retransmit_candidates` already advanced last_sent_time and
+                            // resend_attempt for this entry, so we must deliver it.  Race the
+                            // send with shutdown so a stalled socket cannot block teardown.
+                            let send_ok = tokio::select! {
+                                biased;
+                                _ = shutdown_rx.recv() => false,
+                                result = writer_tx.send(Message::Binary(data)) => result.is_ok(),
+                            };
+                            if !send_ok {
                                 warn!(
                                     seq,
-                                    error = ?e,
-                                    "Failed to retransmit message"
+                                    "Writer channel closed during retransmit — stopping"
                                 );
+                                fatal = true;
+                                break;
                             } else {
                                 trace!(seq, "Retransmitted message");
                             }
                         }
+                        if fatal { break; }
                     }
                 }
             }
@@ -740,17 +944,21 @@ impl ConnectionManager {
             )));
         }
 
-        // Send via lock-free writer channel
+        // H-4: Buffer BEFORE sending — ensures the retransmit scheduler always
+        // has the message in its buffer even if the send fails or is reordered.
+        self.outgoing_buffer.add(msg_bytes.clone(), sequence).await;
+
+        // Send via bounded writer channel (backpressure: await when full).
+        // A send failure means the writer task has exited — this is an internal
+        // channel shutdown, not a WebSocket I/O error.
         self.writer_tx
             .send(Message::Binary(msg_bytes.clone()))
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+            .await
+            .map_err(|_| TransportError::Channel("writer channel closed".to_string()))?;
 
         // Record send metrics
         metrics::counter(MetricNames::MESSAGES_SENT, 1, &[]);
         metrics::counter(MetricNames::BYTES_SENT, msg_bytes.len() as u64, &[]);
-
-        // Track in OutgoingMessageBuffer for reliable delivery
-        self.outgoing_buffer.add(msg_bytes, sequence).await;
 
         debug!(
             sequence,
@@ -786,17 +994,21 @@ impl ConnectionManager {
             )));
         }
 
-        // Send via lock-free writer channel
+        // H-4: Buffer BEFORE sending — ensures the retransmit scheduler always
+        // has the message in its buffer even if the send fails or is reordered.
+        self.outgoing_buffer.add(msg_bytes.clone(), sequence).await;
+
+        // Send via bounded writer channel (backpressure: await when full).
+        // A send failure means the writer task has exited — channel closed, not
+        // a WebSocket I/O error.
         self.writer_tx
             .send(Message::Binary(msg_bytes.clone()))
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+            .await
+            .map_err(|_| TransportError::Channel("writer channel closed".to_string()))?;
 
         // Record send metrics
         metrics::counter(MetricNames::MESSAGES_SENT, 1, &[]);
         metrics::counter(MetricNames::BYTES_SENT, msg_bytes.len() as u64, &[]);
-
-        // Track in OutgoingMessageBuffer for reliable delivery
-        self.outgoing_buffer.add(msg_bytes, sequence).await;
 
         debug!(
             sequence,
@@ -1001,7 +1213,7 @@ impl ConnectionManager {
                 // Normal output data - send to output channel
                 if !msg.payload.is_empty() {
                     trace!(len = msg.payload.len(), payload_type = ?msg.payload_type, "Routing output data");
-                    ctx.channels.send_output(msg.payload.clone()).await?;
+                    ctx.channels.send_output(msg.payload.clone())?;
                 }
             }
             PayloadType::HandshakeRequest => {
@@ -1022,7 +1234,9 @@ impl ConnectionManager {
                                     &ctx.writer_tx,
                                     &response,
                                     &ctx.sequence,
-                                ) {
+                                )
+                                .await
+                                {
                                     error!(error = ?e, "Failed to send handshake response");
                                 } else {
                                     info!("Handshake response sent");
@@ -1110,8 +1324,8 @@ impl ConnectionManager {
     }
 
     /// Send handshake response via writer channel
-    fn send_handshake_response(
-        writer_tx: &mpsc::UnboundedSender<Message>,
+    async fn send_handshake_response(
+        writer_tx: &mpsc::Sender<Message>,
         response: &HandshakeResponse,
         sequence: &Arc<std::sync::atomic::AtomicI64>,
     ) -> Result<()> {
@@ -1138,17 +1352,25 @@ impl ConnectionManager {
             "Serialized HandshakeResponse message"
         );
 
+        // Send failure means the writer task has exited (channel closed).
         writer_tx
             .send(Message::Binary(msg_bytes))
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+            .await
+            .map_err(|_| TransportError::Channel("writer channel closed".to_string()))?;
 
         debug!("HandshakeResponse sent to WebSocket");
         Ok(())
     }
 
-    /// Send acknowledge message for a received message (sequential)
+    /// Send acknowledge message for a received message (sequential).
+    ///
+    /// Uses `try_send` so this never blocks the receiver loop.  If the writer
+    /// channel is momentarily full the ACK is dropped with a warning; the
+    /// remote end will retransmit and the next ACK attempt will succeed once
+    /// the writer drains.  Pong frames and other control messages therefore
+    /// remain unaffected.
     fn send_acknowledge(
-        writer_tx: &mpsc::UnboundedSender<Message>,
+        writer_tx: &mpsc::Sender<Message>,
         received_msg: &ClientMessage,
     ) -> Result<()> {
         // Create acknowledgment message using AckTracker helper
@@ -1164,16 +1386,26 @@ impl ConnectionManager {
         );
         let msg_bytes = ack_msg.serialize()?;
 
-        writer_tx
-            .send(Message::Binary(msg_bytes))
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
-
-        Ok(())
+        match writer_tx.try_send(Message::Binary(msg_bytes)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    original_seq = received_msg.sequence_number,
+                    "ACK dropped: writer channel full (remote will retransmit)"
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(TransportError::Channel("writer channel closed".to_string()).into())
+            }
+        }
     }
 
-    /// Send acknowledge message for an out-of-order message (non-sequential)
+    /// Send acknowledge message for an out-of-order message (non-sequential).
+    ///
+    /// Uses `try_send` — see [`Self::send_acknowledge`] for rationale.
     fn send_acknowledge_non_sequential(
-        writer_tx: &mpsc::UnboundedSender<Message>,
+        writer_tx: &mpsc::Sender<Message>,
         received_msg: &ClientMessage,
     ) -> Result<()> {
         // Create acknowledgment with IsSequentialMessage=false
@@ -1189,16 +1421,30 @@ impl ConnectionManager {
         );
         let msg_bytes = ack_msg.serialize()?;
 
-        writer_tx
-            .send(Message::Binary(msg_bytes))
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
-
-        Ok(())
+        match writer_tx.try_send(Message::Binary(msg_bytes)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    original_seq = received_msg.sequence_number,
+                    "ACK (non-sequential) dropped: writer channel full (remote will retransmit)"
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(TransportError::Channel("writer channel closed".to_string()).into())
+            }
+        }
     }
 
     /// Shutdown the connection gracefully
     async fn shutdown(self) -> Result<()> {
         info!("Shutting down connection manager");
+
+        // Close the channel multiplexer so all Session::output() consumers
+        // immediately see EOF rather than blocking forever.  The receiver task
+        // also exits on the shutdown broadcast below, but races mean it may not
+        // have closed the channels yet when consumers check.
+        self.channels.close();
 
         // Signal all tasks to shutdown
         let _ = self.shutdown_tx.send(());
@@ -1240,12 +1486,18 @@ impl ConnectionManager {
         // - ssmmessages.<region>.amazonaws.com
         // - ssmmessages-fips.<region>.amazonaws.com
         // - ssmmessages.<region>.amazonaws.com.cn (China regions)
+        //
+        // SSRF hardening: require the host to start with `ssmmessages` so that
+        // attacker-controlled hostnames like `evil.ssmmessages.com.amazonaws.com`
+        // or `s3.amazonaws.com` are rejected even though they end with the right
+        // suffix.
+        let is_ssm_prefix = host.starts_with("ssmmessages.") || host.starts_with("ssmmessages-");
         let is_aws_domain = host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn");
-        let is_ssm_service = host.contains("ssmmessages");
 
-        if !is_aws_domain || !is_ssm_service {
+        if !is_ssm_prefix || !is_aws_domain {
             return Err(Error::Config(format!(
-                "Stream URL host '{}' is not a valid AWS SSM endpoint",
+                "Stream URL host '{}' is not a valid AWS SSM messages endpoint \
+                 (expected ssmmessages[‑fips].<region>.amazonaws.com[.cn])",
                 host
             )));
         }
@@ -1335,7 +1587,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("not a valid AWS SSM endpoint"));
+            .contains("not a valid AWS SSM messages endpoint"));
     }
 
     #[test]

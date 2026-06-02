@@ -139,6 +139,7 @@ pub mod tracing_ext;
 
 mod channels;
 mod connection;
+pub mod mux;
 
 // ============================================================================
 // Feature-Gated Modules
@@ -165,13 +166,16 @@ pub use errors::{Error, Result};
 pub use protocol::{MessageType, SessionType};
 
 // Retry utilities
-pub use retry::{CircuitBreaker, CircuitState, RetryConfig, RetryStrategy};
+pub use retry::{RetryConfig, RetryStrategy};
 
 // Rate limiting
 pub use rate_limit::{RateLimitConfig, RateLimitResult, RateLimiter};
 
 // Port forwarding
 pub use port_forward::{PortForwardConfig, PortForwarder};
+
+// smux stream diagnostics (close reason for forwarded streams)
+pub use mux::StreamCloseReason;
 
 // Streaming API
 pub use channels::OutputStream;
