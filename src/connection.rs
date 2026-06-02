@@ -340,10 +340,24 @@ impl ConnectionManager {
         let retransmit_task = self.spawn_retransmit_task();
         self.tasks.push(retransmit_task);
 
+        // Subscribe BEFORE entering the loop so that any shutdown_tx.send(())
+        // fired by heartbeat/retransmit tasks (dead-connection detection, retransmit
+        // timeout) wakes this select! promptly.  Without this arm the loop can
+        // be stuck waiting for the next command while all background tasks have
+        // already exited, leaving the session in a zombie state.
+        let mut shutdown_rx = self.shutdown_rx();
+
         // Main command processing loop
         debug!("Entering command processing loop");
         loop {
             tokio::select! {
+                biased;
+
+                _ = shutdown_rx.recv() => {
+                    info!("Internal shutdown triggered — exiting command loop");
+                    break;
+                }
+
                 Some(cmd) = self.command_rx.recv() => {
                     match cmd {
                         ManagerCommand::SendData(data) => {
@@ -372,6 +386,7 @@ impl ConnectionManager {
                         }
                     }
                 }
+
                 else => {
                     warn!("Command channel closed");
                     break;

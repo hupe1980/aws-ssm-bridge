@@ -175,9 +175,10 @@ impl PortForwarder {
                             };
 
                             let mux = Arc::clone(&mux);
+                            let handler_shutdown = shutdown.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // released when the task finishes
-                                if let Err(e) = Self::handle_connection(stream, mux).await {
+                                if let Err(e) = Self::handle_connection(stream, mux, handler_shutdown).await {
                                     error!(error = ?e, "Connection handler error");
                                 }
                             });
@@ -193,17 +194,31 @@ impl PortForwarder {
     }
 
     /// Bidirectionally copy between a local TCP connection and a smux stream.
-    #[instrument(skip(stream, mux))]
-    async fn handle_connection(mut stream: TcpStream, mux: Arc<SmuxSession>) -> Result<()> {
+    ///
+    /// Races the copy against the shutdown signal so that in-flight connections
+    /// are aborted promptly when shutdown is requested rather than waiting for
+    /// the TCP sockets to close on their own.
+    #[instrument(skip(stream, mux, shutdown))]
+    async fn handle_connection(
+        mut stream: TcpStream,
+        mux: Arc<SmuxSession>,
+        shutdown: crate::shutdown::ShutdownSignal,
+    ) -> Result<()> {
         debug!("Starting connection handler");
 
         let mut smux_stream = mux.open_stream()?;
 
-        tokio::io::copy_bidirectional(&mut stream, &mut smux_stream)
-            .await
-            .map_err(Error::Io)?;
+        tokio::select! {
+            biased;
+            result = tokio::io::copy_bidirectional(&mut stream, &mut smux_stream) => {
+                result.map_err(Error::Io)?;
+                info!("Connection handler completed");
+            }
+            _ = shutdown.cancelled() => {
+                debug!("Connection handler cancelled due to shutdown");
+            }
+        }
 
-        info!("Connection handler completed");
         Ok(())
     }
 }
