@@ -130,7 +130,10 @@ impl PortForwarder {
         }
 
         // Wrap the session in a smux multiplexer (one per PortForwarder lifetime).
-        let mux = Arc::new(SmuxSession::new(Arc::clone(&session), SmuxConfig::default()));
+        let mux = Arc::new(SmuxSession::new(
+            Arc::clone(&session),
+            SmuxConfig::default(),
+        ));
 
         let semaphore = Arc::new(Semaphore::new(self.config.max_connections));
         let max_connections = self.config.max_connections;

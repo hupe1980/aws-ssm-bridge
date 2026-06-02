@@ -318,7 +318,11 @@ impl SmuxSession {
         });
 
         tokio::spawn(recv_task(Arc::clone(&session), Arc::clone(&inner)));
-        tokio::spawn(send_task(Arc::clone(&session), frame_rx, Arc::clone(&inner)));
+        tokio::spawn(send_task(
+            Arc::clone(&session),
+            frame_rx,
+            Arc::clone(&inner),
+        ));
         if config.keepalive {
             tokio::spawn(keepalive_task(Arc::clone(&inner)));
         }
@@ -338,7 +342,11 @@ impl SmuxSession {
         let stream_id = self.inner.next_id.fetch_add(2, Ordering::SeqCst);
         let (data_tx, data_rx) = mpsc::unbounded_channel::<Bytes>();
 
-        self.inner.streams.lock().unwrap().insert(stream_id, data_tx);
+        self.inner
+            .streams
+            .lock()
+            .unwrap()
+            .insert(stream_id, data_tx);
 
         // Inform the remote agent of the new stream.
         let _ = self.inner.frame_tx.send(encode_ctrl(CMD_SYN, stream_id));
@@ -581,7 +589,10 @@ mod tests {
 
         let mut buf = frame;
         // decode_frame must discard the frame and return None.
-        assert!(decode_frame(&mut buf).is_none(), "Unknown version must be discarded");
+        assert!(
+            decode_frame(&mut buf).is_none(),
+            "Unknown version must be discarded"
+        );
         // Buffer must be fully consumed (no desync).
         assert!(buf.is_empty(), "Buffer must be drained after discard");
     }

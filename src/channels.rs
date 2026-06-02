@@ -219,7 +219,10 @@ mod tests {
         let result =
             tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "Post-close stream should be empty");
+        assert!(
+            result.unwrap().is_none(),
+            "Post-close stream should be empty"
+        );
     }
 
     #[tokio::test]
