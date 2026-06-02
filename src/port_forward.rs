@@ -109,7 +109,8 @@ impl PortForwarder {
     /// document such as `AWS-StartPortForwardingSessionToRemoteHost`.
     /// L-3: Accepts a `ShutdownSignal` so the forwarding loop can be
     /// cancelled cleanly (e.g. from `Ctrl-C` or session termination);
-    /// on shutdown the listener is explicitly dropped to release the bound port.
+    /// the listener is moved into the function and dropped when it returns,
+    /// releasing the bound port on every exit path.
     #[instrument(skip(self, session, shutdown))]
     pub async fn forward(
         &mut self,
@@ -118,7 +119,7 @@ impl PortForwarder {
     ) -> Result<()> {
         let listener = self
             .listener
-            .as_ref()
+            .take()
             .ok_or_else(|| Error::InvalidState("Listener not started".to_string()))?;
 
         // Block until the SSM protocol handshake is complete.
@@ -146,7 +147,6 @@ impl PortForwarder {
 
                 _ = shutdown.cancelled() => {
                     info!("Port forwarder shutdown requested");
-                    self.listener = None; // release the bound port immediately
                     return Ok(());
                 }
 
