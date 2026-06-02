@@ -253,8 +253,13 @@ async fn keepalive_task(inner: Arc<Inner>) {
                     break;
                 }
                 let nop = encode_ctrl(CMD_NOP, 0);
-                if inner.frame_tx.try_send(nop).is_err() {
-                    break;
+                match inner.frame_tx.try_send(nop) {
+                    Ok(()) => {}
+                    // Channel temporarily full — skip this NOP tick; the
+                    // session is busy but still alive, so don't stop keepalives.
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                    // Channel closed — send task has exited; stop keepalives.
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         }
@@ -286,14 +291,17 @@ pub struct SmuxConfig {
 ///
 /// # Background tasks
 ///
-/// `SmuxSession::new` spawns three lightweight tasks:
+/// `SmuxSession::new` spawns two background tasks (three when
+/// [`SmuxConfig::keepalive`] is enabled):
 ///
 /// * **recv** – reads raw bytes from the SSM session, reassembles smux frames,
 ///   and routes each PSH frame to the correct per-stream channel.
 /// * **send** – drains the shared outbound frame queue and writes to the SSM
 ///   session, preserving frame ordering.
-/// * **keepalive** – sends a NOP frame every 10 seconds so the remote SSM
-///   agent does not time out an idle session.
+/// * **keepalive** *(optional, requires `SmuxConfig { keepalive: true }`)* –
+///   sends a NOP frame every 10 seconds so the remote SSM agent does not time
+///   out an idle session.  Disabled by default to match the official
+///   `session-manager-plugin` behaviour.
 pub struct SmuxSession {
     inner: Arc<Inner>,
 }

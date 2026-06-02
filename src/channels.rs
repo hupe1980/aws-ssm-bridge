@@ -164,10 +164,15 @@ impl ChannelMultiplexer {
 
     /// Subscribe to a lossless output tap backed by an unbounded mpsc channel.
     ///
-    /// Unlike the broadcast-based [`output_stream`], this receiver never
-    /// drops frames under load — the sender blocks in `send_output` until the
-    /// subscriber's queue drains.  Use this for the smux `recv_task` where
-    /// dropped bytes corrupt framing.
+    /// Unlike the broadcast-based [`output_stream`], this receiver never silently
+    /// drops frames — every byte written by `send_output` is queued until the
+    /// subscriber consumes it.  Use this for the smux `recv_task` where dropped
+    /// bytes corrupt framing.
+    ///
+    /// **Back-pressure warning**: the underlying channel is unbounded.  A slow
+    /// subscriber will cause queue memory to grow without bound.  Only use this
+    /// when the consumer (e.g. the smux `recv_task`) processes data at least as
+    /// fast as it arrives.
     pub fn subscribe_lossless(&self) -> mpsc::UnboundedReceiver<Bytes> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.direct_subs
