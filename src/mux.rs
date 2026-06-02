@@ -22,7 +22,6 @@
 //! Commands: `SYN=0`, `FIN=1`, `PSH=2`, `NOP=3`
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::StreamExt;
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
@@ -34,6 +33,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::interval;
+use tokio_util::sync::PollSender;
 use tracing::{debug, warn};
 
 use crate::errors::{Error, Result};
@@ -54,6 +54,12 @@ const HEADER_SIZE: usize = 8;
 
 /// Maximum PSH payload per frame (32 KiB – matches xtaci/smux default).
 const MAX_PAYLOAD: usize = 32 * 1024;
+
+/// Outbound frame channel capacity (frames queued for the send task).
+const FRAME_CHANNEL_CAP: usize = 256;
+
+/// Per-stream inbound data channel capacity.
+const STREAM_CHANNEL_CAP: usize = 64;
 
 /// Keep-alive NOP interval (10 s – matches xtaci/smux default).
 const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -119,9 +125,9 @@ fn decode_frame(buf: &mut BytesMut) -> Option<(u8, u32, Bytes)> {
 
 struct Inner {
     /// Active streams: stream_id → sender for inbound data.
-    streams: Mutex<HashMap<u32, mpsc::UnboundedSender<Bytes>>>,
+    streams: Mutex<HashMap<u32, mpsc::Sender<Bytes>>>,
     /// Outbound frame queue consumed by the send task.
-    frame_tx: mpsc::UnboundedSender<Bytes>,
+    frame_tx: mpsc::Sender<Bytes>,
     /// Next stream ID for client-initiated streams (odd: 1, 3, 5 …).
     next_id: AtomicU32,
     /// Set once the mux session is torn down.
@@ -144,10 +150,12 @@ impl Inner {
     }
 
     /// Dispatch an inbound PSH frame to its stream, evicting a dead entry if needed.
-    fn route_psh(&self, stream_id: u32, data: Bytes) {
+    async fn route_psh(&self, stream_id: u32, data: Bytes) {
         let tx = self.streams.lock().unwrap().get(&stream_id).cloned();
         if let Some(tx) = tx {
-            if tx.send(data).is_err() {
+            // Use send().await for backpressure: if the per-stream buffer is
+            // full we wait rather than dropping data.
+            if tx.send(data).await.is_err() {
                 self.streams.lock().unwrap().remove(&stream_id);
             }
         }
@@ -165,19 +173,18 @@ impl Inner {
 
 /// Reads raw bytes from the SSM session, reassembles smux frames, and routes
 /// them to the appropriate per-stream channels.
-async fn recv_task(session: Arc<Session>, inner: Arc<Inner>) {
-    let mut output = session.output();
+async fn recv_task(mut output_rx: mpsc::UnboundedReceiver<Bytes>, inner: Arc<Inner>) {
     let mut buf = BytesMut::new();
 
     loop {
         tokio::select! {
             biased;
             _ = inner.die.notified() => break,
-            chunk = output.next() => {
+            chunk = output_rx.recv() => {
                 match chunk {
                     Some(bytes) => {
                         buf.extend_from_slice(&bytes);
-                        dispatch_frames(&mut buf, &inner);
+                        dispatch_frames(&mut buf, &inner).await;
                     }
                     None => break, // SSM session closed
                 }
@@ -186,14 +193,14 @@ async fn recv_task(session: Arc<Session>, inner: Arc<Inner>) {
     }
 
     // Flush any remaining complete frames before terminating.
-    dispatch_frames(&mut buf, &inner);
+    dispatch_frames(&mut buf, &inner).await;
     inner.close();
 }
 
-fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) {
+async fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) {
     while let Some((cmd, stream_id, data)) = decode_frame(buf) {
         match cmd {
-            CMD_PSH => inner.route_psh(stream_id, data),
+            CMD_PSH => inner.route_psh(stream_id, data).await,
             CMD_FIN => inner.route_fin(stream_id),
             CMD_NOP | CMD_SYN => {} // NOP = keepalive; SYN from server not expected here
             _ => warn!(cmd, stream_id, "Unknown smux command – ignoring"),
@@ -207,7 +214,7 @@ fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) {
 /// writer does not keep the task alive after session teardown.
 async fn send_task(
     session: Arc<Session>,
-    mut frame_rx: mpsc::UnboundedReceiver<Bytes>,
+    mut frame_rx: mpsc::Receiver<Bytes>,
     inner: Arc<Inner>,
 ) {
     loop {
@@ -250,7 +257,7 @@ async fn keepalive_task(inner: Arc<Inner>) {
                     break;
                 }
                 let nop = encode_ctrl(CMD_NOP, 0);
-                if inner.frame_tx.send(nop).is_err() {
+                if inner.frame_tx.try_send(nop).is_err() {
                     break;
                 }
             }
@@ -305,7 +312,7 @@ impl SmuxSession {
     /// Pass [`SmuxConfig::default()`] unless you have a specific reason to
     /// deviate from the official plugin's defaults (keepalive disabled).
     pub fn new(session: Arc<Session>, config: SmuxConfig) -> Self {
-        let (frame_tx, frame_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(FRAME_CHANNEL_CAP);
 
         let inner = Arc::new(Inner {
             streams: Mutex::new(HashMap::new()),
@@ -315,7 +322,9 @@ impl SmuxSession {
             die: Notify::new(),
         });
 
-        tokio::spawn(recv_task(Arc::clone(&session), Arc::clone(&inner)));
+        let output_rx = session.subscribe_output();
+
+        tokio::spawn(recv_task(output_rx, Arc::clone(&inner)));
         tokio::spawn(send_task(
             Arc::clone(&session),
             frame_rx,
@@ -338,7 +347,7 @@ impl SmuxSession {
         }
 
         let stream_id = self.inner.next_id.fetch_add(2, Ordering::SeqCst);
-        let (data_tx, data_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (data_tx, data_rx) = mpsc::channel::<Bytes>(STREAM_CHANNEL_CAP);
 
         self.inner
             .streams
@@ -347,18 +356,21 @@ impl SmuxSession {
             .insert(stream_id, data_tx);
 
         // Inform the remote agent of the new stream.
+        // Use try_send: open_stream is sync and the channel has ample capacity.
         if self
             .inner
             .frame_tx
-            .send(encode_ctrl(CMD_SYN, stream_id))
+            .try_send(encode_ctrl(CMD_SYN, stream_id))
             .is_err()
         {
-            // send task has already exited; clean up and report the error.
+            // send task has already exited or channel is full; clean up.
             self.inner.streams.lock().unwrap().remove(&stream_id);
             return Err(Error::InvalidState("smux send task has exited".to_string()));
         }
 
         debug!(stream_id, "Opened smux stream");
+
+        let frame_sink = PollSender::new(self.inner.frame_tx.clone());
 
         Ok(SmuxStream {
             stream_id,
@@ -367,6 +379,7 @@ impl SmuxSession {
             current_chunk: None,
             read_closed: false,
             write_closed: false,
+            frame_sink,
         })
     }
 
@@ -401,11 +414,13 @@ pub struct SmuxStream {
     stream_id: u32,
     inner: Arc<Inner>,
     /// Incoming data dispatched by the recv task.
-    data_rx: mpsc::UnboundedReceiver<Bytes>,
+    data_rx: mpsc::Receiver<Bytes>,
     /// Leftover bytes from a previous partial read.
     current_chunk: Option<Bytes>,
     read_closed: bool,
     write_closed: bool,
+    /// Backpressured sender for outbound PSH frames.
+    frame_sink: PollSender<Bytes>,
 }
 
 impl AsyncRead for SmuxStream {
@@ -460,7 +475,7 @@ impl AsyncRead for SmuxStream {
 impl AsyncWrite for SmuxStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
@@ -480,14 +495,22 @@ impl AsyncWrite for SmuxStream {
 
         // Respect MAX_PAYLOAD; the caller retries for the remainder.
         let n = buf.len().min(MAX_PAYLOAD);
-        let frame = encode_frame(CMD_PSH, this.stream_id, &buf[..n]);
 
-        match this.inner.frame_tx.send(frame) {
-            Ok(()) => Poll::Ready(Ok(n)),
-            Err(_) => Poll::Ready(Err(io::Error::new(
+        // Reserve a slot in the bounded outbound channel before encoding the
+        // frame; if the channel is full we park until space is available.
+        match this.frame_sink.poll_reserve(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "smux session closed",
             ))),
+            Poll::Ready(Ok(())) => {
+                let frame = encode_frame(CMD_PSH, this.stream_id, &buf[..n]);
+                this.frame_sink
+                    .send_item(frame)
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "smux session closed"))?;
+                Poll::Ready(Ok(n))
+            }
         }
     }
 
@@ -501,7 +524,7 @@ impl AsyncWrite for SmuxStream {
             this.write_closed = true;
             this.inner
                 .frame_tx
-                .send(encode_ctrl(CMD_FIN, this.stream_id))
+                .try_send(encode_ctrl(CMD_FIN, this.stream_id))
                 .ok();
             debug!(stream_id = this.stream_id, "Sent FIN");
         }
@@ -516,7 +539,7 @@ impl Drop for SmuxStream {
             self.write_closed = true;
             self.inner
                 .frame_tx
-                .send(encode_ctrl(CMD_FIN, self.stream_id))
+                .try_send(encode_ctrl(CMD_FIN, self.stream_id))
                 .ok();
         }
         self.inner.streams.lock().unwrap().remove(&self.stream_id);

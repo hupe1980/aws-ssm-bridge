@@ -117,6 +117,8 @@ pub struct PySession {
     ready_notify: Arc<tokio::sync::Notify>,
     /// Cached terminated notify — avoids holding the lock in wait_terminated.
     terminated_notify: Arc<tokio::sync::Notify>,
+    /// Cached terminated latch — fast-path for wait_terminated when already done.
+    terminated_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[pymethods]
@@ -226,8 +228,14 @@ impl PySession {
     /// Does **not** hold the session lock while waiting.
     fn wait_terminated<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let terminated_notify = Arc::clone(&self.terminated_notify);
+        let terminated_flag = Arc::clone(&self.terminated_flag);
         future_into_py(py, async move {
-            terminated_notify.notified().await;
+            // Create the notified() future BEFORE the flag check to avoid the
+            // race where terminated_flag is set between the load and the await.
+            let notified = terminated_notify.notified();
+            if !terminated_flag.load(Ordering::SeqCst) {
+                notified.await;
+            }
             Ok(())
         })
     }
@@ -355,12 +363,14 @@ impl PySessionManager {
             let protocol_can_send = session.can_send_signal();
             let ready_notify = session.ready_signal();
             let terminated_notify = session.terminated_signal();
+            let terminated_flag = session.terminated_flag();
             Ok(PySession {
                 inner: Arc::new(tokio::sync::Mutex::new(session)),
                 session_id,
                 protocol_can_send,
                 ready_notify,
                 terminated_notify,
+                terminated_flag,
             })
         })
     }
@@ -384,12 +394,14 @@ impl PySessionManager {
             let protocol_can_send = session.can_send_signal();
             let ready_notify = session.ready_signal();
             let terminated_notify = session.terminated_signal();
+            let terminated_flag = session.terminated_flag();
             Ok(PySession {
                 inner: Arc::new(tokio::sync::Mutex::new(session)),
                 session_id,
                 protocol_can_send,
                 ready_notify,
                 terminated_notify,
+                terminated_flag,
             })
         })
     }

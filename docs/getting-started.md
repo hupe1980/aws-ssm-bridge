@@ -78,18 +78,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 use std::net::SocketAddr;
 use std::sync::Arc;
-use aws_ssm_bridge::{SessionManager, SessionConfig, PortForwardConfig, PortForwarder,
-                     install_signal_handlers};
+use aws_ssm_bridge::{SessionBuilder, PortForwardConfig, PortForwarder,
+                     ShutdownSignal, install_signal_handlers};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (signal, _guard) = install_signal_handlers()?;
-    let manager = SessionManager::new().await?;
+    let signal = ShutdownSignal::new();
+    install_signal_handlers(signal.clone());
 
-    let session = Arc::new(manager.start_session(SessionConfig {
-        target: "i-0123456789abcdef0".into(),
-        ..Default::default()
-    }).await?);
+    let session = Arc::new(
+        SessionBuilder::new("i-0123456789abcdef0")
+            .port_forward(80)
+            .build()
+            .await?
+    );
 
     let config = PortForwardConfig {
         local_addr: "127.0.0.1:8080".parse::<SocketAddr>()?,

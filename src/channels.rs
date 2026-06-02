@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, warn};
@@ -85,6 +85,9 @@ pub struct ChannelMultiplexer {
     /// Wrapped in `Mutex<Option<_>>` so `close()` can drop it, which
     /// wakes all parked receivers instantly.
     output_tx: std::sync::Mutex<Option<broadcast::Sender<Bytes>>>,
+    /// Lossless direct subscribers (mpsc-backed, never drops frames).
+    /// Used by the smux `recv_task` to avoid broadcast-lag data corruption.
+    direct_subs: std::sync::Mutex<Vec<mpsc::UnboundedSender<Bytes>>>,
 
     /// Flag to signal channel closure (fast check without lock).
     closed: Arc<AtomicBool>,
@@ -101,6 +104,7 @@ impl ChannelMultiplexer {
 
         Self {
             output_tx: std::sync::Mutex::new(Some(output_tx)),
+            direct_subs: std::sync::Mutex::new(Vec::new()),
             closed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -132,6 +136,11 @@ impl ChannelMultiplexer {
             .lock()
             .expect("output_tx lock poisoned")
             .take();
+        // Clear direct subscribers so their channels close too.
+        self.direct_subs
+            .lock()
+            .expect("direct_subs lock poisoned")
+            .clear();
     }
 
     /// Send output data to all subscribed output streams.
@@ -140,11 +149,32 @@ impl ChannelMultiplexer {
     pub fn send_output(&self, data: Bytes) -> Result<()> {
         let guard = self.output_tx.lock().expect("output_tx lock poisoned");
         if let Some(tx) = guard.as_ref() {
-            if tx.send(data).is_err() {
+            if tx.send(data.clone()).is_err() {
                 debug!("No active output stream receivers");
             }
         }
+        drop(guard);
+        // Fan out to lossless direct subscribers; drop dead ones.
+        self.direct_subs
+            .lock()
+            .expect("direct_subs lock poisoned")
+            .retain(|tx| tx.send(data.clone()).is_ok());
         Ok(())
+    }
+
+    /// Subscribe to a lossless output tap backed by an unbounded mpsc channel.
+    ///
+    /// Unlike the broadcast-based [`output_stream`], this receiver never
+    /// drops frames under load — the sender blocks in `send_output` until the
+    /// subscriber's queue drains.  Use this for the smux `recv_task` where
+    /// dropped bytes corrupt framing.
+    pub fn subscribe_lossless(&self) -> mpsc::UnboundedReceiver<Bytes> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.direct_subs
+            .lock()
+            .expect("direct_subs lock poisoned")
+            .push(tx);
+        rx
     }
 }
 

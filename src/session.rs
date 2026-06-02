@@ -120,6 +120,10 @@ pub struct Session {
     /// Notified when session transitions to Terminated
     terminated_notify: Arc<Notify>,
 
+    /// Latching flag set when session transitions to Terminated.
+    /// Allows `wait_terminated` to return immediately if called after termination.
+    terminated_flag: Arc<std::sync::atomic::AtomicBool>,
+
     /// SSM client for API-side termination (optional — None for bare connections)
     ssm_client: Option<Arc<aws_sdk_ssm::Client>>,
 }
@@ -168,6 +172,7 @@ impl Session {
             protocol_can_send,
             ready_notify,
             terminated_notify: Arc::new(Notify::new()),
+            terminated_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ssm_client,
         };
 
@@ -221,6 +226,13 @@ impl Session {
         Arc::clone(&self.terminated_notify)
     }
 
+    /// Return a clone of the terminated latch flag.
+    ///
+    /// Callers can `load(Ordering::SeqCst)` to check termination without a lock.
+    pub fn terminated_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.terminated_flag)
+    }
+
     /// Wait for the session to be ready (start_publication or handshake complete)
     ///
     /// This should be called before sending data to ensure the agent is ready.
@@ -256,6 +268,10 @@ impl Session {
         );
         *state = new_state;
         if new_state == SessionState::Terminated {
+            // Store the flag BEFORE notify_waiters so any racer that wakes and
+            // checks the flag will see it set.
+            self.terminated_flag
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             self.terminated_notify.notify_waiters();
         }
     }
@@ -263,6 +279,15 @@ impl Session {
     /// Get output stream for reading stdout/stderr
     pub fn output(&self) -> OutputStream {
         self.channels.output_stream()
+    }
+
+    /// Subscribe to a lossless output stream backed by an unbounded mpsc channel.
+    ///
+    /// Unlike [`output`], this receiver never drops frames under load and is
+    /// suitable for consumers that must not lose any bytes (e.g. the smux
+    /// `recv_task`).
+    pub fn subscribe_output(&self) -> mpsc::UnboundedReceiver<bytes::Bytes> {
+        self.channels.subscribe_lossless()
     }
 
     /// Send data to the session (stdin)
@@ -352,11 +377,16 @@ impl Session {
 
     /// Wait for session to terminate
     pub async fn wait_terminated(&self) {
-        // Fast path
-        if *self.state.read().await == SessionState::Terminated {
+        // Create the notified() future BEFORE the flag check to avoid the race
+        // where termination happens between the load and the notified().await.
+        let notified = self.terminated_notify.notified();
+        if self
+            .terminated_flag
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
-        self.terminated_notify.notified().await;
+        notified.await;
     }
 }
 

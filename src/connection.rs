@@ -715,12 +715,17 @@ impl ConnectionManager {
                             // Record retransmission metric
                             metrics::counter(MetricNames::RETRANSMISSIONS, 1, &[]);
 
-                            if let Err(e) = writer_tx.try_send(Message::Binary(data)) {
+                            // `get_retransmit_candidates` already advanced last_sent_time and
+                            // resend_attempt for this entry, so we must deliver it — use
+                            // send().await (backpressure) rather than try_send which can silently
+                            // drop the frame and leave the buffer believing it was sent.
+                            if writer_tx.send(Message::Binary(data)).await.is_err() {
                                 warn!(
                                     seq,
-                                    error = ?e,
-                                    "Failed to retransmit message (writer channel full or closed)"
+                                    "Writer channel closed during retransmit — stopping"
                                 );
+                                fatal = true;
+                                break;
                             } else {
                                 trace!(seq, "Retransmitted message");
                             }
