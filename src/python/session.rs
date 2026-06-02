@@ -164,12 +164,15 @@ impl PySession {
         let can_send = Arc::clone(&self.protocol_can_send);
         let ready_notify = Arc::clone(&self.ready_notify);
         future_into_py(py, async move {
+            // Create the notified() future BEFORE the atomic load so that a
+            // notification fired between the load and the await is not lost.
+            let notified = ready_notify.notified();
             // Fast path: already ready.
             if can_send.load(Ordering::SeqCst) {
                 return Ok(true);
             }
             let timeout = std::time::Duration::from_secs_f64(timeout_secs);
-            match tokio::time::timeout(timeout, ready_notify.notified()).await {
+            match tokio::time::timeout(timeout, notified).await {
                 Ok(_) => Ok(true),
                 // Timeout — check once more (notification may have raced with timeout)
                 Err(_) => Ok(can_send.load(Ordering::SeqCst)),
@@ -235,12 +238,11 @@ impl PySession {
         let ready_notify = Arc::clone(&slf.ready_notify);
         let self_obj: Py<PySession> = slf.into();
         future_into_py(py, async move {
+            // Create the notified() future BEFORE the atomic load to avoid a
+            // race where the session becomes ready between the check and the await.
+            let notified = ready_notify.notified();
             if !can_send.load(Ordering::SeqCst) {
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    ready_notify.notified(),
-                )
-                .await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(30), notified).await;
             }
             Ok(self_obj)
         })

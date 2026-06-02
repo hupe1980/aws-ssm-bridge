@@ -621,11 +621,19 @@ impl ConnectionManager {
                         }
 
                         trace!("Sending heartbeat ping");
-                        // try_send: a full queue means we're already in trouble;
-                        // a missed ping just increments missed_pongs on the next tick.
-                        if writer_tx.try_send(Message::Ping(Bytes::new())).is_err() {
-                            debug!("Writer channel closed or full, stopping heartbeat");
-                            break;
+                        // try_send: only break on Closed (channel gone); on Full the
+                        // queue is congested so we skip this ping — missed_pongs will
+                        // fire dead-connection detection on the next interval if the
+                        // queue never drains.
+                        match writer_tx.try_send(Message::Ping(Bytes::new())) {
+                            Ok(_) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                debug!("Writer channel full, skipping heartbeat ping");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                debug!("Writer channel closed, stopping heartbeat");
+                                break;
+                            }
                         }
                     }
                 }
@@ -862,7 +870,7 @@ impl ConnectionManager {
 
                 if msg.sequence_number == state.expected_sequence {
                     // In-order message: process, ACK, then check buffer for consecutive messages
-                    if let Err(e) = Self::send_acknowledge(&ctx.writer_tx, &msg) {
+                    if let Err(e) = Self::send_acknowledge(&ctx.writer_tx, &msg).await {
                         error!(error = ?e, "Failed to send acknowledge");
                     } else {
                         debug!(
@@ -903,7 +911,8 @@ impl ConnectionManager {
 
                     if incoming_buffer.add(msg.clone(), raw_bytes).await {
                         // Successfully buffered - send ACK with IsSequentialMessage=false
-                        if let Err(e) = Self::send_acknowledge_non_sequential(&ctx.writer_tx, &msg)
+                        if let Err(e) =
+                            Self::send_acknowledge_non_sequential(&ctx.writer_tx, &msg).await
                         {
                             error!(error = ?e, "Failed to send acknowledge for out-of-order message");
                         } else {
@@ -1042,7 +1051,9 @@ impl ConnectionManager {
                                     &ctx.writer_tx,
                                     &response,
                                     &ctx.sequence,
-                                ) {
+                                )
+                                .await
+                                {
                                     error!(error = ?e, "Failed to send handshake response");
                                 } else {
                                     info!("Handshake response sent");
@@ -1130,7 +1141,7 @@ impl ConnectionManager {
     }
 
     /// Send handshake response via writer channel
-    fn send_handshake_response(
+    async fn send_handshake_response(
         writer_tx: &mpsc::Sender<Message>,
         response: &HandshakeResponse,
         sequence: &Arc<std::sync::atomic::AtomicI64>,
@@ -1159,7 +1170,8 @@ impl ConnectionManager {
         );
 
         writer_tx
-            .try_send(Message::Binary(msg_bytes))
+            .send(Message::Binary(msg_bytes))
+            .await
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         debug!("HandshakeResponse sent to WebSocket");
@@ -1167,7 +1179,7 @@ impl ConnectionManager {
     }
 
     /// Send acknowledge message for a received message (sequential)
-    fn send_acknowledge(
+    async fn send_acknowledge(
         writer_tx: &mpsc::Sender<Message>,
         received_msg: &ClientMessage,
     ) -> Result<()> {
@@ -1185,14 +1197,15 @@ impl ConnectionManager {
         let msg_bytes = ack_msg.serialize()?;
 
         writer_tx
-            .try_send(Message::Binary(msg_bytes))
+            .send(Message::Binary(msg_bytes))
+            .await
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         Ok(())
     }
 
     /// Send acknowledge message for an out-of-order message (non-sequential)
-    fn send_acknowledge_non_sequential(
+    async fn send_acknowledge_non_sequential(
         writer_tx: &mpsc::Sender<Message>,
         received_msg: &ClientMessage,
     ) -> Result<()> {
@@ -1210,7 +1223,8 @@ impl ConnectionManager {
         let msg_bytes = ack_msg.serialize()?;
 
         writer_tx
-            .try_send(Message::Binary(msg_bytes))
+            .send(Message::Binary(msg_bytes))
+            .await
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
 
         Ok(())

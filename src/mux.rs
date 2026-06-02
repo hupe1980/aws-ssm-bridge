@@ -85,28 +85,32 @@ fn encode_ctrl(cmd: u8, stream_id: u32) -> Bytes {
 /// Frames with an unexpected version byte are discarded with a warning so
 /// the stream stays synchronised even if a future agent adds a v2 frame.
 fn decode_frame(buf: &mut BytesMut) -> Option<(u8, u32, Bytes)> {
-    if buf.len() < HEADER_SIZE {
-        return None;
+    loop {
+        if buf.len() < HEADER_SIZE {
+            return None;
+        }
+        // Peek at version and length fields without consuming.
+        let version = buf[0];
+        let length = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+        if buf.len() < HEADER_SIZE + length {
+            return None;
+        }
+        // M-8: Validate version byte — discard unknown-version frames to avoid
+        // mis-routing a future smux v2 command byte as a v1 command.
+        // Loop (not return None) so frames buffered after the bad one are
+        // still processed without waiting for more bytes to arrive.
+        if version != VERSION {
+            warn!(version, "Unexpected smux version byte — discarding frame");
+            buf.advance(HEADER_SIZE + length);
+            continue;
+        }
+        buf.advance(1); // version (validated above)
+        let cmd = buf.get_u8();
+        buf.advance(2); // length (already peeked)
+        let stream_id = buf.get_u32_le();
+        let payload = buf.split_to(length).freeze();
+        return Some((cmd, stream_id, payload));
     }
-    // Peek at version and length fields without consuming.
-    let version = buf[0];
-    let length = u16::from_le_bytes([buf[2], buf[3]]) as usize;
-    if buf.len() < HEADER_SIZE + length {
-        return None;
-    }
-    // M-8: Validate version byte — discard unknown-version frames to avoid
-    // mis-routing a future smux v2 command byte as a v1 command.
-    if version != VERSION {
-        warn!(version, "Unexpected smux version byte — discarding frame");
-        buf.advance(HEADER_SIZE + length);
-        return None;
-    }
-    buf.advance(1); // version (validated above)
-    let cmd = buf.get_u8();
-    buf.advance(2); // length (already peeked)
-    let stream_id = buf.get_u32_le();
-    let payload = buf.split_to(length).freeze();
-    Some((cmd, stream_id, payload))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -343,7 +347,16 @@ impl SmuxSession {
             .insert(stream_id, data_tx);
 
         // Inform the remote agent of the new stream.
-        let _ = self.inner.frame_tx.send(encode_ctrl(CMD_SYN, stream_id));
+        if self
+            .inner
+            .frame_tx
+            .send(encode_ctrl(CMD_SYN, stream_id))
+            .is_err()
+        {
+            // send task has already exited; clean up and report the error.
+            self.inner.streams.lock().unwrap().remove(&stream_id);
+            return Err(Error::InvalidState("smux send task has exited".to_string()));
+        }
 
         debug!(stream_id, "Opened smux stream");
 
