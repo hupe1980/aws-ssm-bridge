@@ -207,7 +207,8 @@ impl Session {
     ///
     /// Callers (e.g. Python bindings) can cache this and call
     /// `load(Ordering::SeqCst)` directly without acquiring the session lock.
-    pub fn can_send_signal(&self) -> Arc<std::sync::atomic::AtomicBool> {
+    #[cfg(feature = "python")]
+    pub(crate) fn can_send_signal(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.protocol_can_send)
     }
 
@@ -215,21 +216,24 @@ impl Session {
     ///
     /// Callers can `tokio::time::timeout(t, notify.notified()).await` without
     /// ever holding the session lock.
-    pub fn ready_signal(&self) -> Arc<Notify> {
+    #[cfg(feature = "python")]
+    pub(crate) fn ready_signal(&self) -> Arc<Notify> {
         Arc::clone(&self.ready_notify)
     }
 
     /// Return a clone of the terminated [`Notify`].
     ///
     /// Callers can await `notify.notified()` without holding the session lock.
-    pub fn terminated_signal(&self) -> Arc<Notify> {
+    #[cfg(feature = "python")]
+    pub(crate) fn terminated_signal(&self) -> Arc<Notify> {
         Arc::clone(&self.terminated_notify)
     }
 
     /// Return a clone of the terminated latch flag.
     ///
     /// Callers can `load(Ordering::SeqCst)` to check termination without a lock.
-    pub fn terminated_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+    #[cfg(feature = "python")]
+    pub(crate) fn terminated_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.terminated_flag)
     }
 

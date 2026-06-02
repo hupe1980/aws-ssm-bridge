@@ -637,19 +637,17 @@ impl ConnectionManager {
 
                         trace!("Sending heartbeat ping");
                         // try_send: only break on Closed (channel gone); on Full the
-                        // queue is congested so we skip this ping.  If skipped due to Full,
-                        // restore pong_received so we don't count a "missed pong" for a
-                        // ping we never sent — that would trigger false dead-connection
-                        // detection under sustained backpressure.
+                        // queue is congested so we skip this ping.  To prevent false
+                        // dead-connection detection under sustained backpressure, restore
+                        // pong_received unconditionally when we cannot send: if we can't
+                        // enqueue the ping, we shouldn't count its absence next tick.
                         match writer_tx.try_send(Message::Ping(Bytes::new())) {
                             Ok(_) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 debug!("Writer channel full, skipping heartbeat ping");
-                                // Restore the flag so the next interval's check doesn't
-                                // count this as a missed pong.
-                                if missed_pongs == 0 {
-                                    pong_received.store(true, std::sync::atomic::Ordering::SeqCst);
-                                }
+                                // Restore the flag unconditionally: a skipped ping should
+                                // not increment missed_pongs on the next interval.
+                                pong_received.store(true, std::sync::atomic::Ordering::SeqCst);
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 debug!("Writer channel closed, stopping heartbeat");

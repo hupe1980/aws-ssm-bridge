@@ -122,9 +122,16 @@ impl PortForwarder {
             .take()
             .ok_or_else(|| Error::InvalidState("Listener not started".to_string()))?;
 
-        // Block until the SSM protocol handshake is complete.
+        // Block until the SSM protocol handshake is complete, racing against shutdown.
         let connect_timeout = session.config().connect_timeout;
-        if !session.wait_for_ready(connect_timeout).await {
+        let ready = tokio::select! {
+            ready = session.wait_for_ready(connect_timeout) => ready,
+            _ = shutdown.cancelled() => {
+                info!("Shutting down before session handshake completed");
+                return Ok(());
+            }
+        };
+        if !ready {
             return Err(Error::InvalidState(
                 "SSM session not ready: handshake timed out".to_string(),
             ));
