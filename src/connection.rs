@@ -808,11 +808,13 @@ impl ConnectionManager {
         // has the message in its buffer even if the send fails or is reordered.
         self.outgoing_buffer.add(msg_bytes.clone(), sequence).await;
 
-        // Send via bounded writer channel (backpressure: await when full)
+        // Send via bounded writer channel (backpressure: await when full).
+        // A send failure means the writer task has exited — this is an internal
+        // channel shutdown, not a WebSocket I/O error.
         self.writer_tx
             .send(Message::Binary(msg_bytes.clone()))
             .await
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+            .map_err(|_| TransportError::Channel("writer channel closed".to_string()))?;
 
         // Record send metrics
         metrics::counter(MetricNames::MESSAGES_SENT, 1, &[]);
@@ -856,11 +858,13 @@ impl ConnectionManager {
         // has the message in its buffer even if the send fails or is reordered.
         self.outgoing_buffer.add(msg_bytes.clone(), sequence).await;
 
-        // Send via bounded writer channel (backpressure: await when full)
+        // Send via bounded writer channel (backpressure: await when full).
+        // A send failure means the writer task has exited — channel closed, not
+        // a WebSocket I/O error.
         self.writer_tx
             .send(Message::Binary(msg_bytes.clone()))
             .await
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+            .map_err(|_| TransportError::Channel("writer channel closed".to_string()))?;
 
         // Record send metrics
         metrics::counter(MetricNames::MESSAGES_SENT, 1, &[]);
@@ -1209,10 +1213,11 @@ impl ConnectionManager {
             "Serialized HandshakeResponse message"
         );
 
+        // Send failure means the writer task has exited (channel closed).
         writer_tx
             .send(Message::Binary(msg_bytes))
             .await
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+            .map_err(|_| TransportError::Channel("writer channel closed".to_string()))?;
 
         debug!("HandshakeResponse sent to WebSocket");
         Ok(())
@@ -1239,7 +1244,7 @@ impl ConnectionManager {
         writer_tx
             .send(Message::Binary(msg_bytes))
             .await
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+            .map_err(|_| TransportError::Channel("writer channel closed".to_string()))?;
 
         Ok(())
     }
@@ -1265,7 +1270,7 @@ impl ConnectionManager {
         writer_tx
             .send(Message::Binary(msg_bytes))
             .await
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+            .map_err(|_| TransportError::Channel("writer channel closed".to_string()))?;
 
         Ok(())
     }

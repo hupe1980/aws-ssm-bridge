@@ -164,6 +164,11 @@ impl Inner {
                     // Consumer too slow — close this stream to unblock other streams.
                     warn!(stream_id, "Per-stream receive buffer full — closing stream");
                     self.streams.lock().unwrap().remove(&stream_id);
+                    // Best-effort FIN: inform the remote agent so it can release
+                    // its stream resources rather than continuing to push data into
+                    // a stream we've silently discarded.  Ignore send errors here
+                    // (the mux may already be closing).
+                    let _ = self.frame_tx.try_send(encode_ctrl(CMD_FIN, stream_id));
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     // Stream already gone — evict the dead entry.
@@ -258,28 +263,34 @@ fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) -> bool {
 /// writer does not keep the task alive after session teardown.
 async fn send_task(session: Arc<Session>, mut frame_rx: mpsc::Receiver<Bytes>, inner: Arc<Inner>) {
     loop {
-        // Fast-path latch check: `Notify` is edge-triggered — if `inner.close()`
-        // fires `notify_waiters()` between loop iterations (after we return from
-        // the inner select! but before we register the next `notified()` future),
-        // the wakeup is missed and the task can block on `frame_rx.recv()`
-        // indefinitely, keeping the `Arc<Inner>` and `frame_tx` alive.
+        // IMPORTANT: register the `die` subscription BEFORE the `is_closed()`
+        // latch check.  `Notify` is edge-triggered: `notify_waiters()` only wakes
+        // futures that are *currently* registered.  The wrong order is:
+        //   1. check is_closed() → false
+        //   2. close() fires notify_waiters()   ← notification lost
+        //   3. register notified()              ← never woken
+        // By pinning first we guarantee: if close() fires after pin but before
+        // select!, the wakeup is captured; if it fired before pin, is_closed()
+        // catches it on the latch check immediately below.
+        let die = inner.die.notified();
+        tokio::pin!(die);
         if inner.is_closed() {
             break;
         }
         tokio::select! {
             biased;
-            _ = inner.die.notified() => break,
+            _ = &mut die => break,
             frame = frame_rx.recv() => {
                 match frame {
                     Some(f) => {
                         // Subscribe to `die` *before* starting the send so that
                         // a concurrent `notify_waiters()` during the send is not
                         // missed (Tokio's Notify only wakes current subscribers).
-                        let die = inner.die.notified();
-                        tokio::pin!(die);
+                        let send_die = inner.die.notified();
+                        tokio::pin!(send_die);
                         tokio::select! {
                             biased;
-                            _ = &mut die => break,
+                            _ = &mut send_die => break,
                             result = session.send(f) => {
                                 if let Err(e) = result {
                                     warn!(error = ?e, "smux send task: session error");
