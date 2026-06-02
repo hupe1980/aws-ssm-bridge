@@ -212,11 +212,7 @@ async fn dispatch_frames(buf: &mut BytesMut, inner: &Inner) {
 ///
 /// Exits immediately when `inner.die` is notified so that a stalled WebSocket
 /// writer does not keep the task alive after session teardown.
-async fn send_task(
-    session: Arc<Session>,
-    mut frame_rx: mpsc::Receiver<Bytes>,
-    inner: Arc<Inner>,
-) {
+async fn send_task(session: Arc<Session>, mut frame_rx: mpsc::Receiver<Bytes>, inner: Arc<Inner>) {
     loop {
         tokio::select! {
             biased;
@@ -506,9 +502,9 @@ impl AsyncWrite for SmuxStream {
             ))),
             Poll::Ready(Ok(())) => {
                 let frame = encode_frame(CMD_PSH, this.stream_id, &buf[..n]);
-                this.frame_sink
-                    .send_item(frame)
-                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "smux session closed"))?;
+                this.frame_sink.send_item(frame).map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "smux session closed")
+                })?;
                 Poll::Ready(Ok(n))
             }
         }
