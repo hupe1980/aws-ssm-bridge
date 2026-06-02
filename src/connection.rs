@@ -83,7 +83,8 @@ type WsReader = SplitStream<WsStream>;
 /// **Security**: Has a manual `Debug` implementation that redacts `token_value`
 /// to prevent accidental token leakage in logs.
 /// Implements `Zeroize` to scrub `token_value` from memory on drop.
-/// `Clone` is intentionally absent — no copies of the session token should exist.
+/// `Clone` is intentionally absent — the struct itself cannot be cloned,
+/// preventing accidental duplication of this security-sensitive value.
 #[derive(Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 #[serde(rename_all = "PascalCase")]
@@ -635,13 +636,19 @@ impl ConnectionManager {
 
                         trace!("Sending heartbeat ping");
                         // try_send: only break on Closed (channel gone); on Full the
-                        // queue is congested so we skip this ping — missed_pongs will
-                        // fire dead-connection detection on the next interval if the
-                        // queue never drains.
+                        // queue is congested so we skip this ping.  If skipped due to Full,
+                        // restore pong_received so we don't count a "missed pong" for a
+                        // ping we never sent — that would trigger false dead-connection
+                        // detection under sustained backpressure.
                         match writer_tx.try_send(Message::Ping(Bytes::new())) {
                             Ok(_) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 debug!("Writer channel full, skipping heartbeat ping");
+                                // Restore the flag so the next interval's check doesn't
+                                // count this as a missed pong.
+                                if missed_pongs == 0 {
+                                    pong_received.store(true, std::sync::atomic::Ordering::SeqCst);
+                                }
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 debug!("Writer channel closed, stopping heartbeat");
@@ -733,11 +740,7 @@ impl ConnectionManager {
                             // send with shutdown so a stalled socket cannot block teardown.
                             let send_ok = tokio::select! {
                                 biased;
-                                _ = shutdown_rx.recv() => {
-                                    debug!("Retransmit task shutting down during send");
-                                    fatal = true;
-                                    break;
-                                }
+                                _ = shutdown_rx.recv() => false,
                                 result = writer_tx.send(Message::Binary(data)) => result.is_ok(),
                             };
                             if !send_ok {

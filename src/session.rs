@@ -238,6 +238,11 @@ impl Session {
     /// This should be called before sending data to ensure the agent is ready.
     /// Returns `true` if ready, `false` if timeout expired.
     pub async fn wait_for_ready(&self, timeout: std::time::Duration) -> bool {
+        // Subscribe to notification BEFORE checking the flag so that a
+        // notification fired between the check and the subscribe is not lost
+        // (Notify only wakes registered subscribers).
+        let notified = self.ready_notify.notified();
+
         // Fast path: already ready
         if self
             .protocol_can_send
@@ -247,7 +252,7 @@ impl Session {
         }
 
         // Wait for notification or timeout
-        match tokio::time::timeout(timeout, self.ready_notify.notified()).await {
+        match tokio::time::timeout(timeout, notified).await {
             Ok(_) => true,
             Err(_) => {
                 // Timeout — check once more (notification may have raced)

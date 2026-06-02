@@ -169,10 +169,12 @@ impl ChannelMultiplexer {
     /// subscriber consumes it.  Use this for the smux `recv_task` where dropped
     /// bytes corrupt framing.
     ///
-    /// **Back-pressure warning**: the underlying channel is unbounded.  A slow
-    /// subscriber will cause queue memory to grow without bound.  Only use this
-    /// when the consumer (e.g. the smux `recv_task`) processes data at least as
-    /// fast as it arrives.
+    /// **WARNING**: The underlying channel is unbounded.  A slow subscriber or
+    /// any backpressure in the consumer loop (e.g., bounded per-stream channels
+    /// in the smux recv_task) can cause queue memory to grow without bound and
+    /// trigger OOM.  This is an acceptable tradeoff for the smux recv_task,
+    /// which must never drop frames; callers **must** ensure the consumer
+    /// processes data continuously without stalling.
     pub fn subscribe_lossless(&self) -> mpsc::UnboundedReceiver<Bytes> {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut guard = self.direct_subs.lock().expect("direct_subs lock poisoned");
