@@ -44,11 +44,9 @@ session.terminate().await?;
 
 ## Install
 
-```toml
-# Cargo.toml
-[dependencies]
-aws-ssm-bridge = "0.5"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```sh
+cargo add aws-ssm-bridge
+cargo add tokio --features rt-multi-thread,macros
 ```
 
 ```sh

@@ -26,17 +26,22 @@ Additional permissions for optional features:
 
 ## Install
 
-```toml
-# Cargo.toml
-[dependencies]
-aws-ssm-bridge = "0.5"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-futures-util = "0.3"
+```sh
+cargo add aws-ssm-bridge
+cargo add tokio --features rt-multi-thread,macros
+cargo add futures-util
 ```
 
 ```sh
 pip install aws-ssm-bridge
 ```
+
+`futures-util` is only needed for the [`StreamExt`] trait that
+[`Session::output`] is consumed with; skip it if you drive the stream some other
+way.
+
+[`StreamExt`]: https://docs.rs/futures-util/latest/futures_util/stream/trait.StreamExt.html
+[`Session::output`]: https://docs.rs/aws-ssm-bridge/latest/aws_ssm_bridge/session/struct.Session.html#method.output
 
 
 ## Your first session
