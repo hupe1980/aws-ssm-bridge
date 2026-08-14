@@ -1,277 +1,185 @@
-//! Interactive shell session combining terminal handling with SSM protocol.
+//! A complete interactive shell, terminal and all.
 //!
-//! This module provides a complete interactive shell experience that goes
-//! BEYOND what AWS session-manager-plugin offers:
+//! ```no_run
+//! use aws_ssm_bridge::InteractiveShell;
 //!
-//! ## Improvements Over AWS
-//!
-//! | Feature | AWS Plugin | aws-ssm-bridge |
-//! |---------|-----------|----------------|
-//! | Terminal handling | OS-specific exec | crossterm (unified) |
-//! | Resize detection | 500ms polling | Instant via events |
-//! | Input batching | None | Smart batching |
-//! | Error recovery | Basic | Automatic retry |
-//! | State restoration | Manual cleanup | RAII guaranteed |
-//!
-//! ## Usage
-//!
-//! ```rust,no_run
-//! use aws_ssm_bridge::interactive::{InteractiveShell, InteractiveConfig};
-//! use aws_ssm_bridge::SessionConfig;
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = InteractiveConfig::default();
-//! let mut shell = InteractiveShell::new(config)?;
-//!
-//! // Connect to instance
-//! shell.connect("i-1234567890abcdef0").await?;
-//!
-//! // Run interactive session (blocks until exit)
-//! shell.run().await?;
-//! # Ok(())
+//! # async fn example() -> aws_ssm_bridge::Result<()> {
+//! let exit_code = InteractiveShell::new(Default::default())
+//!     .run("i-0123456789abcdef0")
+//!     .await?;
+//! std::process::exit(exit_code.unwrap_or(0));
 //! # }
 //! ```
+//!
+//! Everything the local terminal produces is forwarded verbatim and everything
+//! the agent sends is written straight to stdout — see [`crate::terminal`] for
+//! why that is the only correct approach. Resizes propagate through SIGWINCH,
+//! and the terminal is restored on every exit path, panics included.
 
-use bytes::Bytes;
-use futures::StreamExt;
-use tracing::{debug, info, instrument, trace};
+use futures_util::StreamExt;
+use std::sync::Arc;
+use tracing::{debug, info};
 
-use crate::errors::{Error, Result};
-use crate::session::{Session, SessionConfig, SessionState};
-use crate::terminal::{ControlSignal, Terminal, TerminalConfig, TerminalInput};
-use crate::SessionManager;
+use crate::builder::SessionBuilder;
+use crate::errors::Result;
+use crate::session::{CloseReason, Session, SessionManager};
+use crate::terminal::{self, RawModeGuard, TerminalEvent, TerminalReader, TerminalSize};
 
-/// Configuration for interactive shell sessions
+/// How the interactive shell presents itself.
 #[derive(Debug, Clone)]
 pub struct InteractiveConfig {
-    /// Terminal configuration
-    pub terminal: TerminalConfig,
-    /// Send initial terminal size on connect
-    pub send_initial_size: bool,
-    /// Display banner on connect
+    /// Print "Starting session …" and "Session ended" around the session.
     pub show_banner: bool,
-    /// Forward Ctrl+C as signal (true) or bytes (false)
-    pub forward_signals: bool,
+    /// Send the terminal size once the session is ready.
+    ///
+    /// Without this the remote pty stays at its default 80×24 and full-screen
+    /// programs draw at the wrong size.
+    pub send_initial_size: bool,
+    /// AWS region; `None` uses the ambient configuration.
+    pub region: Option<String>,
+    /// Reason recorded in CloudTrail.
+    pub reason: Option<String>,
 }
 
 impl Default for InteractiveConfig {
     fn default() -> Self {
         Self {
-            terminal: TerminalConfig::default(),
-            send_initial_size: true,
             show_banner: true,
-            forward_signals: true,
+            send_initial_size: true,
+            region: None,
+            reason: None,
         }
     }
 }
 
-/// Interactive shell session with full terminal support
+/// Runs a session against the local terminal.
+#[derive(Debug, Default)]
 pub struct InteractiveShell {
     config: InteractiveConfig,
-    terminal: Terminal,
-    session: Option<Session>,
-    session_manager: Option<SessionManager>,
 }
 
 impl InteractiveShell {
-    /// Create a new interactive shell
-    pub fn new(config: InteractiveConfig) -> Result<Self> {
-        let terminal = Terminal::new(config.terminal.clone())?;
-        Ok(Self {
-            config,
-            terminal,
-            session: None,
-            session_manager: None,
-        })
+    /// Build a shell with the given presentation options.
+    pub fn new(config: InteractiveConfig) -> Self {
+        Self { config }
     }
 
-    /// Connect to an EC2 instance
-    #[instrument(skip(self))]
-    pub async fn connect(&mut self, target: &str) -> Result<()> {
-        info!(target = %target, "Connecting to instance");
+    /// Start a session against `target` and run it until it ends.
+    ///
+    /// Returns the remote process's exit code when the agent reported one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Config`] if stdin and stdout are not a terminal;
+    /// raw mode is meaningless on a pipe. Use [`Session::send`] and
+    /// [`Session::output`] for headless use.
+    pub async fn run(&self, target: &str) -> Result<Option<i32>> {
+        terminal::require_terminal()?;
 
-        // Create session manager
-        let manager = SessionManager::new().await?;
+        let mut builder = SessionBuilder::new(target).maybe_region(self.config.region.clone());
+        if let Some(reason) = &self.config.reason {
+            builder = builder.reason(reason.clone());
+        }
+        let session = Arc::new(builder.start().await?);
+        self.drive(session).await
+    }
 
-        // Create session config
-        let session_config = SessionConfig {
-            target: target.to_string(),
-            ..Default::default()
-        };
+    /// Start a session using an existing manager, then run it.
+    pub async fn run_with(&self, target: &str, manager: &SessionManager) -> Result<Option<i32>> {
+        terminal::require_terminal()?;
+        let session = Arc::new(SessionBuilder::new(target).start_with(manager).await?);
+        self.drive(session).await
+    }
 
-        // Start session
-        let session = manager.start_session(session_config).await?;
+    /// Attach the local terminal to an already-open session.
+    ///
+    /// The session is terminated when the shell exits.
+    pub async fn attach(&self, session: Arc<Session>) -> Result<Option<i32>> {
+        terminal::require_terminal()?;
+        self.drive(session).await
+    }
 
+    async fn drive(&self, session: Arc<Session>) -> Result<Option<i32>> {
         if self.config.show_banner {
-            println!(
-                "\n\x1b[32mStarting session with SessionId: {}\x1b[0m\n",
-                session.id()
-            );
+            println!("Starting session with SessionId: {}", session.id());
         }
 
-        self.session = Some(session);
-        self.session_manager = Some(manager);
+        session.wait_ready().await?;
+        if let Some(banner) = session.banner() {
+            println!("{banner}");
+        }
 
-        // Send initial terminal size
+        // Raw mode goes on last, and comes off first: every early return above
+        // this point leaves the terminal untouched, and the guard restores it on
+        // every path below, panics included.
+        let _raw = RawModeGuard::enter()?;
+
         if self.config.send_initial_size {
-            self.send_terminal_size().await?;
+            let size = TerminalSize::current();
+            session.send_terminal_size(size.cols, size.rows).await?;
         }
 
-        Ok(())
-    }
+        let result = self.pump(&session).await;
 
-    /// Send terminal size to session
-    async fn send_size_to_session(session: &Session, terminal: &Terminal) -> Result<()> {
-        let size = terminal.size();
-        session.send_size(size).await
-    }
+        // Leave the cursor at column zero. In raw mode `\n` is a line feed only,
+        // so without the carriage return the shell prompt resumes mid-line.
+        let _ = terminal::write_output(b"\r\n");
+        drop(_raw);
 
-    /// Send current terminal size to remote
-    async fn send_terminal_size(&self) -> Result<()> {
-        if let Some(ref session) = self.session {
-            Self::send_size_to_session(session, &self.terminal).await?;
-        }
-        Ok(())
-    }
-
-    /// Run the interactive session (blocks until exit)
-    #[instrument(skip(self))]
-    pub async fn run(&mut self) -> Result<()> {
-        // Take session out for the duration of run()
-        let session = self
-            .session
-            .take()
-            .ok_or_else(|| Error::Config("Not connected".to_string()))?;
-
-        // Enable raw mode with RAII guard
-        let _raw_guard = self.terminal.enable_raw_mode()?;
-
-        // Start terminal input reader
-        let mut input_rx = self.terminal.start_input_reader();
-
-        // Get output stream from session
-        let mut output = session.output();
-
-        // Main event loop
-        let result = loop {
-            tokio::select! {
-                // Handle terminal input
-                input = input_rx.recv() => {
-                    match input {
-                        Some(TerminalInput::Data(data)) => {
-                            trace!(len = data.len(), "Sending input data");
-                            if let Err(e) = session.send(data).await {
-                                break Err(e);
-                            }
-                        }
-                        Some(TerminalInput::Signal(signal)) => {
-                            if self.config.forward_signals {
-                                let byte = signal.as_byte();
-                                debug!(?signal, byte, "Forwarding control signal");
-                                if let Err(e) = session.send(Bytes::from(vec![byte])).await {
-                                    break Err(e);
-                                }
-                            }
-
-                            // Handle Ctrl+D as EOF
-                            if matches!(signal, ControlSignal::EndOfFile) {
-                                info!("EOF received, terminating session");
-                                break Ok(());
-                            }
-                        }
-                        Some(TerminalInput::Resize(size)) => {
-                            debug!(cols = size.cols, rows = size.rows, "Terminal resized");
-                            if let Err(e) = Self::send_size_to_session(&session, &self.terminal).await {
-                                break Err(e);
-                            }
-                        }
-                        Some(TerminalInput::Eof) | None => {
-                            info!("Terminal input closed");
-                            break Ok(());
-                        }
-                    }
-                }
-
-                // Handle session output
-                output_data = output.next() => {
-                    match output_data {
-                        Some(data) => {
-                            trace!(len = data.len(), "Received output data");
-                            if let Err(e) = Terminal::write_output(&data) {
-                                break Err(Error::Io(e));
-                            }
-                        }
-                        None => {
-                            info!("Session output closed");
-                            break Ok(());
-                        }
-                    }
-                }
-            }
-        };
-
-        // Graceful shutdown
-        self.terminal.stop();
+        let reason = session.close_reason();
+        let exit_code = session.exit_code();
         session.terminate().await?;
 
-        // In raw mode OPOST is disabled, so bare `\n` is a line-feed only
-        // (cursor down, no carriage return).  If the last session output ended
-        // mid-line the cursor could be at column N > 0, which would cause zsh's
-        // PROMPT_SP to fire (the `%` block with surrounding spaces) after exit.
-        // Writing an explicit `\r\n` while still in raw mode guarantees column 0.
-        {
-            use std::io::Write;
-            let _ = std::io::stdout().lock().write_all(b"\r\n");
-        }
-
-        // Restore terminal BEFORE printing the banner so that the subsequent
-        // `println!` runs in cooked mode with OPOST/ONLCR re-enabled and
-        // `\n` correctly translates to `\r\n`.
-        drop(_raw_guard);
-
         if self.config.show_banner {
-            println!("\x1b[33mSession terminated.\x1b[0m\n");
+            match &reason {
+                Some(CloseReason::Terminated) | None => println!("Session ended."),
+                Some(reason) => println!("Session ended: {reason}"),
+            }
         }
 
-        result
+        result.map(|()| exit_code)
     }
 
-    /// Get the underlying session (if connected)
-    pub fn session(&self) -> Option<&Session> {
-        self.session.as_ref()
-    }
+    /// Shuttle bytes between the terminal and the session until either stops.
+    async fn pump(&self, session: &Session) -> Result<()> {
+        let mut terminal_input = TerminalReader::start();
+        let mut output = session.output();
 
-    /// Check if connected (async to check state)
-    pub async fn is_connected(&self) -> bool {
-        if let Some(ref session) = self.session {
-            session.state().await == SessionState::Connected
-        } else {
-            false
+        loop {
+            tokio::select! {
+                // Session output first: draining what the remote already sent
+                // keeps the display current even while the user types fast.
+                biased;
+
+                chunk = output.next() => match chunk {
+                    Some(chunk) => terminal::write_output(&chunk)?,
+                    None => {
+                        debug!("session output ended");
+                        return Ok(());
+                    }
+                },
+
+                event = terminal_input.next() => match event {
+                    Some(TerminalEvent::Input(bytes)) => session.send(bytes).await?,
+                    Some(TerminalEvent::Resize(size)) => {
+                        session.send_terminal_size(size.cols, size.rows).await?;
+                    }
+                    // Ctrl-D at the shell prompt arrives as a 0x04 byte and is
+                    // forwarded like any other input; the remote shell decides
+                    // what it means. Genuine stdin EOF ends the session.
+                    Some(TerminalEvent::Eof) | None => {
+                        info!("terminal input ended");
+                        return Ok(());
+                    }
+                },
+
+                () = session.closed() => {
+                    debug!(reason = ?session.close_reason(), "session ended");
+                    return Ok(());
+                }
+            }
         }
     }
-}
-
-impl Drop for InteractiveShell {
-    fn drop(&mut self) {
-        self.terminal.stop();
-    }
-}
-
-/// Convenience function for quick interactive session
-///
-/// # Example
-///
-/// ```rust,no_run
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// aws_ssm_bridge::interactive::run_shell("i-1234567890abcdef0").await?;
-/// # Ok(())
-/// # }
-/// ```
-pub async fn run_shell(target: &str) -> Result<()> {
-    let config = InteractiveConfig::default();
-    let mut shell = InteractiveShell::new(config)?;
-    shell.connect(target).await?;
-    shell.run().await
 }
 
 #[cfg(test)]
@@ -279,24 +187,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_interactive_config_default() {
+    fn defaults_show_a_banner_and_send_the_size() {
         let config = InteractiveConfig::default();
-        assert!(config.send_initial_size);
         assert!(config.show_banner);
-        assert!(config.forward_signals);
+        assert!(config.send_initial_size);
+        assert!(config.region.is_none());
     }
 
-    #[test]
-    fn test_interactive_shell_creation() {
-        let config = InteractiveConfig::default();
-        let shell = InteractiveShell::new(config);
-        assert!(shell.is_ok());
-    }
-
+    /// Raw mode on a pipe is meaningless and `enable_raw_mode` would fail deep
+    /// inside the run. Fail early with an explanation instead.
     #[tokio::test]
-    async fn test_not_connected_initially() {
-        let config = InteractiveConfig::default();
-        let shell = InteractiveShell::new(config).unwrap();
-        assert!(!shell.is_connected().await);
+    async fn running_without_a_terminal_is_rejected_before_any_aws_call() {
+        if terminal::is_terminal() {
+            return; // running attached to a real terminal; nothing to assert
+        }
+        let err = InteractiveShell::default()
+            .run("i-0123456789abcdef0")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("terminal"), "{err}");
     }
 }

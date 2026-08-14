@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="aws-ssm-bridge">
+  <title>aws-ssm-bridge</title>
+  <!-- Two endpoints joined by a span: a bridge, and the two ends of a session. -->
+  <rect x="1" y="1" width="30" height="30" rx="7" fill="#b7410e"/>
+  <g fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round">
+    <path d="M6 20V13"/>
+    <path d="M26 20V13"/>
+    <path d="M6 13c3.6-4.6 16.4-4.6 20 0"/>
+  </g>
+  <circle cx="16" cy="10.4" r="2.4" fill="#fff"/>
+</svg>

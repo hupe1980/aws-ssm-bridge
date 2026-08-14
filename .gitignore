@@ -32,3 +32,11 @@ FINDINGS.md
 *.so
 *.pyd
 *.dylib
+
+# Zola build output for the documentation site
+site/public/
+
+# cargo-fuzz corpora and artifacts
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/

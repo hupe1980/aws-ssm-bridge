@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+
+{% block body %}
+<main id="main">
+
+<section class="hero">
+  <div class="wrap">
+    <p class="eyebrow">Rust · Python · MIT</p>
+    <h1>AWS Session Manager,<br>as a library.</h1>
+    <p class="hero-sub">
+      Open sessions, stream bytes and forward ports from inside your own async
+      application. No <code>session-manager-plugin</code> binary, no subprocess,
+      no scraping stdout.
+    </p>
+
+    <div class="cta">
+      <a class="btn btn-primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+      <a class="btn" href="{{ config.extra.repo }}">View on GitHub</a>
+    </div>
+
+    <div class="install">
+      <code>cargo add aws-ssm-bridge</code>
+      <span class="sep">or</span>
+      <code>pip install aws-ssm-bridge</code>
+    </div>
+  </div>
+</section>
+
+<section class="wrap band">
+  <div class="tabs" data-tabs>
+    <div class="tablist" role="tablist" aria-label="Language">
+      <button role="tab" aria-selected="true" aria-controls="tab-rust" id="lbl-rust">Rust</button>
+      <button role="tab" aria-selected="false" aria-controls="tab-python" id="lbl-python">Python</button>
+    </div>
+
+    <div role="tabpanel" id="tab-rust" aria-labelledby="lbl-rust">
+{{ ("```rust\n" ~ load_data(path="snippets/quickstart.rs", format="plain") ~ "```") | markdown | safe }}
+    </div>
+
+    <div role="tabpanel" id="tab-python" aria-labelledby="lbl-python" hidden>
+{{ ("```python\n" ~ load_data(path="snippets/quickstart.py", format="plain") ~ "```") | markdown | safe }}
+    </div>
+  </div>
+</section>
+
+<section class="wrap band">
+  <h2>What you get</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>Shell &amp; command sessions</h3>
+      <p>Interactive shells, plus both <code>AWS-Start*Command</code> documents, with typed wrappers so a wrong parameter name is a compile error.</p>
+    </div>
+    <div class="card">
+      <h3>Port forwarding</h3>
+      <p>smux-multiplexed, so many concurrent TCP connections share one WebSocket without blocking or corrupting each other.</p>
+    </div>
+    <div class="card">
+      <h3>KMS session encryption</h3>
+      <p>AES-256-GCM end-to-end for accounts that mandate it. A client that cannot negotiate it fails the handshake rather than downgrading.</p>
+    </div>
+    <div class="card">
+      <h3>Interactive terminal</h3>
+      <p>Raw byte passthrough, SIGWINCH resize, and terminal restoration on every exit path — panics included.</p>
+    </div>
+    <div class="card">
+      <h3>Reconnection</h3>
+      <p>An output stream that outlives the session beneath it, rebuilt with full-jitter backoff when — and only when — a retry could help.</p>
+    </div>
+    <div class="card">
+      <h3>Python bindings</h3>
+      <p>The full async API with type stubs and context managers, shipped as an <code>abi3</code> wheel for CPython 3.8 and later.</p>
+    </div>
+  </div>
+</section>
+
+<section class="wrap band">
+  <div class="split">
+    <div>
+      <h2>One guarantee everything else rests on</h2>
+      <p>
+        A session is either running or closed. <em>Every</em> way it can end — a
+        clean <code>terminate()</code>, the agent hanging up, a dead network, a
+        protocol violation — resolves <code>closed()</code> and records a
+        <code>CloseReason</code>.
+      </p>
+      <p>
+        That is what makes the layers above it work: the port forwarder stops
+        accepting when the tunnel dies, the pool reaps dead entries, and
+        reconnection knows when to rebuild. There is no state in which the handle
+        looks alive but nothing is running.
+      </p>
+      <p><a class="arrow" href="{{ get_url(path='@/docs/architecture.md') }}">How it is put together</a></p>
+    </div>
+    <div>
+{{ ("```rust\n" ~ load_data(path="snippets/closed.rs", format="plain") ~ "```") | markdown | safe }}
+    </div>
+  </div>
+</section>
+
+<section class="wrap band">
+  <h2>Built to be verified, not trusted</h2>
+  <div class="grid grid-4">
+    <div class="stat">
+      <strong>forbid</strong>
+      <span><code>unsafe_code</code> is forbidden crate-wide</span>
+    </div>
+    <div class="stat">
+      <strong>Fuzzed</strong>
+      <span>Every parser that touches network bytes</span>
+    </div>
+    <div class="stat">
+      <strong>Verified</strong>
+      <span>SHA-256 payload digests, like the reference plugin</span>
+    </div>
+    <div class="stat">
+      <strong>Pinned</strong>
+      <span>Wire format locked by byte-offset tests</span>
+    </div>
+  </div>
+  <p class="muted">
+    The data channel refuses any endpoint that is not an AWS SSM messages host,
+    and the session token travels only in the open message — never in a URL,
+    where proxies and traces would record it.
+    <a class="arrow" href="{{ get_url(path='@/docs/security.md') }}">Read the threat model</a>
+  </p>
+</section>
+
+<section class="wrap band closing">
+  <h2>Start here</h2>
+  <div class="grid grid-3">
+    <a class="card link-card" href="{{ get_url(path='@/docs/getting-started.md') }}">
+      <h3>Getting started</h3>
+      <p>Credentials, your first session, port forwarding, and the errors you will actually hit.</p>
+    </a>
+    <a class="card link-card" href="{{ get_url(path='@/docs/protocol.md') }}">
+      <h3>Wire protocol</h3>
+      <p>What travels between a client and the SSM agent, and the traps that make a session hang silently.</p>
+    </a>
+    <a class="card link-card" href="{{ get_url(path='@/docs/python.md') }}">
+      <h3>Python API</h3>
+      <p>The full async surface, with type stubs, context managers and fan-out patterns.</p>
+    </a>
+  </div>
+</section>
+
+<p class="disclaimer wrap">
+  Not affiliated with AWS. This is an independent implementation of a protocol
+  documented by observation, not endorsed or sponsored by Amazon Web Services, Inc.
+</p>
+
+</main>
+{% endblock body %}

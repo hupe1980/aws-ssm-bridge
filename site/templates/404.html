@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block body %}
+<main id="main" class="wrap band" style="text-align:center; min-height:50vh">
+  <p class="eyebrow">404</p>
+  <h1>That page is not here.</h1>
+  <p class="hero-sub">It may have moved when the documentation was reorganised.</p>
+  <p class="cta">
+    <a class="btn btn-primary" href="{{ get_url(path='@/docs/_index.md') }}">Browse the docs</a>
+    <a class="btn" href="{{ get_url(path='@/_index.md') }}">Home</a>
+  </p>
+</main>
+{% endblock body %}

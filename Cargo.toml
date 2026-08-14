@@ -1,14 +1,17 @@
 [package]
 name = "aws-ssm-bridge"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-rust-version = "1.81"
+# Set by the AWS SDK, not by this crate's own code: aws-config and the
+# aws-sdk-* crates declare 1.94.1, and aws-sigv4 pulls in a `digest` whose
+# manifest needs edition2024. Verify with `just msrv` before lowering it.
+rust-version = "1.94.1"
 authors = ["hupe1980"]
 license = "MIT"
 repository = "https://github.com/hupe1980/aws-ssm-bridge"
 homepage = "https://hupe1980.github.io/aws-ssm-bridge/"
-description = "Rust library implementing AWS Systems Manager Session Manager protocol"
-keywords = ["aws", "ssm", "session-manager", "async"]
+description = "Rust library implementing the AWS Systems Manager Session Manager protocol"
+keywords = ["aws", "ssm", "session-manager", "port-forwarding", "async"]
 categories = ["network-programming", "asynchronous"]
 readme = "README.md"
 
@@ -17,35 +20,64 @@ name = "aws_ssm_bridge"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["interactive"]
-# Core features
-# interactive = terminal handling for interactive shells
-interactive = []
-# python = Python bindings via PyO3
+default = ["interactive", "kms"]
+# Terminal handling for interactive shells (pulls in crossterm).
+interactive = ["dep:crossterm"]
+# KMS session encryption (AES-256-GCM), required when the SSM session
+# preference document enables "Encrypt session data".
+kms = ["dep:aws-sdk-kms", "dep:aes-gcm"]
+# Python bindings via PyO3.
 python = ["dep:pyo3", "dep:pyo3-async-runtimes", "dep:tracing-subscriber"]
+# Link the bindings as a Python extension module rather than against libpython.
+#
+# Split out from `python` on purpose: `extension-module` leaves the CPython
+# symbols to be resolved by the interpreter at load time, which is right for a
+# wheel and fatal for a test binary — `cargo test --features python` would abort
+# with "symbol not found in flat namespace". maturin turns this on (see
+# pyproject.toml); nothing else should.
+extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.40", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio = { version = "1.40", features = ["rt", "net", "io-util", "sync", "time", "macros", "signal"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 
-# AWS SDK (with SSO/login support)
-aws-config = { version = "1.5", features = ["behavior-version-latest", "sso", "credentials-login"] }
-aws-sdk-ssm = "1.45"
+# AWS SDK.
+#
+# `default-features = false` deliberately drops the SDK crates' `rustls`
+# feature, which pulls in aws-smithy-http-client's *legacy* hyper-0.14 stack
+# (rustls 0.21 / rustls-webpki 0.101) alongside the modern one. That older
+# webpki carries unpatched advisories in its 0.101.x series and nothing here
+# uses it: `default-https-client` already provides an HTTPS client on
+# rustls 0.23. See .cargo/audit.toml.
+aws-config = { version = "1.5", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+    "credentials-process",
+    "sso",
+    "credentials-login",
+] }
+aws-sdk-ssm = { version = "1.45", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-kms = { version = "1.40", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+], optional = true }
 aws-smithy-types = "1.2"
 aws-smithy-runtime-api = "1.7"
 
 # WebSocket
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
-tungstenite = "0.26"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Error handling
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Logging
 tracing = "0.1"
@@ -53,49 +85,34 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 
 # Utilities
 bytes = "1.7"
-futures = "0.3"
-pin-project-lite = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 base64 = "0.22"
 sha2 = "0.10"
-uuid = { version = "1.10", features = ["v4", "serde"] }
+uuid = { version = "1.10", features = ["v4"] }
 rand = "0.8"
-url = "2.5"  # URL parsing and validation
-zeroize = { version = "1", features = ["derive"] }  # Zero-on-drop for secrets (token_value)
+url = "2.5"
+zeroize = { version = "1", features = ["derive"] }
 
-# Terminal handling
-crossterm = "0.28"
+# Session encryption (optional)
+aes-gcm = { version = "0.10", optional = true }
+
+# Terminal handling (optional)
+crossterm = { version = "0.28", optional = true }
 
 # Python bindings (optional)
-pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"], optional = true }
-pyo3-async-runtimes = { version = "0.24", features = ["tokio-runtime"], optional = true }
+pyo3 = { version = "0.29", features = ["abi3-py38"], optional = true }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"], optional = true }
 
 [dev-dependencies]
+tokio = { version = "1.40", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-mockall = "0.13"
-tokio-test = "0.4"
-futures-util = "0.3"
+futures = "0.3"
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 proptest = "1.4"
-test-case = "3.3"
 
 [[example]]
-name = "interactive_shell"
+name = "interactive"
 required-features = ["interactive"]
-
-[[example]]
-name = "metrics_session"
-
-[[example]]
-name = "port_forwarding"
-
-[[example]]
-name = "reconnecting"
-
-[[example]]
-name = "session_pool"
-
-[[example]]
-name = "shell_session"
 
 [[bench]]
 name = "throughput"
@@ -106,18 +123,18 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+[package.metadata.docs.rs]
+all-features = false
+features = ["interactive", "kms"]
+
 [lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
 unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
 
 [lints.clippy]
-# Only enable useful lints, disable overly pedantic ones
-# Correctness
 all = { level = "warn", priority = -1 }
-# Style improvements (selective)
-unnested_or_patterns = "allow"
-match_same_arms = "allow"
-redundant_else = "allow"
-# Pedantic (disable most, too noisy for production code)
-pedantic = { level = "allow", priority = -1 }
-# Nursery (disable, unstable)
-nursery = { level = "allow", priority = -1 }
+# Correctness lints worth the noise for a networking library.
+await_holding_lock = "deny"
+undocumented_unsafe_blocks = "deny"

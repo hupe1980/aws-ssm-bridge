@@ -1,0 +1,36 @@
+base_url = "https://hupe1980.github.io/aws-ssm-bridge"
+title = "aws-ssm-bridge"
+description = "A Rust library implementing the AWS Systems Manager Session Manager protocol, with async Python bindings. Open sessions, stream bytes and forward ports without the session-manager-plugin binary."
+
+compile_sass = true
+build_search_index = true
+generate_feeds = false
+minify_html = true
+
+[markdown]
+smart_punctuation = false
+render_emoji = false
+external_links_target_blank = true
+external_links_no_referrer = true
+# Zola emits the heading anchors, so the page works with JavaScript disabled.
+insert_anchor_links = "heading"
+# `> [!NOTE]` / `> [!WARNING]` callouts, which replace the kramdown ones the
+# Jekyll site used.
+github_alerts = true
+
+[markdown.highlighting]
+# Emit CSS classes rather than inline styles, so the palette follows the page
+# theme instead of being baked into every code block at render time.
+style = "class"
+light_theme = "github-light"
+dark_theme = "github-dark"
+
+[search]
+index_format = "elasticlunr_json"
+
+[extra]
+repo = "https://github.com/hupe1980/aws-ssm-bridge"
+crate = "https://crates.io/crates/aws-ssm-bridge"
+docs_rs = "https://docs.rs/aws-ssm-bridge"
+pypi = "https://pypi.org/project/aws-ssm-bridge/"
+author = "hupe1980"

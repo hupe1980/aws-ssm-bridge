@@ -1,542 +1,725 @@
-//! AWS SSM Handshake Protocol Implementation
+//! The SSM agent handshake.
 //!
-//! Implements the 3-phase handshake protocol used by AWS SSM for session initialization:
-//!
-//! 1. **HandshakeRequest** (Agent → Client): Agent sends capabilities and requirements
-//! 2. **HandshakeResponse** (Client → Agent): Client responds with processed actions
-//! 3. **HandshakeComplete** (Agent → Client): Agent confirms handshake completion
-//!
-//! # Protocol Flow
+//! Every modern SSM agent opens a session with a three-message exchange before
+//! any stream data flows:
 //!
 //! ```text
-//! Client                              Agent (EC2)
-//!   │                                    │
-//!   │◄──── HandshakeRequest ─────────────│  (PayloadType 5)
-//!   │      - AgentVersion                │
-//!   │      - RequestedClientActions      │
-//!   │        - KMSEncryption            │
-//!   │        - SessionType              │
-//!   │                                    │
-//!   │───── HandshakeResponse ───────────►│  (PayloadType 6)
-//!   │      - ClientVersion               │
-//!   │      - ProcessedClientActions      │
-//!   │        - ActionStatus (Success/Fail)│
-//!   │                                    │
-//!   │◄──── HandshakeComplete ────────────│  (PayloadType 7)
-//!   │      - HandshakeTimeToComplete     │
-//!   │      - CustomerMessage             │
-//!   │                                    │
-//!   │══════ Session Ready ═══════════════│
+//! agent                                                client
+//!   │── HandshakeRequest (payload type 5) ───────────────►│
+//!   │     AgentVersion, RequestedClientActions            │
+//!   │                                                      │
+//!   │◄─ HandshakeResponse (payload type 6) ───────────────│
+//!   │     ClientVersion, ProcessedClientActions           │
+//!   │                                                      │
+//!   │── HandshakeComplete (payload type 7) ──────────────►│
+//!   │     HandshakeTimeToComplete, CustomerMessage        │
+//!   ╞══════════════ session is ready ═════════════════════╡
 //! ```
+//!
+//! Two actions can be requested:
+//!
+//! * **`SessionType`** — tells the client whether this is a shell, a port
+//!   forward, or an interactive command.  Always supported.
+//! * **`KMSEncryption`** — the account's session preferences require end-to-end
+//!   encryption.  Handled by [`crate::crypto`] when the `kms` feature is
+//!   enabled; otherwise the action is failed with an actionable message rather
+//!   than silently downgrading to an unencrypted session.
+//!
+//! Legacy agents (pre-2.3) send output immediately without a handshake; the
+//! connection layer detects that separately and does not depend on this module.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, warn};
 
-/// SSM session-manager-plugin protocol version this library advertises.
+use crate::errors::{Error, Result};
+
+/// Version this client reports to the agent in its handshake response.
 ///
-/// The AWS SSM agent uses the client version reported in the `HandshakeResponse` to select
-/// the appropriate port-forwarding mode:
-/// - `>= "1.1.70"` enables smux multiplexed port forwarding (`LocalPortForwardingMux`)
-/// - `> "1.2.331.0"` additionally disables agent-side smux keepalive NOP frames
+/// The agent gates protocol features on the *plugin* version string, not on the
+/// crate version:
 ///
-/// This value matches the locally installed `session-manager-plugin` (1.2.814.0) and is
-/// intentionally decoupled from the `aws-ssm-bridge` crate version.
-pub const SSM_PLUGIN_PROTOCOL_VERSION: &str = "1.2.814.0";
+/// | Threshold   | Behaviour unlocked                                |
+/// |-------------|---------------------------------------------------|
+/// | `≥ 1.1.70`  | smux-multiplexed port forwarding                  |
+/// | `> 1.2.331` | agent stops sending smux keep-alive NOP frames    |
+///
+/// It is therefore deliberately decoupled from `CARGO_PKG_VERSION`: bumping the
+/// crate must not change how the agent behaves.
+pub const CLIENT_PROTOCOL_VERSION: &str = "1.2.707.0";
 
-use crate::binary_protocol::{ClientMessage, PayloadType};
-use crate::errors::{Error, ProtocolError, Result};
-use crate::protocol::MessageType;
+// ---------------------------------------------------------------------------
+// Wire types
+// ---------------------------------------------------------------------------
 
-/// Action types that can be requested during handshake
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// An action the agent asks the client to perform during the handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionType {
-    /// KMS encryption setup
+    /// Negotiate a KMS data key for end-to-end session encryption.
     #[serde(rename = "KMSEncryption")]
     KmsEncryption,
-    /// Session type negotiation
+    /// Declare the kind of session being established.
     #[serde(rename = "SessionType")]
     SessionType,
 }
 
-/// Status of a processed action
+/// Outcome of a requested action, as reported back to the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ActionStatus {
-    /// Action completed successfully
+    /// The client performed the action.
     Success = 1,
-    /// Action failed
+    /// The client tried and failed; the agent will end the session.
     Failed = 2,
-    /// Action not supported by client
+    /// The client does not implement the action.
     Unsupported = 3,
 }
 
-impl serde::Serialize for ActionStatus {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_u32(*self as u32)
+impl Serialize for ActionStatus {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_u32(*self as u32)
     }
 }
 
-impl<'de> serde::Deserialize<'de> for ActionStatus {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = u32::deserialize(deserializer)?;
-        match value {
+impl<'de> Deserialize<'de> for ActionStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        match u32::deserialize(d)? {
             1 => Ok(ActionStatus::Success),
             2 => Ok(ActionStatus::Failed),
             3 => Ok(ActionStatus::Unsupported),
-            _ => Err(serde::de::Error::custom(format!(
-                "invalid ActionStatus: {}",
-                value
+            other => Err(serde::de::Error::custom(format!(
+                "invalid ActionStatus {other}"
             ))),
         }
     }
 }
 
-/// Session types supported by SSM
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum SessionTypeValue {
-    /// Standard shell session
-    #[serde(rename = "Standard_Stream")]
+/// The kind of session the agent negotiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NegotiatedSessionType {
+    /// Interactive shell.
     #[default]
     StandardStream,
-    /// Interactive commands (AWS-StartInteractiveCommand)
-    #[serde(rename = "InteractiveCommands")]
+    /// A specific command run interactively.
     InteractiveCommands,
-    /// Port forwarding
-    #[serde(rename = "Port")]
+    /// Port forwarding.
     Port,
 }
 
-/// KMS encryption request from agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KmsEncryptionRequest {
-    /// KMS Key ID for encryption
+impl NegotiatedSessionType {
+    fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "Standard_Stream" => NegotiatedSessionType::StandardStream,
+            "InteractiveCommands" => NegotiatedSessionType::InteractiveCommands,
+            "Port" => NegotiatedSessionType::Port,
+            _ => return None,
+        })
+    }
+}
+
+/// Base64 codec for the handshake's byte-array fields.
+///
+/// The agent is Go, and Go's `encoding/json` renders a `[]byte` as a **base64
+/// string**.  `serde` renders a `Vec<u8>` as an *array of numbers*.  Every field
+/// the reference implementation declares as `[]byte` — `KMSCipherTextKey` and
+/// both `Challenge`s — therefore needs an explicit codec on this side; without
+/// it the agent rejects our handshake response and encrypted sessions never
+/// start.
+mod base64_bytes {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        bytes: &[u8],
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Vec<u8>, D::Error> {
+        // Go writes `null` for a nil slice, which decodes to an empty payload
+        // rather than an error.
+        let Some(encoded) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(Vec::new());
+        };
+        STANDARD
+            .decode(encoded)
+            .map_err(|e| serde::de::Error::custom(format!("field is not valid base64: {e}")))
+    }
+}
+
+/// Parameters of a `KMSEncryption` action.
+#[cfg(feature = "kms")]
+#[derive(Debug, Clone, Deserialize)]
+struct KmsEncryptionRequest {
     #[serde(rename = "KMSKeyId")]
-    pub kms_key_id: String,
+    kms_key_id: String,
 }
 
-/// KMS encryption response to agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KmsEncryptionResponse {
-    /// Encrypted data key (ciphertext blob)
-    #[serde(rename = "KMSCipherTextKey")]
-    pub kms_cipher_text_key: Vec<u8>,
-    /// Optional hash of the cipher text
-    #[serde(rename = "KMSCipherTextHash", skip_serializing_if = "Option::is_none")]
-    pub kms_cipher_text_hash: Option<Vec<u8>>,
+/// Result payload returned for a successful `KMSEncryption` action.
+#[cfg(feature = "kms")]
+#[derive(Debug, Clone, Serialize)]
+struct KmsEncryptionResponse {
+    /// KMS ciphertext blob the agent decrypts to derive the same key pair.
+    #[serde(rename = "KMSCipherTextKey", with = "base64_bytes")]
+    kms_cipher_text_key: Vec<u8>,
 }
 
-/// Session type request from agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionTypeRequest {
-    /// Type of session
+/// Parameters of a `SessionType` action.
+#[derive(Debug, Clone, Deserialize)]
+struct SessionTypeRequest {
     #[serde(rename = "SessionType")]
-    pub session_type: String,
-    /// Additional properties for the session
-    #[serde(rename = "Properties", skip_serializing_if = "Option::is_none")]
-    pub properties: Option<serde_json::Value>,
+    session_type: String,
 }
 
-/// Action requested by agent during handshake
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One entry of `RequestedClientActions`.
+#[derive(Debug, Clone, Deserialize)]
 pub struct RequestedClientAction {
-    /// Type of action
+    /// What the agent wants done.
     #[serde(rename = "ActionType")]
     pub action_type: ActionType,
-    /// Action parameters (JSON)
+    /// Action-specific parameters.
     #[serde(rename = "ActionParameters")]
     pub action_parameters: serde_json::Value,
 }
 
-/// Handshake request sent by agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The agent's handshake request.
+#[derive(Debug, Clone, Deserialize)]
 pub struct HandshakeRequest {
-    /// Agent version string
+    /// Version of the SSM agent on the target.
     #[serde(rename = "AgentVersion")]
     pub agent_version: String,
-    /// Actions requested by agent
+    /// Actions the client must perform before the session starts.
     #[serde(rename = "RequestedClientActions")]
     pub requested_client_actions: Vec<RequestedClientAction>,
 }
 
-/// Result of processing a client action
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One entry of `ProcessedClientActions`.
+#[derive(Debug, Clone, Serialize)]
 pub struct ProcessedClientAction {
-    /// Type of action that was processed
+    /// The action this result refers to.
     #[serde(rename = "ActionType")]
     pub action_type: ActionType,
-    /// Status of the action
+    /// Whether the client performed it.
     #[serde(rename = "ActionStatus")]
     pub action_status: ActionStatus,
-    /// Result of the action (depends on action type)
+    /// Action-specific result data.
     #[serde(rename = "ActionResult", skip_serializing_if = "Option::is_none")]
     pub action_result: Option<serde_json::Value>,
-    /// Error message if action failed
+    /// Why the action failed, when it did.
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Handshake response sent by client
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The client's handshake response.
+#[derive(Debug, Clone, Serialize)]
 pub struct HandshakeResponse {
-    /// Client version string
+    /// Protocol version this client speaks; see [`CLIENT_PROTOCOL_VERSION`].
     #[serde(rename = "ClientVersion")]
     pub client_version: String,
-    /// Processed actions
+    /// One result per requested action, in request order.
     #[serde(rename = "ProcessedClientActions")]
     pub processed_client_actions: Vec<ProcessedClientAction>,
-    /// Errors encountered
-    #[serde(rename = "Errors", skip_serializing_if = "Vec::is_empty", default)]
+    /// Aggregated error strings; the agent surfaces these to the operator.
+    #[serde(rename = "Errors")]
     pub errors: Vec<String>,
 }
 
-/// Handshake completion message from agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The agent's confirmation that the handshake finished.
+#[derive(Debug, Clone, Deserialize)]
 pub struct HandshakeComplete {
-    /// Time taken to complete handshake (nanoseconds)
+    /// How long the agent took, in nanoseconds.
     #[serde(rename = "HandshakeTimeToComplete")]
     pub handshake_time_to_complete: i64,
-    /// Optional customer message to display
-    #[serde(rename = "CustomerMessage", skip_serializing_if = "Option::is_none")]
+    /// Optional message for the operator (e.g. a login banner).
+    ///
+    /// The agent always emits the field and leaves it as `""` when there is no
+    /// banner, so an empty string is normalised to `None` by
+    /// [`HandshakeHandler::on_complete`] rather than surfacing as a blank line.
+    #[serde(rename = "CustomerMessage")]
+    #[serde(default)]
     pub customer_message: Option<String>,
 }
 
-/// Handler for encryption challenges (if KMS is negotiated)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The agent's encryption challenge: proof that both sides derived the same key.
+#[derive(Debug, Clone, Deserialize)]
 pub struct EncryptionChallengeRequest {
-    /// Encrypted challenge data
-    #[serde(rename = "Challenge")]
+    /// Challenge bytes, encrypted with the agent's encryption key.
+    ///
+    /// Base64-encoded on the wire, matching Go's rendering of a `[]byte`.
+    #[serde(rename = "Challenge", with = "base64_bytes")]
     pub challenge: Vec<u8>,
 }
 
-/// Response to encryption challenge
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The client's answer to an [`EncryptionChallengeRequest`].
+#[derive(Debug, Clone, Serialize)]
 pub struct EncryptionChallengeResponse {
-    /// Re-encrypted challenge data
-    #[serde(rename = "Challenge")]
+    /// The same challenge, re-encrypted with the client's encryption key.
+    ///
+    /// Base64-encoded on the wire, matching Go's rendering of a `[]byte`.
+    #[serde(rename = "Challenge", with = "base64_bytes")]
     pub challenge: Vec<u8>,
 }
 
-/// Handshake state machine
+// ---------------------------------------------------------------------------
+// State machine
+// ---------------------------------------------------------------------------
+
+/// Where the handshake has got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeState {
-    /// Waiting for HandshakeRequest from agent
+    /// No `HandshakeRequest` seen yet.
     AwaitingRequest,
-    /// Processing request, preparing response
-    Processing,
-    /// Response sent, waiting for HandshakeComplete
+    /// Response sent; waiting for `HandshakeComplete`.
     AwaitingComplete,
-    /// Handshake completed successfully
+    /// The agent confirmed completion.
     Completed,
-    /// Handshake failed
+    /// An action failed; the agent will terminate the session.
     Failed,
 }
 
-/// Configuration for handshake behavior
-#[derive(Debug, Clone)]
-pub struct HandshakeConfig {
-    /// Client version to report
-    pub client_version: String,
-    /// Supported session types
-    pub supported_session_types: Vec<SessionTypeValue>,
-    /// Timeout for handshake completion
-    pub timeout: Duration,
+/// Everything needed to negotiate a KMS data key, when the session may require one.
+#[cfg(feature = "kms")]
+#[derive(Debug)]
+pub(crate) struct KmsContext {
+    /// KMS client built from the same credentials as the SSM client.
+    pub client: aws_sdk_kms::Client,
+    /// This session's ID; part of the KMS encryption context.
+    pub session_id: String,
+    /// The `StartSession` target; part of the KMS encryption context.
+    pub target_id: String,
 }
 
-impl Default for HandshakeConfig {
-    fn default() -> Self {
-        Self {
-            client_version: SSM_PLUGIN_PROTOCOL_VERSION.to_string(),
-            supported_session_types: vec![
-                SessionTypeValue::StandardStream,
-                SessionTypeValue::InteractiveCommands,
-                SessionTypeValue::Port,
-            ],
-            timeout: Duration::from_secs(30),
-        }
-    }
-}
-
-/// Handshake protocol handler
+/// Drives the handshake and, when the agent asks for it, session encryption.
+#[derive(Debug)]
 pub struct HandshakeHandler {
-    config: HandshakeConfig,
     state: HandshakeState,
-    negotiated_session_type: Option<SessionTypeValue>,
     agent_version: Option<String>,
+    session_type: Option<NegotiatedSessionType>,
+    #[cfg(feature = "kms")]
+    kms: Option<KmsContext>,
+    crypto: Option<Arc<crate::crypto::SessionCrypto>>,
 }
 
 impl HandshakeHandler {
-    /// Create a new handshake handler
-    pub fn new(config: HandshakeConfig) -> Self {
+    /// Create a handler for a session that cannot use KMS encryption.
+    ///
+    /// If the agent requests `KMSEncryption`, the action is failed with a
+    /// message explaining what to change.
+    pub fn new() -> Self {
         Self {
-            config,
             state: HandshakeState::AwaitingRequest,
-            negotiated_session_type: None,
             agent_version: None,
+            session_type: None,
+            #[cfg(feature = "kms")]
+            kms: None,
+            crypto: None,
         }
     }
 
-    /// Get current handshake state
+    /// Create a handler that can negotiate a KMS data key when asked.
+    #[cfg(feature = "kms")]
+    pub(crate) fn with_kms(kms: KmsContext) -> Self {
+        Self {
+            kms: Some(kms),
+            ..Self::new()
+        }
+    }
+
+    /// Current state.
     pub fn state(&self) -> HandshakeState {
         self.state
     }
 
-    /// Get negotiated session type (after handshake completes)
-    pub fn session_type(&self) -> Option<&SessionTypeValue> {
-        self.negotiated_session_type.as_ref()
-    }
-
-    /// Get agent version (after handshake request received)
+    /// Version of the SSM agent, once the request has been seen.
     pub fn agent_version(&self) -> Option<&str> {
         self.agent_version.as_deref()
     }
 
-    /// Process a handshake request and generate response
+    /// Session type the agent negotiated, once the request has been seen.
+    pub fn session_type(&self) -> Option<NegotiatedSessionType> {
+        self.session_type
+    }
+
+    /// The negotiated session cipher, if encryption was enabled.
+    pub fn crypto(&self) -> Option<Arc<crate::crypto::SessionCrypto>> {
+        self.crypto.clone()
+    }
+
+    /// Process a `HandshakeRequest` and produce the response to send back.
     ///
-    /// If we receive a duplicate HandshakeRequest after already sending a response
-    /// (state is AwaitingComplete), we return None to indicate this should be ignored.
-    /// The caller should handle the duplicate silently.
-    #[instrument(skip(self, request))]
-    pub fn process_request(
+    /// Returns `Ok(None)` for a duplicate request received after the response
+    /// was already sent — the agent retransmits until it sees our reply, and
+    /// answering twice would push the state machine out of sync.
+    pub async fn on_request(
         &mut self,
         request: HandshakeRequest,
     ) -> Result<Option<HandshakeResponse>> {
-        // If we're already waiting for HandshakeComplete, ignore duplicate requests
-        // (the agent may be retransmitting before it received our response)
-        if self.state == HandshakeState::AwaitingComplete || self.state == HandshakeState::Completed
-        {
-            debug!(state = ?self.state, "Ignoring duplicate HandshakeRequest");
-            return Ok(None);
+        match self.state {
+            HandshakeState::AwaitingComplete | HandshakeState::Completed => {
+                debug!(state = ?self.state, "ignoring duplicate HandshakeRequest");
+                return Ok(None);
+            }
+            HandshakeState::Failed => {
+                return Err(Error::protocol(
+                    "HandshakeRequest received after the handshake already failed",
+                ));
+            }
+            HandshakeState::AwaitingRequest => {}
         }
-
-        if self.state != HandshakeState::AwaitingRequest {
-            return Err(Error::Protocol(ProtocolError::InvalidMessage(format!(
-                "Invalid state for handshake request: {:?}",
-                self.state
-            ))));
-        }
-
-        self.state = HandshakeState::Processing;
-        self.agent_version = Some(request.agent_version.clone());
 
         info!(
             agent_version = %request.agent_version,
             actions = request.requested_client_actions.len(),
-            "Processing handshake request"
+            "processing agent handshake request"
         );
+        self.agent_version = Some(request.agent_version);
 
-        let mut processed_actions = Vec::new();
+        let mut processed = Vec::with_capacity(request.requested_client_actions.len());
         let mut errors = Vec::new();
 
         for action in &request.requested_client_actions {
-            let processed = self.process_action(action);
-            if processed.action_status == ActionStatus::Failed {
-                if let Some(ref err) = processed.error {
-                    errors.push(err.clone());
-                }
+            let result = match action.action_type {
+                ActionType::SessionType => self.handle_session_type(action),
+                ActionType::KmsEncryption => self.handle_kms_encryption(action).await,
+            };
+            if let Some(message) = &result.error {
+                errors.push(message.clone());
             }
-            processed_actions.push(processed);
+            processed.push(result);
         }
 
-        let response = HandshakeResponse {
-            client_version: self.config.client_version.clone(),
-            processed_client_actions: processed_actions,
-            errors,
+        let any_failed = processed
+            .iter()
+            .any(|a| a.action_status != ActionStatus::Success);
+        self.state = if any_failed {
+            HandshakeState::Failed
+        } else {
+            HandshakeState::AwaitingComplete
         };
 
-        self.state = HandshakeState::AwaitingComplete;
-
-        debug!("Handshake response prepared");
-        Ok(Some(response))
+        Ok(Some(HandshakeResponse {
+            client_version: CLIENT_PROTOCOL_VERSION.to_owned(),
+            processed_client_actions: processed,
+            errors,
+        }))
     }
 
-    /// Process a single action from the handshake request
-    fn process_action(&mut self, action: &RequestedClientAction) -> ProcessedClientAction {
-        match action.action_type {
-            ActionType::KmsEncryption => self.process_kms_action(action),
-            ActionType::SessionType => self.process_session_type_action(action),
+    /// Process a `HandshakeComplete`, returning the agent's operator message.
+    pub fn on_complete(&mut self, complete: HandshakeComplete) -> Result<Option<String>> {
+        if self.state != HandshakeState::AwaitingComplete {
+            return Err(Error::protocol(format!(
+                "HandshakeComplete received in state {:?}",
+                self.state
+            )));
         }
+        self.state = HandshakeState::Completed;
+
+        let elapsed = Duration::from_nanos(complete.handshake_time_to_complete.max(0) as u64);
+        info!(
+            elapsed_ms = elapsed.as_millis(),
+            session_type = ?self.session_type,
+            encrypted = self.crypto.is_some(),
+            "agent handshake complete"
+        );
+        // Go serialises an absent banner as `""`, not as a missing field.
+        Ok(complete.customer_message.filter(|m| !m.is_empty()))
     }
 
-    /// Process KMS encryption action
-    fn process_kms_action(&mut self, _action: &RequestedClientAction) -> ProcessedClientAction {
-        // KMS session encryption is not implemented.  Rather than silently
-        // downgrading to unencrypted transport (which would violate an operator
-        // policy that mandated KMS), we surface a hard error so the caller can
-        // decide whether to abort or reconfigure the SSM session preference.
-        // The caller (`process_request`) propagates this via the `Failed` status
-        // in the HandshakeResponse; the agent will then terminate the session.
-        ProcessedClientAction {
-            action_type: ActionType::KmsEncryption,
-            action_status: ActionStatus::Failed,
-            action_result: None,
-            error: Some(
-                "KMS session encryption is required by the SSM agent but is not implemented \
-                 in this client. To connect without KMS encryption, change the SSM session \
-                 preference document to omit KMS key configuration. Alternatively, use the \
-                 official AWS session-manager-plugin for KMS-encrypted sessions."
-                    .to_string(),
+    /// Answer an encryption challenge: decrypt with our inbound key, re-encrypt
+    /// with our outbound key.  A mismatch here proves the two sides derived
+    /// different keys, which is fatal.
+    pub fn answer_challenge(
+        &self,
+        request: &EncryptionChallengeRequest,
+    ) -> Result<EncryptionChallengeResponse> {
+        let crypto = self.crypto.as_ref().ok_or_else(|| {
+            Error::protocol("agent sent an encryption challenge but no key was negotiated")
+        })?;
+        let plaintext = crypto.decrypt(&request.challenge)?;
+        Ok(EncryptionChallengeResponse {
+            challenge: crypto.encrypt(&plaintext)?.to_vec(),
+        })
+    }
+
+    fn handle_session_type(&mut self, action: &RequestedClientAction) -> ProcessedClientAction {
+        match serde_json::from_value::<SessionTypeRequest>(action.action_parameters.clone()) {
+            Ok(request) => {
+                let negotiated = NegotiatedSessionType::parse(&request.session_type)
+                    .unwrap_or_else(|| {
+                        warn!(
+                            session_type = %request.session_type,
+                            "agent negotiated an unrecognised session type; assuming a shell"
+                        );
+                        NegotiatedSessionType::StandardStream
+                    });
+                debug!(?negotiated, "session type negotiated");
+                self.session_type = Some(negotiated);
+                success(ActionType::SessionType, None)
+            }
+            Err(e) => failure(
+                ActionType::SessionType,
+                format!("could not parse SessionType parameters: {e}"),
             ),
         }
     }
 
-    /// Process session type action
-    fn process_session_type_action(
+    #[cfg(feature = "kms")]
+    async fn handle_kms_encryption(
         &mut self,
         action: &RequestedClientAction,
     ) -> ProcessedClientAction {
-        let session_req: std::result::Result<SessionTypeRequest, _> =
-            serde_json::from_value(action.action_parameters.clone());
+        let Some(kms) = self.kms.as_ref() else {
+            return failure(
+                ActionType::KmsEncryption,
+                "this session was created without a KMS client, so session encryption \
+                 cannot be negotiated"
+                    .to_owned(),
+            );
+        };
 
-        match session_req {
-            Ok(req) => {
-                info!(session_type = %req.session_type, "Session type requested");
-
-                // Map session type string to enum
-                let session_type = match req.session_type.as_str() {
-                    "Standard_Stream" => SessionTypeValue::StandardStream,
-                    "InteractiveCommands" => SessionTypeValue::InteractiveCommands,
-                    "Port" => SessionTypeValue::Port,
-                    other => {
-                        warn!(
-                            session_type = other,
-                            "Unknown session type, defaulting to StandardStream"
-                        );
-                        SessionTypeValue::StandardStream
-                    }
-                };
-
-                self.negotiated_session_type = Some(session_type);
-
-                ProcessedClientAction {
-                    action_type: ActionType::SessionType,
-                    action_status: ActionStatus::Success,
-                    action_result: None,
-                    error: None,
+        let request: KmsEncryptionRequest =
+            match serde_json::from_value(action.action_parameters.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    return failure(
+                        ActionType::KmsEncryption,
+                        format!("could not parse KMSEncryption parameters: {e}"),
+                    )
                 }
+            };
+
+        info!(kms_key_id = %request.kms_key_id, "negotiating session encryption key");
+        match crate::crypto::SessionCrypto::negotiate(
+            &kms.client,
+            &request.kms_key_id,
+            &kms.session_id,
+            &kms.target_id,
+        )
+        .await
+        {
+            Ok(crypto) => {
+                let blob = crypto.cipher_text_blob().to_vec();
+                self.crypto = Some(Arc::new(crypto));
+                let result = serde_json::to_value(KmsEncryptionResponse {
+                    kms_cipher_text_key: blob,
+                })
+                .expect("KmsEncryptionResponse always serializes");
+                success(ActionType::KmsEncryption, Some(result))
             }
-            Err(e) => {
-                warn!(error = %e, "Failed to parse session type request");
-                ProcessedClientAction {
-                    action_type: ActionType::SessionType,
-                    action_status: ActionStatus::Failed,
-                    action_result: None,
-                    error: Some(format!("Failed to parse session type: {}", e)),
-                }
-            }
+            Err(e) => failure(
+                ActionType::KmsEncryption,
+                format!(
+                    "kms:GenerateDataKey failed for key {}: {e}. The caller needs \
+                     kms:GenerateDataKey on this key, and the target's instance profile \
+                     needs kms:Decrypt.",
+                    request.kms_key_id
+                ),
+            ),
         }
     }
 
-    /// Process handshake complete message
-    #[instrument(skip(self, complete))]
-    pub fn process_complete(&mut self, complete: HandshakeComplete) -> Result<()> {
-        if self.state != HandshakeState::AwaitingComplete {
-            return Err(Error::Protocol(ProtocolError::InvalidMessage(format!(
-                "Invalid state for handshake complete: {:?}",
-                self.state
-            ))));
+    #[cfg(not(feature = "kms"))]
+    async fn handle_kms_encryption(
+        &mut self,
+        _action: &RequestedClientAction,
+    ) -> ProcessedClientAction {
+        ProcessedClientAction {
+            action_type: ActionType::KmsEncryption,
+            action_status: ActionStatus::Unsupported,
+            action_result: None,
+            error: Some(
+                "this build of aws-ssm-bridge was compiled without the `kms` feature, but the \
+                 session preferences require encrypted sessions. Rebuild with `--features kms`, \
+                 or disable \"Encrypt session data\" in the Session Manager preferences."
+                    .to_owned(),
+            ),
         }
-
-        let duration = Duration::from_nanos(complete.handshake_time_to_complete as u64);
-
-        info!(
-            duration_ms = duration.as_millis(),
-            customer_message = ?complete.customer_message,
-            "Handshake completed"
-        );
-
-        if let Some(msg) = &complete.customer_message {
-            info!(message = %msg, "Customer message received");
-        }
-
-        self.state = HandshakeState::Completed;
-        Ok(())
     }
+}
 
-    /// Serialize handshake response to binary protocol message
-    pub fn response_to_message(
-        &self,
-        response: &HandshakeResponse,
-        sequence_number: i64,
-    ) -> Result<ClientMessage> {
-        let payload = serde_json::to_vec(response).map_err(|e| {
-            Error::Protocol(ProtocolError::Framing(format!(
-                "Failed to serialize response: {}",
-                e
-            )))
-        })?;
-
-        Ok(ClientMessage::new(
-            MessageType::InputStreamData,
-            sequence_number,
-            PayloadType::HandshakeResponse,
-            Bytes::from(payload),
-        ))
+impl Default for HandshakeHandler {
+    fn default() -> Self {
+        Self::new()
     }
+}
 
-    /// Parse handshake request from binary protocol message
-    pub fn parse_request(message: &ClientMessage) -> Result<HandshakeRequest> {
-        if message.payload_type != PayloadType::HandshakeRequest {
-            return Err(Error::Protocol(ProtocolError::InvalidMessage(format!(
-                "Expected HandshakeRequest, got {:?}",
-                message.payload_type
-            ))));
-        }
-
-        serde_json::from_slice(&message.payload).map_err(|e| {
-            Error::Protocol(ProtocolError::Framing(format!(
-                "Failed to parse HandshakeRequest: {}",
-                e
-            )))
-        })
+fn success(action_type: ActionType, result: Option<serde_json::Value>) -> ProcessedClientAction {
+    ProcessedClientAction {
+        action_type,
+        action_status: ActionStatus::Success,
+        action_result: result,
+        error: None,
     }
+}
 
-    /// Parse handshake complete from binary protocol message
-    pub fn parse_complete(message: &ClientMessage) -> Result<HandshakeComplete> {
-        if message.payload_type != PayloadType::HandshakeComplete {
-            return Err(Error::Protocol(ProtocolError::InvalidMessage(format!(
-                "Expected HandshakeComplete, got {:?}",
-                message.payload_type
-            ))));
-        }
-
-        serde_json::from_slice(&message.payload).map_err(|e| {
-            Error::Protocol(ProtocolError::Framing(format!(
-                "Failed to parse HandshakeComplete: {}",
-                e
-            )))
-        })
+fn failure(action_type: ActionType, message: String) -> ProcessedClientAction {
+    warn!(?action_type, %message, "handshake action failed");
+    ProcessedClientAction {
+        action_type,
+        action_status: ActionStatus::Failed,
+        action_result: None,
+        error: Some(message),
     }
+}
+
+/// Serialize a handshake response into the payload of a stream-data message.
+pub(crate) fn response_payload(response: &HandshakeResponse) -> Result<Bytes> {
+    Ok(Bytes::from(serde_json::to_vec(response)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn session_type_request(kind: &str) -> HandshakeRequest {
+        HandshakeRequest {
+            agent_version: "3.3.1345.0".to_owned(),
+            requested_client_actions: vec![RequestedClientAction {
+                action_type: ActionType::SessionType,
+                action_parameters: serde_json::json!({ "SessionType": kind }),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn happy_path_reaches_completed() {
+        let mut handler = HandshakeHandler::new();
+        assert_eq!(handler.state(), HandshakeState::AwaitingRequest);
+
+        let response = handler
+            .on_request(session_type_request("Port"))
+            .await
+            .unwrap()
+            .expect("a response is required");
+        assert_eq!(handler.state(), HandshakeState::AwaitingComplete);
+        assert_eq!(response.client_version, CLIENT_PROTOCOL_VERSION);
+        assert_eq!(
+            response.processed_client_actions[0].action_status,
+            ActionStatus::Success
+        );
+        assert_eq!(handler.session_type(), Some(NegotiatedSessionType::Port));
+        assert_eq!(handler.agent_version(), Some("3.3.1345.0"));
+
+        let banner = handler
+            .on_complete(HandshakeComplete {
+                handshake_time_to_complete: 1_500_000,
+                customer_message: Some("Welcome".into()),
+            })
+            .unwrap();
+        assert_eq!(handler.state(), HandshakeState::Completed);
+        assert_eq!(banner.as_deref(), Some("Welcome"));
+    }
+
+    /// The agent retransmits its request until it sees a response; answering a
+    /// duplicate would send a second response and desynchronise the exchange.
+    #[tokio::test]
+    async fn duplicate_request_is_ignored() {
+        let mut handler = HandshakeHandler::new();
+        assert!(handler
+            .on_request(session_type_request("Standard_Stream"))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(handler
+            .on_request(session_type_request("Standard_Stream"))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(handler.state(), HandshakeState::AwaitingComplete);
+    }
+
+    #[tokio::test]
+    async fn unknown_session_type_falls_back_to_shell() {
+        let mut handler = HandshakeHandler::new();
+        handler
+            .on_request(session_type_request("Telepathy"))
+            .await
+            .unwrap();
+        assert_eq!(
+            handler.session_type(),
+            Some(NegotiatedSessionType::StandardStream)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_action_parameters_fail_the_handshake() {
+        let mut handler = HandshakeHandler::new();
+        let response = handler
+            .on_request(HandshakeRequest {
+                agent_version: "3.0.0.0".into(),
+                requested_client_actions: vec![RequestedClientAction {
+                    action_type: ActionType::SessionType,
+                    action_parameters: serde_json::json!({ "Nope": 1 }),
+                }],
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            response.processed_client_actions[0].action_status,
+            ActionStatus::Failed
+        );
+        assert!(!response.errors.is_empty());
+        assert_eq!(handler.state(), HandshakeState::Failed);
+    }
+
+    /// Without a KMS client the action must fail loudly. Silently continuing
+    /// would produce an unencrypted session in an account that mandated
+    /// encryption — the one outcome an operator must never get.
+    #[tokio::test]
+    async fn kms_without_a_client_fails_rather_than_downgrading() {
+        let mut handler = HandshakeHandler::new();
+        let response = handler
+            .on_request(HandshakeRequest {
+                agent_version: "3.0.0.0".into(),
+                requested_client_actions: vec![RequestedClientAction {
+                    action_type: ActionType::KmsEncryption,
+                    action_parameters: serde_json::json!({
+                        "KMSKeyId": "arn:aws:kms:us-east-1:111122223333:key/abc"
+                    }),
+                }],
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(
+            response.processed_client_actions[0].action_status,
+            ActionStatus::Success
+        );
+        assert!(handler.crypto().is_none());
+        assert_eq!(handler.state(), HandshakeState::Failed);
+    }
+
+    #[tokio::test]
+    async fn complete_out_of_order_is_rejected() {
+        let mut handler = HandshakeHandler::new();
+        assert!(handler
+            .on_complete(HandshakeComplete {
+                handshake_time_to_complete: 0,
+                customer_message: None,
+            })
+            .is_err());
+    }
+
     #[test]
-    fn test_handshake_request_parsing() {
+    fn request_parses_the_agent_wire_format() {
         let json = r#"{
-            "AgentVersion": "3.0.0",
+            "AgentVersion": "3.3.1345.0",
             "RequestedClientActions": [
-                {
-                    "ActionType": "SessionType",
-                    "ActionParameters": {
-                        "SessionType": "Standard_Stream"
-                    }
-                }
+                {"ActionType": "SessionType",
+                 "ActionParameters": {"SessionType": "Port", "Properties": {"portNumber": "22"}}}
             ]
         }"#;
-
         let request: HandshakeRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(request.agent_version, "3.0.0");
-        assert_eq!(request.requested_client_actions.len(), 1);
+        assert_eq!(request.agent_version, "3.3.1345.0");
         assert_eq!(
             request.requested_client_actions[0].action_type,
             ActionType::SessionType
@@ -544,129 +727,106 @@ mod tests {
     }
 
     #[test]
-    fn test_handshake_response_serialization() {
+    fn response_serializes_to_the_shape_the_agent_expects() {
         let response = HandshakeResponse {
-            client_version: "0.1.0".to_string(),
-            processed_client_actions: vec![ProcessedClientAction {
-                action_type: ActionType::SessionType,
-                action_status: ActionStatus::Success,
-                action_result: None,
-                error: None,
-            }],
+            client_version: CLIENT_PROTOCOL_VERSION.to_owned(),
+            processed_client_actions: vec![success(ActionType::SessionType, None)],
             errors: vec![],
         };
+        let json: serde_json::Value =
+            serde_json::from_slice(&response_payload(&response).unwrap()).unwrap();
+        assert_eq!(json["ClientVersion"], CLIENT_PROTOCOL_VERSION);
+        assert_eq!(
+            json["ProcessedClientActions"][0]["ActionType"],
+            "SessionType"
+        );
+        // ActionStatus is a number on the wire, not a string.
+        assert_eq!(json["ProcessedClientActions"][0]["ActionStatus"], 1);
+        assert!(json["Errors"].is_array());
+    }
 
+    #[test]
+    fn complete_tolerates_a_missing_customer_message() {
+        let complete: HandshakeComplete =
+            serde_json::from_str(r#"{"HandshakeTimeToComplete": 42}"#).unwrap();
+        assert_eq!(complete.customer_message, None);
+    }
+
+    /// Go renders an absent banner as `""`, so a blank line would otherwise be
+    /// printed above every shell prompt.
+    #[tokio::test]
+    async fn an_empty_customer_message_is_not_a_banner() {
+        let mut handler = HandshakeHandler::new();
+        handler
+            .on_request(session_type_request("Standard_Stream"))
+            .await
+            .unwrap();
+        let banner = handler
+            .on_complete(HandshakeComplete {
+                handshake_time_to_complete: 1,
+                customer_message: Some(String::new()),
+            })
+            .unwrap();
+        assert_eq!(banner, None);
+    }
+
+    /// Go's `encoding/json` renders `[]byte` as base64. serde would render
+    /// `Vec<u8>` as `[1,2,3]`, which the agent rejects outright — so this is the
+    /// difference between working and broken session encryption, in both
+    /// directions.
+    #[test]
+    fn byte_array_fields_use_base64_not_a_number_array() {
+        let response = EncryptionChallengeResponse {
+            challenge: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
         let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("ClientVersion"));
-        assert!(json.contains("ProcessedClientActions"));
+        assert_eq!(json, r#"{"Challenge":"3q2+7w=="}"#);
+
+        let request: EncryptionChallengeRequest =
+            serde_json::from_str(r#"{"Challenge":"3q2+7w=="}"#).unwrap();
+        assert_eq!(request.challenge, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]
-    fn test_handshake_complete_parsing() {
-        let json = r#"{
-            "HandshakeTimeToComplete": 1000000000,
-            "CustomerMessage": "Welcome to SSM"
-        }"#;
+    fn a_null_byte_array_decodes_to_an_empty_payload() {
+        let request: EncryptionChallengeRequest =
+            serde_json::from_str(r#"{"Challenge":null}"#).unwrap();
+        assert!(request.challenge.is_empty());
+    }
 
-        let complete: HandshakeComplete = serde_json::from_str(json).unwrap();
-        assert_eq!(complete.handshake_time_to_complete, 1_000_000_000);
-        assert_eq!(
-            complete.customer_message,
-            Some("Welcome to SSM".to_string())
+    #[test]
+    fn a_non_base64_challenge_is_rejected_rather_than_silently_empty() {
+        assert!(
+            serde_json::from_str::<EncryptionChallengeRequest>(r#"{"Challenge":"!!!!"}"#).is_err()
+        );
+        // An int array is exactly what the old, broken encoding produced.
+        assert!(
+            serde_json::from_str::<EncryptionChallengeRequest>(r#"{"Challenge":[1,2,3]}"#).is_err()
         );
     }
 
+    #[cfg(feature = "kms")]
     #[test]
-    fn test_handshake_state_machine() {
-        let config = HandshakeConfig::default();
-        let mut handler = HandshakeHandler::new(config);
-
-        assert_eq!(handler.state(), HandshakeState::AwaitingRequest);
-
-        // Simulate handshake request
-        let request = HandshakeRequest {
-            agent_version: "3.0.0".to_string(),
-            requested_client_actions: vec![RequestedClientAction {
-                action_type: ActionType::SessionType,
-                action_parameters: serde_json::json!({
-                    "SessionType": "Standard_Stream"
-                }),
-            }],
-        };
-
-        let response = handler
-            .process_request(request)
-            .unwrap()
-            .expect("Should return response");
-        assert_eq!(handler.state(), HandshakeState::AwaitingComplete);
-        assert_eq!(response.processed_client_actions.len(), 1);
-        assert_eq!(
-            response.processed_client_actions[0].action_status,
-            ActionStatus::Success
-        );
-
-        // Simulate handshake complete
-        let complete = HandshakeComplete {
-            handshake_time_to_complete: 500_000_000,
-            customer_message: Some("Session ready".to_string()),
-        };
-
-        handler.process_complete(complete).unwrap();
-        assert_eq!(handler.state(), HandshakeState::Completed);
-        assert!(handler.session_type().is_some());
+    fn the_kms_ciphertext_blob_is_base64_in_the_handshake_response() {
+        let json = serde_json::to_string(&KmsEncryptionResponse {
+            kms_cipher_text_key: b"blob".to_vec(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"KMSCipherTextKey":"YmxvYg=="}"#);
     }
 
+    /// The advertised version gates smux port forwarding on the agent side, so
+    /// it must stay above the thresholds documented on the constant.
     #[test]
-    fn test_kms_unsupported() {
-        let config = HandshakeConfig::default();
-        let mut handler = HandshakeHandler::new(config);
-
-        let request = HandshakeRequest {
-            agent_version: "3.0.0".to_string(),
-            requested_client_actions: vec![RequestedClientAction {
-                action_type: ActionType::KmsEncryption,
-                action_parameters: serde_json::json!({
-                    "KMSKeyId": "arn:aws:kms:us-east-1:123456789:key/abc"
-                }),
-            }],
-        };
-
-        let response = handler
-            .process_request(request)
-            .unwrap()
-            .expect("Should return response");
-        // KMS is never supported — always returns Failed so the agent terminates the session.
-        assert_eq!(
-            response.processed_client_actions[0].action_status,
-            ActionStatus::Failed
+    fn client_version_unlocks_smux_multiplexing() {
+        let parts: Vec<u32> = CLIENT_PROTOCOL_VERSION
+            .split('.')
+            .map(|p| p.parse().unwrap())
+            .collect();
+        assert_eq!(parts.len(), 4, "expected a four-part version");
+        assert!(
+            (parts[0], parts[1], parts[2]) > (1, 2, 331),
+            "{CLIENT_PROTOCOL_VERSION} must exceed 1.2.331 to disable agent keep-alives"
         );
-        assert!(response.processed_client_actions[0].error.is_some());
-    }
-
-    #[test]
-    fn test_duplicate_request_ignored() {
-        let config = HandshakeConfig::default();
-        let mut handler = HandshakeHandler::new(config);
-
-        let request = HandshakeRequest {
-            agent_version: "3.0.0".to_string(),
-            requested_client_actions: vec![RequestedClientAction {
-                action_type: ActionType::SessionType,
-                action_parameters: serde_json::json!({
-                    "SessionType": "Standard_Stream"
-                }),
-            }],
-        };
-
-        // First request should return a response
-        let response = handler.process_request(request.clone()).unwrap();
-        assert!(response.is_some());
-        assert_eq!(handler.state(), HandshakeState::AwaitingComplete);
-
-        // Second (duplicate) request should return None
-        let duplicate_response = handler.process_request(request).unwrap();
-        assert!(duplicate_response.is_none());
-        // State should still be AwaitingComplete
-        assert_eq!(handler.state(), HandshakeState::AwaitingComplete);
     }
 }

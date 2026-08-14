@@ -1,175 +1,99 @@
-use aws_ssm_bridge::binary_protocol::{ClientMessage, PayloadType};
-use aws_ssm_bridge::errors::*;
-use aws_ssm_bridge::protocol::MessageType;
+//! Micro-benchmarks for the hot path: framing, digests and reordering.
+//!
+//! ```sh
+//! cargo bench
+//! ```
+//!
+//! These cover the per-message work the data channel does for every chunk.
+//! Anything above them is dominated by network latency and is not meaningful
+//! to benchmark locally.
+
+// criterion's macros generate undocumented items.
+#![allow(missing_docs)]
+
+use aws_ssm_bridge::ack::{build_ack, IncomingBuffer, OutgoingBuffer, RttEstimate};
+use aws_ssm_bridge::binary_protocol::{ClientMessage, MessageType, PayloadType};
 use bytes::Bytes;
-/// Performance benchmarks for aws-ssm-bridge
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 use std::time::Duration;
 
-/// Benchmark binary message serialization
-fn bench_message_serialization(c: &mut Criterion) {
-    let mut group = c.benchmark_group("message_serialization");
+/// Payload sizes spanning a keystroke, the default chunk, and a bulk transfer.
+const SIZES: [usize; 5] = [1, 64, 1024, 8192, 32768];
 
-    // Benchmark different payload sizes
-    for size in [64, 256, 1024, 4096, 16384].iter() {
-        let payload = vec![0u8; *size];
-        group.throughput(Throughput::Bytes(*size as u64));
+fn message(size: usize) -> ClientMessage {
+    ClientMessage::new(
+        MessageType::InputStreamData,
+        1,
+        PayloadType::Output,
+        Bytes::from(vec![0x5A; size]),
+    )
+}
 
-        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &_size| {
-            b.iter(|| {
-                let msg = ClientMessage::new(
-                    MessageType::InputStreamData,
-                    black_box(1),
-                    PayloadType::Output,
-                    black_box(Bytes::from(payload.clone())),
-                );
-                black_box(msg.serialize().unwrap())
-            });
+fn serialize(c: &mut Criterion) {
+    let mut group = c.benchmark_group("serialize");
+    for size in SIZES {
+        let msg = message(size);
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
+            b.iter(|| black_box(msg.serialize()));
         });
     }
-
     group.finish();
 }
 
-/// Benchmark binary message deserialization
-fn bench_message_deserialization(c: &mut Criterion) {
-    let mut group = c.benchmark_group("message_deserialization");
-
-    for size in [64, 256, 1024, 4096, 16384].iter() {
-        let payload = vec![0u8; *size];
-        let msg = ClientMessage::new(
-            MessageType::InputStreamData,
-            1,
-            PayloadType::Output,
-            Bytes::from(payload),
-        );
-        let serialized = msg.serialize().unwrap();
-
-        group.throughput(Throughput::Bytes(*size as u64));
-
-        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &_size| {
-            b.iter(|| {
-                let parsed = ClientMessage::deserialize(black_box(serialized.clone())).unwrap();
-                black_box(parsed)
-            });
+fn deserialize(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deserialize");
+    for size in SIZES {
+        let wire = message(size).serialize();
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
+            // Includes SHA-256 verification, which dominates at larger sizes.
+            b.iter(|| black_box(ClientMessage::deserialize(wire.clone()).unwrap()));
         });
     }
-
     group.finish();
 }
 
-/// Benchmark Base64 encoding/decoding (still used in some JSON payloads)
-fn bench_base64_operations(c: &mut Criterion) {
-    use base64::Engine;
-    let mut group = c.benchmark_group("base64_operations");
-
-    for size in [64, 256, 1024, 4096, 16384].iter() {
-        let data = vec![0u8; *size];
-        group.throughput(Throughput::Bytes(*size as u64));
-
-        // Encoding
-        group.bench_with_input(BenchmarkId::new("encode", size), size, |b, &_size| {
-            b.iter(|| {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(black_box(&data));
-                black_box(encoded)
-            });
-        });
-
-        // Decoding
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
-        group.bench_with_input(BenchmarkId::new("decode", size), size, |b, &_size| {
-            b.iter(|| {
-                let decoded = base64::engine::general_purpose::STANDARD.decode(black_box(&encoded));
-                black_box(decoded)
-            });
-        });
-    }
-
-    group.finish();
+fn acknowledge(c: &mut Criterion) {
+    let received = message(1024);
+    c.bench_function("build_ack", |b| {
+        b.iter(|| black_box(build_ack(&received, true).unwrap()));
+    });
 }
 
-/// Benchmark error classification
-fn bench_error_classification(c: &mut Criterion) {
-    let mut group = c.benchmark_group("error_classification");
+fn reliability(c: &mut Criterion) {
+    let wire = message(1024).serialize();
 
-    group.bench_function("is_retriable_timeout", |b| {
-        let error = Error::Timeout;
-        b.iter(|| black_box(error.is_retriable()));
+    c.bench_function("outgoing_track_then_ack", |b| {
+        let buffer = OutgoingBuffer::new(10_000, 3000);
+        let mut sequence = 0i64;
+        b.iter(|| {
+            assert!(buffer.track(wire.clone(), sequence));
+            assert!(buffer.acknowledge(sequence));
+            sequence += 1;
+        });
     });
 
-    group.bench_function("is_fatal_transport", |b| {
-        let error = Error::Transport(TransportError::HeartbeatTimeout);
-        b.iter(|| black_box(error.is_fatal()));
+    c.bench_function("incoming_reorder_roundtrip", |b| {
+        let buffer = IncomingBuffer::new(10_000);
+        let mut sequence = 0i64;
+        b.iter(|| {
+            let mut msg = message(64);
+            msg.sequence_number = sequence;
+            assert!(buffer.insert(msg));
+            black_box(buffer.take(sequence));
+            sequence += 1;
+        });
     });
 
-    group.finish();
-}
-
-/// Benchmark SHA-256 digest computation (used for message integrity)
-fn bench_sha256_digest(c: &mut Criterion) {
-    use sha2::{Digest, Sha256};
-    let mut group = c.benchmark_group("sha256_digest");
-
-    for size in [64, 256, 1024, 4096, 16384].iter() {
-        let data = vec![0u8; *size];
-        group.throughput(Throughput::Bytes(*size as u64));
-
-        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &_size| {
-            b.iter(|| {
-                let mut hasher = Sha256::new();
-                hasher.update(black_box(&data));
-                black_box(hasher.finalize())
-            });
+    c.bench_function("rtt_estimate_update", |b| {
+        let mut rtt = RttEstimate::default();
+        b.iter(|| {
+            rtt.record(black_box(Duration::from_micros(1234)));
         });
-    }
-
-    group.finish();
+    });
 }
 
-/// Benchmark message validation (digest verification)
-fn bench_message_validation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("message_validation");
-
-    for size in [64, 256, 1024, 4096, 16384].iter() {
-        let payload = vec![0u8; *size];
-        let msg = ClientMessage::new(
-            MessageType::OutputStreamData,
-            1,
-            PayloadType::Output,
-            Bytes::from(payload),
-        );
-
-        group.throughput(Throughput::Bytes(*size as u64));
-
-        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &_size| {
-            b.iter(|| {
-                msg.validate().unwrap();
-                black_box(())
-            });
-        });
-    }
-
-    group.finish();
-}
-
-/// Configuration for benchmarks
-fn configure_benchmarks() -> Criterion {
-    Criterion::default()
-        .sample_size(100)
-        .measurement_time(Duration::from_secs(5))
-        .warm_up_time(Duration::from_secs(2))
-}
-
-criterion_group! {
-    name = benches;
-    config = configure_benchmarks();
-    targets =
-        bench_message_serialization,
-        bench_message_deserialization,
-        bench_base64_operations,
-        bench_error_classification,
-        bench_sha256_digest,
-        bench_message_validation
-}
-
+criterion_group!(benches, serialize, deserialize, acknowledge, reliability);
 criterion_main!(benches);

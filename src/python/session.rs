@@ -1,470 +1,552 @@
-//! Python bindings for session management
+//! Session, output stream and port forwarder bindings.
 
-use crate::{SessionConfig, SessionManager, SessionState, SessionType};
-use pyo3::prelude::*;
-use pyo3_async_runtimes::tokio::future_into_py;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+
+use pyo3::prelude::*;
+use pyo3::types::PyBytes;
+use pyo3_async_runtimes::tokio::future_into_py;
 
 use super::to_py_err;
+use crate::documents::SessionType;
+use crate::{
+    DocumentSpec, OutputStream, PortForwardConfig, PortForwarder, Session, SessionConfig,
+    SessionManager, ShutdownSignal,
+};
 
-/// Python wrapper for SessionType
-#[pyclass(name = "SessionType")]
-#[derive(Clone)]
-pub struct PySessionType {
-    inner: SessionType,
+/// Starts SSM sessions.
+///
+/// ```python
+/// manager = await SessionManager.new(region="eu-central-1")
+/// session = await manager.start_session("i-0123456789abcdef0")
+/// ```
+#[pyclass(name = "SessionManager", frozen)]
+#[derive(Debug)]
+pub struct PySessionManager {
+    inner: SessionManager,
 }
 
 #[pymethods]
-impl PySessionType {
-    /// Standard shell session
-    #[classattr]
-    const STANDARD_STREAM: &'static str = "standard_stream";
-
-    /// Port forwarding session
-    #[classattr]
-    const PORT: &'static str = "port";
-
-    /// Interactive commands (AWS-StartInteractiveCommand)
-    #[classattr]
-    const INTERACTIVE_COMMANDS: &'static str = "interactive_commands";
-
-    #[new]
-    fn new(session_type: &str) -> PyResult<Self> {
-        let inner = match session_type {
-            "standard_stream" => SessionType::StandardStream,
-            "port" => SessionType::Port,
-            "interactive_commands" => SessionType::InteractiveCommands,
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid session type: '{}'. Valid types: 'standard_stream', 'port', 'interactive_commands'",
-                    session_type
-                )))
+impl PySessionManager {
+    /// Build a manager, optionally pinned to a region.
+    ///
+    /// Credentials come from the standard AWS chain: environment variables,
+    /// `~/.aws/config`, SSO, or instance metadata.
+    #[staticmethod]
+    #[pyo3(signature = (region = None))]
+    #[allow(clippy::new_ret_no_self)]
+    fn new(py: Python<'_>, region: Option<String>) -> PyResult<Bound<'_, PyAny>> {
+        future_into_py(py, async move {
+            let inner = match region {
+                Some(region) => SessionManager::for_region(region).await,
+                None => SessionManager::new().await,
             }
-        };
-
-        Ok(Self { inner })
+            .map_err(to_py_err)?;
+            Ok(PySessionManager { inner })
+        })
     }
 
-    fn __repr__(&self) -> String {
-        format!("SessionType({:?})", self.inner)
-    }
-}
-
-/// Python wrapper for SessionConfig
-#[pyclass(name = "SessionConfig")]
-#[derive(Clone)]
-pub struct PySessionConfig {
-    inner: SessionConfig,
-}
-
-#[pymethods]
-impl PySessionConfig {
-    #[new]
-    #[pyo3(signature = (target, region=None, session_type=None, document_name=None, parameters=None, reason=None))]
-    fn new(
+    /// Start a session.
+    ///
+    /// Args:
+    ///     target: instance ID, `mi-` managed instance, `ecs:` task or ARN.
+    ///     document_name: SSM document, e.g. `AWS-StartInteractiveCommand`.
+    ///         Omit for a plain shell.
+    ///     parameters: document parameters, `{"portNumber": ["3306"]}`.
+    ///     reason: recorded in CloudTrail.
+    ///     ready_timeout: seconds to wait for the agent handshake.
+    #[pyo3(signature = (
+        target,
+        document_name = None,
+        parameters = None,
+        reason = None,
+        ready_timeout = 30.0,
+    ))]
+    fn start_session<'py>(
+        &self,
+        py: Python<'py>,
         target: String,
-        region: Option<String>,
-        session_type: Option<PySessionType>,
         document_name: Option<String>,
         parameters: Option<HashMap<String, Vec<String>>>,
         reason: Option<String>,
-    ) -> Self {
-        let inner = SessionConfig {
-            target,
-            region,
-            session_type: session_type
-                .map(|t| t.inner)
-                .unwrap_or(SessionType::StandardStream),
-            document_name,
-            parameters: parameters.unwrap_or_default(),
+        ready_timeout: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let manager = self.inner.clone();
+        let config = build_config(target, document_name, parameters, reason, ready_timeout)?;
+
+        future_into_py(py, async move {
+            let session = manager.start_session(config).await.map_err(to_py_err)?;
+            Ok(PySession {
+                inner: Arc::new(session),
+            })
+        })
+    }
+
+    /// Start a port-forwarding session to a port on the instance itself.
+    #[pyo3(signature = (target, remote_port, reason = None))]
+    fn start_port_forward<'py>(
+        &self,
+        py: Python<'py>,
+        target: String,
+        remote_port: u16,
+        reason: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let manager = self.inner.clone();
+        let config = SessionConfig {
+            document: Some(DocumentSpec::new(
+                &crate::documents::PortForwardingSession::new(remote_port),
+            )),
             reason,
-            ..Default::default() // Uses default timeouts
+            ..SessionConfig::new(target)
         };
-
-        Self { inner }
+        future_into_py(py, async move {
+            let session = manager.start_session(config).await.map_err(to_py_err)?;
+            Ok(PySession {
+                inner: Arc::new(session),
+            })
+        })
     }
 
-    #[getter]
-    fn target(&self) -> String {
-        self.inner.target.clone()
+    /// Start a port-forwarding session that reaches `host:remote_port` through
+    /// the target instance.
+    #[pyo3(signature = (target, host, remote_port, reason = None))]
+    fn start_remote_port_forward<'py>(
+        &self,
+        py: Python<'py>,
+        target: String,
+        host: String,
+        remote_port: u16,
+        reason: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let manager = self.inner.clone();
+        let config = SessionConfig {
+            document: Some(DocumentSpec::new(
+                &crate::documents::PortForwardingToRemoteHost::new(host, remote_port),
+            )),
+            reason,
+            ..SessionConfig::new(target)
+        };
+        future_into_py(py, async move {
+            let session = manager.start_session(config).await.map_err(to_py_err)?;
+            Ok(PySession {
+                inner: Arc::new(session),
+            })
+        })
     }
 
-    #[getter]
-    fn region(&self) -> Option<String> {
-        self.inner.region.clone()
+    /// Terminate a session by ID without holding a session object.
+    fn terminate_session<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let manager = self.inner.clone();
+        future_into_py(py, async move {
+            manager
+                .terminate_session(&session_id)
+                .await
+                .map_err(to_py_err)
+        })
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "SessionConfig(target='{}', region={:?})",
-            self.inner.target, self.inner.region
-        )
+        "SessionManager()".to_owned()
     }
 }
 
-/// Python wrapper for Session
-#[pyclass(name = "Session")]
+fn build_config(
+    target: String,
+    document_name: Option<String>,
+    parameters: Option<HashMap<String, Vec<String>>>,
+    reason: Option<String>,
+    ready_timeout: f64,
+) -> PyResult<SessionConfig> {
+    let parameters = parameters.unwrap_or_default();
+    let document = document_name.map(|name| {
+        // The session type only decides whether PortForwarder will accept this
+        // session, and only the two forwarding documents are multiplexed.
+        let session_type = if name.starts_with("AWS-StartPortForwardingSession") {
+            SessionType::Port
+        } else {
+            SessionType::StandardStream
+        };
+        DocumentSpec {
+            name,
+            parameters,
+            session_type,
+        }
+    });
+
+    Ok(SessionConfig {
+        document,
+        reason,
+        ready_timeout: seconds(ready_timeout, "ready_timeout")?,
+        ..SessionConfig::new(target)
+    })
+}
+
+/// Convert a Python float to a `Duration`, rejecting the values that would
+/// otherwise panic inside `Duration::from_secs_f64`.
+fn seconds(value: f64, name: &str) -> PyResult<Duration> {
+    if !value.is_finite() || value < 0.0 || value > Duration::MAX.as_secs_f64() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{name} must be a finite, non-negative number of seconds, got {value}"
+        )));
+    }
+    Ok(Duration::from_secs_f64(value))
+}
+
+/// An open SSM session.
+///
+/// Use it as an async context manager to guarantee termination:
+///
+/// ```python
+/// async with await manager.start_session("i-0123456789abcdef0") as session:
+///     await session.send(b"uname -a\r")
+///     async for chunk in session.output():
+///         print(chunk.decode(errors="replace"), end="")
+/// ```
+#[pyclass(name = "Session", frozen)]
+#[derive(Debug)]
 pub struct PySession {
-    inner: Arc<crate::Session>,
-    /// Cached session ID (avoids async lock for a read-only field)
-    session_id: String,
-    /// Cached ready signal — avoids holding the session lock during wait_for_ready.
-    protocol_can_send: Arc<std::sync::atomic::AtomicBool>,
-    /// Cached ready notify — avoids holding the session lock in __aenter__.
-    ready_notify: Arc<tokio::sync::Notify>,
-    /// Cached terminated notify — avoids holding the lock in wait_terminated.
-    terminated_notify: Arc<tokio::sync::Notify>,
-    /// Cached terminated latch — fast-path for wait_terminated when already done.
-    terminated_flag: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) inner: Arc<Session>,
 }
 
 #[pymethods]
 impl PySession {
-    /// Get session ID (synchronous — no await needed)
+    /// The AWS session ID.
     #[getter]
-    fn id(&self) -> String {
-        self.session_id.clone()
+    fn id(&self) -> &str {
+        self.inner.id()
     }
 
-    /// Get session state
-    fn state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// The target this session connects to.
+    #[getter]
+    fn target(&self) -> &str {
+        &self.inner.config().target
+    }
+
+    /// Version of the SSM agent, once the handshake has run.
+    #[getter]
+    fn agent_version(&self) -> Option<&str> {
+        self.inner.agent_version()
+    }
+
+    /// The agent's login banner, if it sent one.
+    #[getter]
+    fn banner(&self) -> Option<String> {
+        self.inner.banner()
+    }
+
+    /// Exit status of the remote process, once it has exited.
+    #[getter]
+    fn exit_code(&self) -> Option<i32> {
+        self.inner.exit_code()
+    }
+
+    /// Whether session data is encrypted end-to-end with a KMS-derived key.
+    #[getter]
+    fn is_encrypted(&self) -> bool {
+        self.inner.is_encrypted()
+    }
+
+    /// Whether the agent handshake has completed.
+    #[getter]
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
+    /// Whether the session has ended.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    /// Why the session ended, or `None` while it is still open.
+    #[getter]
+    fn close_reason(&self) -> Option<String> {
+        self.inner.close_reason().map(|r| r.to_string())
+    }
+
+    /// Wait for the agent handshake to finish.
+    fn wait_ready<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let session = Arc::clone(&self.inner);
+        future_into_py(
+            py,
+            async move { session.wait_ready().await.map_err(to_py_err) },
+        )
+    }
+
+    /// Wait for the session to end.
+    fn wait_closed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            let state = session.state().await;
-            let state_str = match state {
-                SessionState::Initializing => "initializing",
-                SessionState::Connected => "connected",
-                SessionState::Disconnecting => "disconnecting",
-                SessionState::Terminated => "terminated",
-            };
-            Ok(state_str)
+            session.closed().await;
+            Ok(())
         })
     }
 
-    /// Check if the session is ready to send data (synchronous — no await needed).
+    /// Send bytes to the remote process's standard input.
     ///
-    /// Reads a cached `AtomicBool` — no lock, no false negatives under contention.
-    fn is_ready(&self) -> bool {
-        self.protocol_can_send.load(Ordering::SeqCst)
-    }
-
-    /// Wait for the session to become ready.
-    ///
-    /// Does **not** acquire the session lock — uses a cached `Notify` and
-    /// `AtomicBool` so all other Python operations on this session remain
-    /// unblocked during the wait.
-    #[pyo3(signature = (timeout_secs = 30.0))]
-    fn wait_for_ready<'py>(
-        &self,
-        py: Python<'py>,
-        timeout_secs: f64,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        // Validate before entering the async block: Duration::from_secs_f64
-        // panics on NaN, infinite, negative, or overflow values, which would
-        // abort the entire Python process.
-        if !timeout_secs.is_finite()
-            || timeout_secs < 0.0
-            || timeout_secs > std::time::Duration::MAX.as_secs_f64()
-        {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "timeout_secs must be a finite value in [0, {:.0}], got {timeout_secs}",
-                std::time::Duration::MAX.as_secs_f64(),
-            )));
-        }
-        let can_send = Arc::clone(&self.protocol_can_send);
-        let ready_notify = Arc::clone(&self.ready_notify);
-        future_into_py(py, async move {
-            // Create the notified() future BEFORE the atomic load so that a
-            // notification fired between the load and the await is not lost.
-            let notified = ready_notify.notified();
-            // Fast path: already ready.
-            if can_send.load(Ordering::SeqCst) {
-                return Ok(true);
-            }
-            let timeout = std::time::Duration::from_secs_f64(timeout_secs);
-            match tokio::time::timeout(timeout, notified).await {
-                Ok(_) => Ok(true),
-                // Timeout — check once more (notification may have raced with timeout)
-                Err(_) => Ok(can_send.load(Ordering::SeqCst)),
-            }
-        })
-    }
-
-    /// Get output stream for reading session output
-    ///
-    /// Returns an async iterator that yields bytes from the session output.
-    ///
-    /// Example:
-    ///     async for chunk in session.output():
-    ///         print(chunk.decode())
-    fn output(&self) -> PyResult<PyOutputStream> {
-        Ok(PyOutputStream {
-            inner: Arc::new(tokio::sync::Mutex::new(self.inner.output())),
-        })
-    }
-
-    /// Send data to the session
+    /// Send `\r`, not `\n`, for Enter — see the Rust docs for why.
     fn send<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
             session
                 .send(bytes::Bytes::from(data))
                 .await
-                .map_err(to_py_err)?;
-            Ok(())
+                .map_err(to_py_err)
         })
     }
 
-    /// Terminate the session
-    fn terminate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Tell the remote pty the terminal has been resized.
+    fn send_terminal_size<'py>(
+        &self,
+        py: Python<'py>,
+        cols: u16,
+        rows: u16,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            session.terminate().await.map_err(to_py_err)?;
-            Ok(())
+            session
+                .send_terminal_size(cols, rows)
+                .await
+                .map_err(to_py_err)
         })
     }
 
-    /// Wait for session to terminate.
+    /// Subscribe to the session's output.
     ///
-    /// Does **not** hold the session lock while waiting.
-    fn wait_terminated<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let terminated_notify = Arc::clone(&self.terminated_notify);
-        let terminated_flag = Arc::clone(&self.terminated_flag);
-        future_into_py(py, async move {
-            // Create the notified() future BEFORE the flag check to avoid the
-            // race where terminated_flag is set between the load and the await.
-            let notified = terminated_notify.notified();
-            if !terminated_flag.load(Ordering::SeqCst) {
-                notified.await;
-            }
-            Ok(())
-        })
+    /// Returns an async iterator of `bytes`. Subscribe before sending anything
+    /// you want to see the response to; earlier output is not replayed.
+    fn output(&self) -> PyOutputStream {
+        PyOutputStream {
+            inner: Arc::new(tokio::sync::Mutex::new(self.inner.output())),
+        }
     }
 
-    /// Async context manager entry — waits for ready without holding the lock.
+    /// End the session and release it on the AWS side. Idempotent.
+    fn terminate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let session = Arc::clone(&self.inner);
+        future_into_py(
+            py,
+            async move { session.terminate().await.map_err(to_py_err) },
+        )
+    }
+
+    /// Wait for readiness on entry, so the body can send immediately.
     fn __aenter__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let can_send = Arc::clone(&slf.protocol_can_send);
-        let ready_notify = Arc::clone(&slf.ready_notify);
-        let self_obj: Py<PySession> = slf.into();
+        let session = Arc::clone(&slf.inner);
+        let handle: Py<PySession> = slf.into();
         future_into_py(py, async move {
-            // Create the notified() future BEFORE the atomic load to avoid a
-            // race where the session becomes ready between the check and the await.
-            let notified = ready_notify.notified();
-            if !can_send.load(Ordering::SeqCst) {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(30), notified).await;
-            }
-            Ok(self_obj)
+            session.wait_ready().await.map_err(to_py_err)?;
+            Ok(handle)
         })
     }
 
-    /// Async context manager exit - terminates the session.
-    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    /// Terminate on exit, even when the body raised.
+    #[pyo3(signature = (_exc_type = None, _exc_value = None, _traceback = None))]
     fn __aexit__<'py>(
         &self,
         py: Python<'py>,
         _exc_type: Option<Bound<'_, PyAny>>,
-        _exc_val: Option<Bound<'_, PyAny>>,
-        _exc_tb: Option<Bound<'_, PyAny>>,
+        _exc_value: Option<Bound<'_, PyAny>>,
+        _traceback: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            // Best-effort termination, ignore errors on exit
+            // Best effort: an exception propagating out of __aexit__ would mask
+            // whatever the body was already raising.
             let _ = session.terminate().await;
-            Ok(false) // Don't suppress exceptions
+            Ok(false) // do not suppress exceptions
         })
     }
 
     fn __repr__(&self) -> String {
-        format!("Session(id='{}')", self.session_id)
+        format!(
+            "Session(id={:?}, target={:?}, ready={}, closed={})",
+            self.inner.id(),
+            self.inner.config().target,
+            self.inner.is_ready(),
+            self.inner.is_closed(),
+        )
     }
 }
 
-/// Python wrapper for SessionManager
-#[pyclass(name = "SessionManager")]
-pub struct PySessionManager {
-    inner: Arc<RwLock<SessionManager>>,
-}
-
-#[pymethods]
-impl PySessionManager {
-    /// Create a new session manager
-    ///
-    /// If `region` is provided, it overrides the default AWS region.
-    #[staticmethod]
-    #[pyo3(signature = (region=None))]
-    #[allow(clippy::new_ret_no_self)]
-    fn new(py: Python<'_>, region: Option<String>) -> PyResult<Bound<'_, PyAny>> {
-        future_into_py(py, async move {
-            let config = if let Some(ref region) = region {
-                aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .region(aws_config::Region::new(region.clone()))
-                    .load()
-                    .await
-            } else {
-                aws_config::load_from_env().await
-            };
-            let manager = SessionManager::with_config(&config);
-            Ok(PySessionManager {
-                inner: Arc::new(RwLock::new(manager)),
-            })
-        })
-    }
-
-    /// Start a new SSM session with individual parameters
-    #[pyo3(signature = (target, region=None, session_type=None, document_name=None, parameters=None, reason=None))]
-    #[allow(clippy::too_many_arguments)]
-    fn start_session<'py>(
-        &self,
-        py: Python<'py>,
-        target: String,
-        region: Option<String>,
-        session_type: Option<String>,
-        document_name: Option<String>,
-        parameters: Option<HashMap<String, Vec<String>>>,
-        reason: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let manager = Arc::clone(&self.inner);
-
-        // Parse session type
-        let session_type_enum = if let Some(ref st) = session_type {
-            match st.as_str() {
-                "standard_stream" => SessionType::StandardStream,
-                "port" => SessionType::Port,
-                "interactive_commands" => SessionType::InteractiveCommands,
-                _ => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "Invalid session type: '{}'. Valid types: 'standard_stream', 'port', 'interactive_commands'",
-                        st
-                    )))
-                }
-            }
-        } else {
-            SessionType::StandardStream
-        };
-
-        future_into_py(py, async move {
-            let config = SessionConfig {
-                target,
-                region,
-                session_type: session_type_enum,
-                document_name,
-                parameters: parameters.unwrap_or_default(),
-                reason,
-                ..Default::default()
-            };
-
-            let manager_guard = manager.read().await;
-            let session = manager_guard
-                .start_session(config)
-                .await
-                .map_err(to_py_err)?;
-
-            let session_id = session.id().to_string();
-            let protocol_can_send = session.can_send_signal();
-            let ready_notify = session.ready_signal();
-            let terminated_notify = session.terminated_signal();
-            let terminated_flag = session.terminated_flag();
-            Ok(PySession {
-                inner: Arc::new(session),
-                session_id,
-                protocol_can_send,
-                ready_notify,
-                terminated_notify,
-                terminated_flag,
-            })
-        })
-    }
-
-    /// Start a new SSM session from a SessionConfig object
-    fn start_session_with_config<'py>(
-        &self,
-        py: Python<'py>,
-        config: PySessionConfig,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let manager = Arc::clone(&self.inner);
-
-        future_into_py(py, async move {
-            let manager_guard = manager.read().await;
-            let session = manager_guard
-                .start_session(config.inner)
-                .await
-                .map_err(to_py_err)?;
-
-            let session_id = session.id().to_string();
-            let protocol_can_send = session.can_send_signal();
-            let ready_notify = session.ready_signal();
-            let terminated_notify = session.terminated_signal();
-            let terminated_flag = session.terminated_flag();
-            Ok(PySession {
-                inner: Arc::new(session),
-                session_id,
-                protocol_can_send,
-                ready_notify,
-                terminated_notify,
-                terminated_flag,
-            })
-        })
-    }
-
-    /// Terminate a session by ID
-    fn terminate_session<'py>(
-        &self,
-        py: Python<'py>,
-        session_id: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let manager = Arc::clone(&self.inner);
-
-        future_into_py(py, async move {
-            let manager_guard = manager.read().await;
-            manager_guard
-                .terminate_session(&session_id)
-                .await
-                .map_err(to_py_err)?;
-            Ok(())
-        })
-    }
-
-    fn __repr__(&self) -> String {
-        "SessionManager()".to_string()
-    }
-}
-
-/// Python wrapper for output stream
-#[pyclass(name = "OutputStream")]
+/// An async iterator over a session's output.
+#[pyclass(name = "OutputStream", frozen)]
+#[derive(Debug)]
 pub struct PyOutputStream {
-    inner: Arc<tokio::sync::Mutex<crate::OutputStream>>,
+    inner: Arc<tokio::sync::Mutex<OutputStream>>,
 }
 
 #[pymethods]
 impl PyOutputStream {
-    /// Make this an async iterator
     fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
-    /// Get next chunk of output
-    ///
-    /// Returns the next bytes from the stream, or raises StopAsyncIteration when exhausted.
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        use futures::StreamExt;
         use pyo3::exceptions::PyStopAsyncIteration;
 
         let stream = Arc::clone(&self.inner);
-        let fut = future_into_py(py, async move {
-            let mut stream_guard = stream.lock().await;
-            match stream_guard.next().await {
-                Some(bytes) => Ok(bytes.to_vec()),
+        let future = future_into_py(py, async move {
+            match stream.lock().await.recv().await {
+                // Re-attach to the interpreter to build a real `bytes` object.
+                // Returning `Vec<u8>` would hand Python a list of ints instead.
+                Some(chunk) => Ok(Python::attach(|py| {
+                    PyBytes::new(py, &chunk).unbind().into_any()
+                })),
                 None => Err(PyStopAsyncIteration::new_err(())),
             }
         })?;
-
-        Ok(Some(fut))
+        Ok(Some(future))
     }
 
     fn __repr__(&self) -> String {
-        "OutputStream()".to_string()
+        "OutputStream()".to_owned()
+    }
+}
+
+/// Forwards a local TCP port over a port-forwarding session.
+///
+/// ```python
+/// session = await manager.start_port_forward("i-0123456789abcdef0", 3306)
+/// forwarder = await PortForwarder.bind("127.0.0.1:13306")
+/// print("mysql -h 127.0.0.1 -P", forwarder.port)
+/// await forwarder.forward(session)   # runs until the session ends
+/// ```
+#[pyclass(name = "PortForwarder")]
+#[derive(Debug)]
+pub struct PyPortForwarder {
+    forwarder: Option<PortForwarder>,
+    local_addr: std::net::SocketAddr,
+    shutdown: ShutdownSignal,
+}
+
+#[pymethods]
+impl PyPortForwarder {
+    /// Bind a local address.
+    ///
+    /// Use port `0` to let the OS pick; read it back from `port`.
+    #[staticmethod]
+    #[pyo3(signature = (local_addr = "127.0.0.1:0", max_connections = 100))]
+    fn bind<'py>(
+        py: Python<'py>,
+        local_addr: &str,
+        max_connections: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let addr: std::net::SocketAddr = local_addr.parse().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "{local_addr:?} is not a valid address: {e}"
+            ))
+        })?;
+
+        future_into_py(py, async move {
+            let forwarder = PortForwarder::bind(PortForwardConfig {
+                local_addr: addr,
+                max_connections,
+                ..Default::default()
+            })
+            .await
+            .map_err(to_py_err)?;
+
+            Ok(PyPortForwarder {
+                local_addr: forwarder.local_addr(),
+                forwarder: Some(forwarder),
+                shutdown: ShutdownSignal::new(),
+            })
+        })
+    }
+
+    /// The bound address, with the OS-assigned port resolved.
+    #[getter]
+    fn address(&self) -> String {
+        self.local_addr.to_string()
+    }
+
+    /// The bound port.
+    #[getter]
+    fn port(&self) -> u16 {
+        self.local_addr.port()
+    }
+
+    /// Accept and forward connections until the session ends or `stop` is called.
+    fn forward<'py>(
+        &mut self,
+        py: Python<'py>,
+        session: PyRef<'_, PySession>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let forwarder = self.forwarder.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "this PortForwarder has already been used; bind a new one",
+            )
+        })?;
+        let session = Arc::clone(&session.inner);
+        let shutdown = self.shutdown.clone();
+
+        future_into_py(py, async move {
+            forwarder
+                .forward(session, shutdown)
+                .await
+                .map_err(to_py_err)
+        })
+    }
+
+    /// Stop forwarding and release the local port.
+    fn stop(&self) {
+        self.shutdown.shutdown();
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PortForwarder(address={:?})", self.local_addr.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A NaN or infinite timeout would panic inside `Duration::from_secs_f64`
+    /// and take the whole interpreter down.
+    #[test]
+    fn invalid_timeouts_raise_instead_of_panicking() {
+        for bad in [f64::NAN, f64::INFINITY, -1.0, f64::MAX] {
+            assert!(
+                seconds(bad, "ready_timeout").is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        assert_eq!(seconds(1.5, "t").unwrap(), Duration::from_millis(1500));
+        assert_eq!(seconds(0.0, "t").unwrap(), Duration::ZERO);
+    }
+
+    /// Only the forwarding documents may be handed to `PortForwarder`, so the
+    /// document name has to map to the right session type.
+    #[test]
+    fn document_names_map_to_the_right_session_type() {
+        let port = build_config(
+            "i-abc".into(),
+            Some("AWS-StartPortForwardingSessionToRemoteHost".into()),
+            None,
+            None,
+            30.0,
+        )
+        .unwrap();
+        assert_eq!(port.session_type(), SessionType::Port);
+
+        let ssh = build_config(
+            "i-abc".into(),
+            Some("AWS-StartSSHSession".into()),
+            None,
+            None,
+            30.0,
+        )
+        .unwrap();
+        assert_eq!(ssh.session_type(), SessionType::StandardStream);
+
+        let shell = build_config("i-abc".into(), None, None, None, 30.0).unwrap();
+        assert!(shell.document.is_none());
     }
 }

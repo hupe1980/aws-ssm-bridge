@@ -1,470 +1,429 @@
-//! Session reconnection utilities for handling network interruptions.
+//! A session that rebuilds itself when the connection drops.
 //!
-//! Provides automatic reconnection with exponential backoff and configurable
-//! retry strategies for production resilience.
+//! SSM sessions die for boring reasons: a laptop lid closes, a NAT table
+//! expires, an agent restarts during patching. [`ReconnectingSession`] watches
+//! for that, starts a fresh session, and keeps your output stream and your
+//! handle valid across the gap.
 //!
-//! # Example
+//! ```no_run
+//! use aws_ssm_bridge::{ReconnectConfig, ReconnectingSession};
+//! use futures_util::StreamExt;
 //!
-//! ```rust,no_run
-//! use aws_ssm_bridge::reconnect::{ReconnectingSession, ReconnectConfig};
-//! use std::time::Duration;
+//! # async fn example() -> aws_ssm_bridge::Result<()> {
+//! let session = ReconnectingSession::connect("i-0123456789abcdef0", ReconnectConfig::default())
+//!     .await?;
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Create reconnecting wrapper with retry config
-//! let session = ReconnectingSession::new(
-//!     "i-instance123",
-//!     ReconnectConfig {
-//!         max_retries: 5,
-//!         initial_delay: Duration::from_secs(1),
-//!         max_delay: Duration::from_secs(30),
-//!         ..Default::default()
-//!     }
-//! ).await?;
-//!
-//! // Use like a normal session - auto-reconnects on failure
-//! session.send(bytes::Bytes::from("ls\n")).await?;
-//!
-//! // Monitor reconnection events
-//! let mut events = session.events();
+//! // This stream survives reconnects; the underlying session does not.
+//! let mut output = session.output();
 //! tokio::spawn(async move {
-//!     while let Ok(event) = events.recv().await {
-//!         println!("Event: {:?}", event);
+//!     while let Some(chunk) = output.next().await {
+//!         print!("{}", String::from_utf8_lossy(&chunk));
 //!     }
 //! });
-//! # Ok(())
-//! # }
+//!
+//! session.send(&b"tail -f /var/log/syslog\r"[..]).await?;
+//! # Ok(()) }
 //! ```
+//!
+//! # What reconnection cannot restore
+//!
+//! A new session is a new process on the target. Shell state — the working
+//! directory, environment, running foreground job, scrollback — is gone, and
+//! output produced while disconnected was never sent. This type restores
+//! *connectivity*, not continuity; treat every [`ReconnectEvent::Reconnected`]
+//! as a fresh shell.
+//!
+//! Only failures that a retry could plausibly fix trigger a reconnect:
+//! [`CloseReason::is_recoverable`] decides. A session the agent closed, or one
+//! you terminated, stays closed.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use bytes::Bytes;
+use rand::Rng;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, Mutex, RwLock};
-use tokio::time::sleep;
+use tokio::sync::{broadcast, RwLock};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::errors::{Error, Result, TransportError};
-use crate::session::{Session, SessionConfig, SessionManager, SessionState};
+use crate::channels::{OutputFanout, OutputStream};
+use crate::errors::{Error, Result};
+use crate::session::{CloseReason, Session, SessionConfig, SessionManager};
 use crate::shutdown::ShutdownSignal;
 
-/// Configuration for session reconnection behavior.
+/// How hard to try, and how long to wait between attempts.
 #[derive(Debug, Clone)]
 pub struct ReconnectConfig {
-    /// Maximum number of reconnection attempts (0 = unlimited)
-    pub max_retries: u32,
-    /// Initial delay between retry attempts
+    /// Consecutive failed attempts before giving up; `0` means keep trying.
+    pub max_attempts: u32,
+    /// Delay before the first retry.
     pub initial_delay: Duration,
-    /// Maximum delay between retry attempts
+    /// Ceiling on the backoff delay.
     pub max_delay: Duration,
-    /// Multiplier for exponential backoff
-    pub backoff_multiplier: f64,
-    /// Whether to add jitter to delays (recommended for thundering herd prevention)
-    pub jitter: bool,
-    /// Session configuration template
-    pub session_config: SessionConfig,
+    /// Template for each new session.
+    pub session: SessionConfig,
 }
 
 impl Default for ReconnectConfig {
     fn default() -> Self {
         Self {
-            max_retries: 10,
+            max_attempts: 10,
             initial_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(60),
-            backoff_multiplier: 2.0,
-            jitter: true,
-            session_config: SessionConfig::default(),
+            session: SessionConfig::default(),
         }
     }
 }
 
-/// Events emitted during reconnection.
+/// Lifecycle notifications from a [`ReconnectingSession`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ReconnectEvent {
-    /// Connection was lost
+    /// The underlying session ended.
     Disconnected {
-        /// Error that caused disconnection
-        error: String,
+        /// Why it ended.
+        reason: CloseReason,
     },
-    /// Attempting to reconnect
+    /// About to try again.
     Reconnecting {
-        /// Current attempt number (1-indexed)
+        /// Attempt number, starting at 1.
         attempt: u32,
-        /// Delay before this attempt
+        /// How long the supervisor will wait first.
         delay: Duration,
     },
-    /// Successfully reconnected
+    /// A new session is open.
     Reconnected {
-        /// New session ID
+        /// ID of the new session — different from the old one.
         session_id: String,
-        /// Total attempts taken
+        /// How many attempts it took.
         attempts: u32,
     },
-    /// All reconnection attempts exhausted
-    Failed {
-        /// Total attempts made
-        total_attempts: u32,
-        /// Last error
-        last_error: String,
+    /// No further attempts will be made.
+    GaveUp {
+        /// Attempts made before stopping.
+        attempts: u32,
+        /// Why the supervisor stopped.
+        reason: String,
     },
 }
 
-/// Statistics about reconnection attempts.
-#[derive(Debug, Clone, Default)]
-pub struct ReconnectStats {
-    /// Total reconnection attempts
-    pub total_attempts: u64,
-    /// Successful reconnections
-    pub successful_reconnects: u64,
-    /// Failed reconnection cycles (all retries exhausted)
-    pub failed_reconnects: u64,
-    /// Current consecutive failures
-    pub consecutive_failures: u32,
-}
-
-/// A session wrapper that automatically reconnects on failure.
-///
-/// This wraps a regular Session and monitors its health. When the session
-/// becomes disconnected, it automatically attempts to reconnect with
-/// exponential backoff.
-#[must_use = "dropping a ReconnectingSession terminates the underlying session; call terminate() explicitly"]
-pub struct ReconnectingSession {
-    /// Target instance/document
-    target: String,
-    /// Reconnection configuration
+struct Inner {
+    manager: SessionManager,
     config: ReconnectConfig,
-    /// Current session (wrapped in mutex for replacement)
-    session: Arc<RwLock<Option<Session>>>,
-    /// Session manager for creating new sessions
-    manager: Arc<SessionManager>,
-    /// Event broadcast channel
+    current: RwLock<Option<Arc<Session>>>,
+    output: Arc<OutputFanout>,
     events: broadcast::Sender<ReconnectEvent>,
-    /// Statistics
-    stats: Arc<ReconnectStatsInner>,
-    /// Shutdown signal
     shutdown: ShutdownSignal,
-    /// Flag indicating if currently reconnecting
-    reconnecting: Arc<Mutex<bool>>,
+    generation: Mutex<u64>,
 }
 
-struct ReconnectStatsInner {
-    total_attempts: AtomicU64,
-    successful_reconnects: AtomicU64,
-    failed_reconnects: AtomicU64,
-    consecutive_failures: AtomicU64,
-}
-
-impl Default for ReconnectStatsInner {
-    fn default() -> Self {
-        Self {
-            total_attempts: AtomicU64::new(0),
-            successful_reconnects: AtomicU64::new(0),
-            failed_reconnects: AtomicU64::new(0),
-            consecutive_failures: AtomicU64::new(0),
-        }
-    }
+/// A session handle that outlives the sessions underneath it.
+///
+/// Cheap to clone; every clone drives the same supervisor.
+#[derive(Clone)]
+pub struct ReconnectingSession {
+    inner: Arc<Inner>,
+    supervisor: Arc<JoinHandle<()>>,
 }
 
 impl ReconnectingSession {
-    /// Create a new reconnecting session for the given target.
-    pub async fn new(target: &str, config: ReconnectConfig) -> Result<Self> {
-        let manager = Arc::new(SessionManager::new().await?);
-        Self::with_manager(target, config, manager).await
+    /// Open the first session and start supervising it.
+    ///
+    /// Fails if the *initial* connection fails: a target that cannot be reached
+    /// at all is a configuration problem, and retrying it silently would hide a
+    /// typo'd instance ID behind a minute of backoff.
+    pub async fn connect(target: impl Into<String>, config: ReconnectConfig) -> Result<Self> {
+        let manager = SessionManager::new().await?;
+        Self::connect_with(target, config, manager).await
     }
 
-    /// Create a reconnecting session with a custom session manager.
-    pub async fn with_manager(
-        target: &str,
-        config: ReconnectConfig,
-        manager: Arc<SessionManager>,
+    /// Open the first session using an existing manager.
+    pub async fn connect_with(
+        target: impl Into<String>,
+        mut config: ReconnectConfig,
+        manager: SessionManager,
     ) -> Result<Self> {
-        let (events_tx, _) = broadcast::channel(100);
+        config.session.target = target.into();
 
-        let instance = Self {
-            target: target.to_string(),
-            config,
-            session: Arc::new(RwLock::new(None)),
+        let (events, _) = broadcast::channel(64);
+        let inner = Arc::new(Inner {
             manager,
-            events: events_tx,
-            stats: Arc::new(ReconnectStatsInner::default()),
+            config,
+            current: RwLock::new(None),
+            output: Arc::new(OutputFanout::new()),
+            events,
             shutdown: ShutdownSignal::new(),
-            reconnecting: Arc::new(Mutex::new(false)),
-        };
-
-        // Initial connection
-        instance.connect().await?;
-
-        Ok(instance)
-    }
-
-    /// Connect (or reconnect) to the target.
-    async fn connect(&self) -> Result<()> {
-        let mut session_config = self.config.session_config.clone();
-        session_config.target = self.target.clone();
-
-        let session = self.manager.start_session(session_config).await?;
-
-        {
-            let mut guard = self.session.write().await;
-            *guard = Some(session);
-        }
-
-        info!(target = %self.target, "Connected to target");
-        Ok(())
-    }
-
-    /// Attempt reconnection with exponential backoff.
-    async fn reconnect(&self, initial_error: &str) -> Result<()> {
-        // Prevent concurrent reconnection attempts
-        {
-            let mut reconnecting = self.reconnecting.lock().await;
-            if *reconnecting {
-                debug!("Already reconnecting, skipping");
-                return Err(Error::InvalidState("Already reconnecting".to_string()));
-            }
-            *reconnecting = true;
-        }
-
-        // Emit disconnected event
-        let _ = self.events.send(ReconnectEvent::Disconnected {
-            error: initial_error.to_string(),
+            generation: Mutex::new(0),
         });
 
-        let mut delay = self.config.initial_delay;
-        let mut attempts = 0u32;
-        let mut last_error = initial_error.to_string();
+        let session = Arc::new(
+            inner
+                .manager
+                .start_session(inner.config.session.clone())
+                .await?,
+        );
+        inner.adopt(session).await;
 
-        loop {
-            // Check if max retries exceeded
-            if self.config.max_retries > 0 && attempts >= self.config.max_retries {
-                self.stats.failed_reconnects.fetch_add(1, Ordering::Relaxed);
-                let _ = self.events.send(ReconnectEvent::Failed {
-                    total_attempts: attempts,
-                    last_error: last_error.clone(),
-                });
+        let supervisor = tokio::spawn(supervise(Arc::clone(&inner)));
 
-                *self.reconnecting.lock().await = false;
-                return Err(Error::Transport(TransportError::ConnectionFailed(format!(
-                    "Max reconnection attempts ({}) exceeded: {}",
-                    self.config.max_retries, last_error
-                ))));
-            }
-
-            attempts += 1;
-            self.stats.total_attempts.fetch_add(1, Ordering::Relaxed);
-
-            // Apply jitter if enabled
-            let actual_delay = if self.config.jitter {
-                let jitter_factor = 0.5 + rand_jitter() * 0.5; // 50-100% of delay
-                Duration::from_secs_f64(delay.as_secs_f64() * jitter_factor)
-            } else {
-                delay
-            };
-
-            let _ = self.events.send(ReconnectEvent::Reconnecting {
-                attempt: attempts,
-                delay: actual_delay,
-            });
-
-            info!(
-                target = %self.target,
-                attempt = attempts,
-                delay_ms = actual_delay.as_millis(),
-                "Attempting reconnection"
-            );
-
-            // Wait before retry
-            tokio::select! {
-                _ = sleep(actual_delay) => {}
-                _ = self.shutdown.cancelled() => {
-                    *self.reconnecting.lock().await = false;
-                    return Err(Error::InvalidState("Shutdown requested".to_string()));
-                }
-            }
-
-            // Attempt connection
-            match self.connect().await {
-                Ok(()) => {
-                    self.stats
-                        .successful_reconnects
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.stats.consecutive_failures.store(0, Ordering::Relaxed);
-
-                    let session_id = {
-                        let guard = self.session.read().await;
-                        guard
-                            .as_ref()
-                            .map(|s| s.id().to_string())
-                            .unwrap_or_default()
-                    };
-
-                    let _ = self.events.send(ReconnectEvent::Reconnected {
-                        session_id,
-                        attempts,
-                    });
-
-                    *self.reconnecting.lock().await = false;
-                    return Ok(());
-                }
-                Err(e) => {
-                    last_error = e.to_string();
-                    self.stats
-                        .consecutive_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        target = %self.target,
-                        attempt = attempts,
-                        error = %e,
-                        "Reconnection attempt failed"
-                    );
-                }
-            }
-
-            // Increase delay with exponential backoff
-            delay = Duration::from_secs_f64(
-                (delay.as_secs_f64() * self.config.backoff_multiplier)
-                    .min(self.config.max_delay.as_secs_f64()),
-            );
-        }
+        Ok(Self {
+            inner,
+            supervisor: Arc::new(supervisor),
+        })
     }
 
-    /// Send data to the session, reconnecting if necessary.
-    pub async fn send(&self, data: bytes::Bytes) -> Result<()> {
-        loop {
-            let result = {
-                let guard = self.session.read().await;
-                match guard.as_ref() {
-                    Some(session) => session.send(data.clone()).await,
-                    None => Err(Error::InvalidState("No active session".to_string())),
-                }
-            };
-
-            match result {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    // Check if this is a recoverable error
-                    if is_connection_error(&e) {
-                        warn!(error = %e, "Connection error, attempting reconnection");
-                        self.reconnect(&e.to_string()).await?;
-                        // Retry send after reconnection
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
+    /// The target this session connects to.
+    pub fn target(&self) -> &str {
+        &self.inner.config.session.target
     }
 
-    /// Get the output stream.
-    pub async fn output(&self) -> Option<crate::channels::OutputStream> {
-        let guard = self.session.read().await;
-        guard.as_ref().map(|s| s.output())
+    /// The current underlying session, if one is connected right now.
+    ///
+    /// Do not hold this across an await if you care about reconnects — it is a
+    /// snapshot, and it may be closed by the time you use it.
+    pub async fn current(&self) -> Option<Arc<Session>> {
+        self.inner.current.read().await.clone()
+    }
+
+    /// Subscribe to output.
+    ///
+    /// The stream spans reconnects: it does not end when a session dies, only
+    /// when the supervisor gives up or you [`terminate`](Self::terminate).
+    pub fn output(&self) -> OutputStream {
+        self.inner
+            .output
+            .subscribe(self.inner.config.session.output_buffer)
     }
 
     /// Subscribe to reconnection events.
     pub fn events(&self) -> broadcast::Receiver<ReconnectEvent> {
-        self.events.subscribe()
+        self.inner.events.subscribe()
     }
 
-    /// Get reconnection statistics.
-    pub fn stats(&self) -> ReconnectStats {
-        ReconnectStats {
-            total_attempts: self.stats.total_attempts.load(Ordering::Relaxed),
-            successful_reconnects: self.stats.successful_reconnects.load(Ordering::Relaxed),
-            failed_reconnects: self.stats.failed_reconnects.load(Ordering::Relaxed),
-            consecutive_failures: self.stats.consecutive_failures.load(Ordering::Relaxed) as u32,
-        }
+    /// How many times the underlying session has been replaced.
+    pub fn generation(&self) -> u64 {
+        *self
+            .inner
+            .generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Get the current session state.
-    pub async fn state(&self) -> SessionState {
-        let guard = self.session.read().await;
-        match guard.as_ref() {
-            Some(session) => session.state().await,
-            None => SessionState::Terminated,
-        }
-    }
-
-    /// Check if the session is ready.
+    /// Whether a session is connected and ready right now.
     pub async fn is_ready(&self) -> bool {
-        let guard = self.session.read().await;
-        guard.as_ref().map(|s| s.is_ready()).unwrap_or(false)
+        matches!(self.current().await, Some(s) if s.is_ready() && !s.is_closed())
     }
 
-    /// Check if currently in a reconnection cycle.
-    pub async fn is_reconnecting(&self) -> bool {
-        *self.reconnecting.lock().await
+    /// Send data on the current session, waiting through a reconnect if needed.
+    ///
+    /// Blocks for at most [`SessionConfig::ready_timeout`] while the supervisor
+    /// rebuilds a dropped session. Fails immediately once the supervisor has
+    /// given up or [`terminate`](Self::terminate) was called.
+    pub async fn send(&self, data: impl Into<Bytes>) -> Result<()> {
+        let data = data.into();
+        let deadline = tokio::time::Instant::now() + self.inner.config.session.ready_timeout;
+
+        loop {
+            if let Some(session) = self.current().await {
+                if !session.is_closed() {
+                    match session.send(data.clone()).await {
+                        Ok(()) => return Ok(()),
+                        // The session died between the snapshot and the send.
+                        // Fall through and wait for its replacement.
+                        Err(Error::SessionClosed(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            if self.inner.shutdown.is_shutdown() {
+                return Err(Error::SessionClosed(
+                    "the reconnecting session has stopped".into(),
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Timeout(self.inner.config.session.ready_timeout));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
-    /// Get the target identifier.
-    pub fn target(&self) -> &str {
-        &self.target
-    }
-
-    /// Get the shutdown signal.
-    pub fn shutdown_signal(&self) -> ShutdownSignal {
-        self.shutdown.clone()
-    }
-
-    /// Gracefully terminate the session.
+    /// Stop supervising and terminate the current session.
+    ///
+    /// After this the handle is inert: `send` fails and `output` ends.
     pub async fn terminate(&self) -> Result<()> {
-        self.shutdown.shutdown();
+        self.inner.shutdown.shutdown();
+        let session = self.inner.current.write().await.take();
+        let result = match session {
+            Some(session) => session.terminate().await,
+            None => Ok(()),
+        };
+        self.inner.output.close();
+        result
+    }
+}
 
-        let mut guard = self.session.write().await;
-        if let Some(session) = guard.take() {
-            session.terminate().await?;
+impl Drop for ReconnectingSession {
+    fn drop(&mut self) {
+        // Only the final handle tears things down; clones share the supervisor.
+        if Arc::strong_count(&self.supervisor) == 1 {
+            self.inner.shutdown.shutdown();
+            self.supervisor.abort();
+        }
+    }
+}
+
+impl std::fmt::Debug for ReconnectingSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReconnectingSession")
+            .field("target", &self.target())
+            .field("generation", &self.generation())
+            .finish()
+    }
+}
+
+impl Inner {
+    /// Install a session and start pumping its output into the durable fan-out.
+    async fn adopt(&self, session: Arc<Session>) {
+        *self.current.write().await = Some(Arc::clone(&session));
+        *self.generation.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        // The pump outlives one reconnect cycle, so it needs its own handle on
+        // the fan-out rather than borrowing from `Inner`.
+        tokio::spawn(pump_output(session, Arc::clone(&self.output)));
+    }
+
+    fn emit(&self, event: ReconnectEvent) {
+        // A closed receiver set is normal: nobody is required to watch events.
+        let _ = self.events.send(event);
+    }
+}
+
+/// Forward one session's output into the durable fan-out.
+async fn pump_output(session: Arc<Session>, output: Arc<OutputFanout>) {
+    use futures_util::StreamExt;
+
+    let mut stream = session.output();
+    while let Some(chunk) = stream.next().await {
+        output.send(chunk);
+    }
+    if stream.lagged() {
+        warn!("output consumer fell behind during a reconnecting session");
+    }
+}
+
+/// Watch the current session and rebuild it when it drops.
+async fn supervise(inner: Arc<Inner>) {
+    loop {
+        let session = {
+            let guard = inner.current.read().await;
+            match guard.as_ref() {
+                Some(session) => Arc::clone(session),
+                None => return,
+            }
+        };
+
+        tokio::select! {
+            biased;
+            () = inner.shutdown.cancelled() => return,
+            () = session.closed() => {}
         }
 
-        info!(target = %self.target, "Reconnecting session terminated");
-        Ok(())
-    }
+        let reason = session
+            .close_reason()
+            .unwrap_or(CloseReason::Transport("connection lost".into()));
+        inner.emit(ReconnectEvent::Disconnected {
+            reason: reason.clone(),
+        });
 
-    /// Force immediate reconnection (useful after network recovery).
-    pub async fn force_reconnect(&self) -> Result<()> {
-        info!(target = %self.target, "Forcing reconnection");
+        if !reason.is_recoverable() {
+            info!(%reason, "session ended for a reason a reconnect cannot fix");
+            inner.emit(ReconnectEvent::GaveUp {
+                attempts: 0,
+                reason: reason.to_string(),
+            });
+            break;
+        }
 
-        // Terminate current session
-        {
-            let mut guard = self.session.write().await;
-            if let Some(session) = guard.take() {
-                let _ = session.terminate().await;
+        match reconnect(&inner).await {
+            Ok(()) => continue,
+            Err(e) => {
+                inner.emit(ReconnectEvent::GaveUp {
+                    attempts: inner.config.max_attempts,
+                    reason: e.to_string(),
+                });
+                break;
             }
         }
-
-        // Connect fresh
-        self.connect().await
     }
+
+    inner.output.close();
+    *inner.current.write().await = None;
+    debug!("reconnect supervisor finished");
 }
 
-/// Check if an error indicates a connection problem that's worth retrying.
-fn is_connection_error(error: &Error) -> bool {
-    match error {
-        Error::Transport(TransportError::WebSocket(_)) => true,
-        Error::Transport(TransportError::ConnectionFailed(_)) => true,
-        Error::Transport(TransportError::ConnectionClosed { .. }) => true,
-        Error::Transport(TransportError::HeartbeatTimeout) => true,
-        Error::Timeout => true,
-        Error::Io(e) => {
-            use std::io::ErrorKind;
-            matches!(
-                e.kind(),
-                ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::TimedOut
-                    | ErrorKind::NotConnected
-            )
+/// Retry with exponential backoff and full jitter until a session opens.
+async fn reconnect(inner: &Arc<Inner>) -> Result<()> {
+    let mut attempt = 0u32;
+    let mut ceiling = inner.config.initial_delay;
+
+    loop {
+        attempt += 1;
+        if inner.config.max_attempts > 0 && attempt > inner.config.max_attempts {
+            return Err(Error::transport(format!(
+                "gave up reconnecting to {} after {} attempts",
+                inner.config.session.target, inner.config.max_attempts
+            )));
         }
-        _ => false,
+
+        // Full jitter (AWS's own recommendation): sleeping a uniform sample from
+        // [0, ceiling] rather than the ceiling itself keeps a fleet of clients
+        // from retrying in lockstep after a shared outage.
+        let delay = jitter(ceiling);
+        inner.emit(ReconnectEvent::Reconnecting { attempt, delay });
+        info!(attempt, ?delay, target = %inner.config.session.target, "reconnecting");
+
+        tokio::select! {
+            biased;
+            () = inner.shutdown.cancelled() => {
+                return Err(Error::SessionClosed("shutdown requested while reconnecting".into()));
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
+
+        match inner
+            .manager
+            .start_session(inner.config.session.clone())
+            .await
+        {
+            Ok(session) => {
+                let session = Arc::new(session);
+                let session_id = session.id().to_owned();
+                inner.adopt(session).await;
+                info!(%session_id, attempt, "reconnected");
+                inner.emit(ReconnectEvent::Reconnected {
+                    session_id,
+                    attempts: attempt,
+                });
+                return Ok(());
+            }
+            Err(e) if !e.is_retriable() => {
+                warn!(error = %e, "reconnect failed permanently");
+                return Err(e);
+            }
+            Err(e) => {
+                warn!(attempt, error = %e, "reconnect attempt failed");
+                ceiling = (ceiling * 2).min(inner.config.max_delay);
+            }
+        }
     }
 }
 
-/// Generate a random jitter value between 0.0 and 1.0.
-fn rand_jitter() -> f64 {
-    use std::time::SystemTime;
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    (nanos as f64) / (u32::MAX as f64)
+/// A uniform sample from `[0, ceiling]`.
+fn jitter(ceiling: Duration) -> Duration {
+    let millis = ceiling.as_millis().min(u128::from(u64::MAX)) as u64;
+    if millis == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(rand::thread_rng().gen_range(0..=millis))
 }
 
 #[cfg(test)]
@@ -472,85 +431,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_reconnect_config_default() {
+    fn defaults_bound_both_attempts_and_delay() {
         let config = ReconnectConfig::default();
-        assert_eq!(config.max_retries, 10);
+        assert_eq!(config.max_attempts, 10);
         assert_eq!(config.initial_delay, Duration::from_secs(1));
         assert_eq!(config.max_delay, Duration::from_secs(60));
-        assert!((config.backoff_multiplier - 2.0).abs() < f64::EPSILON);
-        assert!(config.jitter);
+    }
+
+    /// Full jitter must be able to produce both ends of the range, and never
+    /// exceed the ceiling — a delay above `max_delay` would defeat the cap.
+    #[test]
+    fn jitter_stays_within_the_ceiling() {
+        let ceiling = Duration::from_millis(1000);
+        let samples: Vec<Duration> = (0..500).map(|_| jitter(ceiling)).collect();
+
+        assert!(
+            samples.iter().all(|d| *d <= ceiling),
+            "jitter exceeded the ceiling"
+        );
+        assert!(
+            samples.iter().any(|d| *d < ceiling / 2),
+            "jitter should reach the low half of the range"
+        );
+        assert!(
+            samples.iter().any(|d| *d > ceiling / 2),
+            "jitter should reach the high half of the range"
+        );
     }
 
     #[test]
-    fn test_reconnect_stats_default() {
-        let stats = ReconnectStats::default();
-        assert_eq!(stats.total_attempts, 0);
-        assert_eq!(stats.successful_reconnects, 0);
-        assert_eq!(stats.failed_reconnects, 0);
-        assert_eq!(stats.consecutive_failures, 0);
+    fn jitter_of_zero_is_zero() {
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// Only failures a retry could fix should restart the loop. Reconnecting
+    /// after a clean agent close would resurrect a session the operator ended.
+    #[test]
+    fn only_recoverable_closures_trigger_a_reconnect() {
+        assert!(CloseReason::Transport("reset".into()).is_recoverable());
+        assert!(CloseReason::PeerUnresponsive {
+            idle: Duration::from_secs(120)
+        }
+        .is_recoverable());
+        assert!(CloseReason::DeliveryFailed {
+            sequence: 1,
+            attempts: 3000
+        }
+        .is_recoverable());
+
+        assert!(!CloseReason::Terminated.is_recoverable());
+        assert!(!CloseReason::AgentClosed {
+            exit_code: Some(0),
+            detail: None
+        }
+        .is_recoverable());
+        assert!(!CloseReason::Protocol("bad digest".into()).is_recoverable());
     }
 
     #[test]
-    fn test_is_connection_error() {
-        // WebSocket errors are connection errors
-        assert!(is_connection_error(&Error::Transport(
-            TransportError::WebSocket("connection closed".to_string())
-        )));
-
-        // Connection failed is retriable
-        assert!(is_connection_error(&Error::Transport(
-            TransportError::ConnectionFailed("network unreachable".to_string())
-        )));
-
-        // Timeout is retriable
-        assert!(is_connection_error(&Error::Timeout));
-
-        // Config errors are not retriable
-        assert!(!is_connection_error(&Error::Config(
-            "bad config".to_string()
-        )));
-
-        // Protocol errors are not retriable
-        use crate::errors::ProtocolError;
-        assert!(!is_connection_error(&Error::Protocol(
-            ProtocolError::InvalidMessage("invalid message".to_string())
-        )));
-    }
-
-    #[test]
-    fn test_rand_jitter() {
-        // Just verify it produces values
-        let j1 = rand_jitter();
-        assert!((0.0..=1.0).contains(&j1));
-    }
-
-    #[test]
-    fn test_reconnect_event_debug() {
-        let event = ReconnectEvent::Disconnected {
-            error: "test".to_string(),
-        };
-        let debug = format!("{:?}", event);
-        assert!(debug.contains("Disconnected"));
-
-        let event = ReconnectEvent::Reconnecting {
-            attempt: 1,
-            delay: Duration::from_secs(1),
-        };
-        let debug = format!("{:?}", event);
-        assert!(debug.contains("Reconnecting"));
-
+    fn events_are_cloneable_for_broadcast() {
         let event = ReconnectEvent::Reconnected {
-            session_id: "abc".to_string(),
-            attempts: 2,
+            session_id: "s-1".into(),
+            attempts: 3,
         };
-        let debug = format!("{:?}", event);
-        assert!(debug.contains("Reconnected"));
-
-        let event = ReconnectEvent::Failed {
-            total_attempts: 5,
-            last_error: "failed".to_string(),
-        };
-        let debug = format!("{:?}", event);
-        assert!(debug.contains("Failed"));
+        let debug = format!("{:?}", event.clone());
+        assert!(debug.contains("s-1"), "{debug}");
     }
 }

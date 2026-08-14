@@ -5,17 +5,16 @@ build-backend = "maturin"
 [project]
 name = "aws-ssm-bridge"
 dynamic = ["version"]
-description = "Python bindings for AWS Systems Manager Session Manager protocol"
-authors = [
-    {name = "hupe1980"}
-]
+description = "Async Python bindings for the AWS Systems Manager Session Manager protocol"
+authors = [{ name = "hupe1980" }]
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "MIT"}
-keywords = ["aws", "ssm", "session-manager", "async"]
+license = { text = "MIT" }
+keywords = ["aws", "ssm", "session-manager", "port-forwarding", "async"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -23,8 +22,11 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
+    "Topic :: System :: Systems Administration",
     "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
 ]
 
 [project.urls]
@@ -33,10 +35,12 @@ Repository = "https://github.com/hupe1980/aws-ssm-bridge"
 Documentation = "https://hupe1980.github.io/aws-ssm-bridge/"
 
 [tool.maturin]
-features = ["python"]
+# The `interactive` and `kms` features are on by default in Cargo.toml, so the
+# wheel ships the terminal handling and session encryption too.
+#
+# `extension-module` is what makes this a loadable module rather than something
+# linked against libpython; it is deliberately not implied by `python`, so that
+# `cargo test --features python` still links.
+features = ["python", "extension-module"]
 python-source = "python"
 module-name = "aws_ssm_bridge._internal"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-asyncio_mode = "auto"

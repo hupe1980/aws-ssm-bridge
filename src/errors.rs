@@ -1,257 +1,138 @@
-//! Error types for aws-ssm-bridge
+//! Error types for `aws-ssm-bridge`.
+//!
+//! Every fallible operation returns [`Result<T>`], aliasing
+//! `std::result::Result<T, Error>`.  [`Error`] is a flat enum: there is one
+//! variant per failure domain and no nested error hierarchies to match through.
 
 use std::fmt;
 
-/// Result type alias for aws-ssm-bridge operations
+/// Result type alias for `aws-ssm-bridge` operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Main error type for the library
+/// The error type returned by every fallible operation in this crate.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
-    /// AWS SDK errors.
+    /// An AWS API call failed.
     ///
-    /// `code` is the typed error code from the AWS API (e.g. `"ThrottlingException"`),
-    /// extracted via [`ProvideErrorMetadata`][aws_smithy_types::error::metadata::ProvideErrorMetadata].
-    /// It is `None` for non-service errors (timeouts, dispatch failures) and for
-    /// errors constructed directly from a plain message string.
-    #[error("AWS SDK error: {message}")]
-    AwsSdk {
-        /// Human-readable error details (debug representation of the SDK error).
+    /// `code` is the typed service error code (e.g. `"ThrottlingException"`,
+    /// `"TargetNotConnected"`) when the SDK provided one.  It is `None` for
+    /// transport-level failures (dispatch, timeout) and for errors this crate
+    /// constructs from a bare message.
+    #[error("AWS API error{}: {message}", .code.as_deref().map(|c| format!(" ({c})")).unwrap_or_default())]
+    Aws {
+        /// Human-readable description of the failure.
         message: String,
-        /// Typed API error code, if available.
+        /// Typed AWS service error code, when available.
         code: Option<String>,
     },
 
-    /// Session errors
-    #[error("Session error: {0}")]
-    Session(#[from] SessionError),
+    /// The SSM binary protocol was violated by the remote peer.
+    #[error("protocol error: {0}")]
+    Protocol(String),
 
-    /// Protocol errors
-    #[error("Protocol error: {0}")]
-    Protocol(#[from] ProtocolError),
+    /// The WebSocket transport failed or was closed.
+    #[error("transport error: {0}")]
+    Transport(String),
 
-    /// Transport errors
-    #[error("Transport error: {0}")]
-    Transport(#[from] TransportError),
+    /// The session is not in a state that permits the requested operation.
+    #[error("session closed: {0}")]
+    SessionClosed(String),
 
-    /// Configuration errors
-    #[error("Configuration error: {0}")]
+    /// Invalid configuration or arguments supplied by the caller.
+    #[error("invalid configuration: {0}")]
     Config(String),
 
-    /// IO errors
-    #[error("IO error: {0}")]
+    /// The SSM agent required a feature this client does not implement.
+    #[error("unsupported by this client: {0}")]
+    Unsupported(String),
+
+    /// Session encryption (KMS / AES-GCM) failed.
+    #[error("session encryption error: {0}")]
+    Crypto(String),
+
+    /// An underlying I/O operation failed.
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Serialization errors
-    #[error("Serialization error: {0}")]
+    /// JSON (de)serialization failed.
+    #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
-    /// Invalid state error
-    #[error("Invalid state: {0}")]
-    InvalidState(String),
-
-    /// Timeout error
-    #[error("Operation timed out")]
-    Timeout,
-
-    /// Cancelled error
-    #[error("Operation was cancelled")]
-    Cancelled,
-}
-
-/// Session-specific errors
-#[derive(Debug, thiserror::Error)]
-pub enum SessionError {
-    /// Session not found
-    #[error("Session not found: {0}")]
-    NotFound(String),
-
-    /// Session already exists
-    #[error("Session already exists: {0}")]
-    AlreadyExists(String),
-
-    /// Session terminated
-    #[error("Session terminated: {reason}")]
-    Terminated {
-        /// The reason for termination
-        reason: String,
-    },
-
-    /// Invalid session state
-    #[error("Invalid session state: expected {expected}, got {actual}")]
-    InvalidState {
-        /// The expected state
-        expected: String,
-        /// The actual state
-        actual: String,
-    },
-
-    /// Session initialization failed
-    #[error("Session initialization failed: {0}")]
-    InitializationFailed(String),
-}
-
-/// Protocol-specific errors
-#[derive(Debug, thiserror::Error)]
-pub enum ProtocolError {
-    /// Invalid message format
-    #[error("Invalid message format: {0}")]
-    InvalidMessage(String),
-
-    /// Unknown message type
-    #[error("Unknown message type: {0}")]
-    UnknownMessageType(String),
-
-    /// Invalid sequence number
-    #[error("Invalid sequence number: expected {expected}, got {actual}")]
-    InvalidSequence {
-        /// The expected sequence number
-        expected: u64,
-        /// The actual sequence number received
-        actual: u64,
-    },
-
-    /// Message framing error
-    #[error("Message framing error: {0}")]
-    Framing(String),
-
-    /// Unsupported protocol version
-    #[error("Unsupported protocol version: {0}")]
-    UnsupportedVersion(String),
-
-    /// Checksum mismatch
-    #[error("Checksum mismatch")]
-    ChecksumMismatch,
-
-    /// Feature required by the remote agent is not implemented in this client.
-    ///
-    /// This is a hard error: the session cannot continue without the feature.
-    /// For example, the SSM agent may mandate KMS session encryption which this
-    /// client does not implement.
-    #[error("Unsupported feature required by agent: {0}")]
-    UnsupportedFeature(String),
-}
-
-/// Transport-specific errors
-#[derive(Debug, thiserror::Error)]
-pub enum TransportError {
-    /// WebSocket error
-    #[error("WebSocket error: {0}")]
-    WebSocket(String),
-
-    /// Connection closed
-    #[error("Connection closed: {reason}")]
-    ConnectionClosed {
-        /// The reason for connection closure
-        reason: String,
-    },
-
-    /// Connection failed
-    #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
-
-    /// Channel error
-    #[error("Channel error: {0}")]
-    Channel(String),
-
-    /// Heartbeat timeout
-    #[error("Heartbeat timeout")]
-    HeartbeatTimeout,
+    /// The operation did not complete within its deadline.
+    #[error("operation timed out after {0:?}")]
+    Timeout(std::time::Duration),
 }
 
 impl Error {
-    /// Construct an `AwsSdk` error from a plain message string with no typed error code.
-    ///
-    /// Use this for response-validation errors (e.g. missing fields in an API
-    /// response) where no SDK `SdkError` is available.  Real SDK errors should
-    /// be converted via the `From<SdkError<E, R>>` impl, which preserves the
-    /// typed error code for accurate retriability classification.
-    pub(crate) fn aws_sdk_msg(message: impl Into<String>) -> Self {
-        Error::AwsSdk {
+    /// Construct an [`Error::Aws`] from a message with no typed service code.
+    pub(crate) fn aws(message: impl Into<String>) -> Self {
+        Error::Aws {
             message: message.into(),
             code: None,
         }
     }
 
-    /// Check if error is retriable
+    /// Construct an [`Error::Protocol`].
+    pub(crate) fn protocol(message: impl Into<String>) -> Self {
+        Error::Protocol(message.into())
+    }
+
+    /// Construct an [`Error::Transport`].
+    pub(crate) fn transport(message: impl Into<String>) -> Self {
+        Error::Transport(message.into())
+    }
+
+    /// Whether retrying the same operation could plausibly succeed.
+    ///
+    /// Transport failures and *transient* AWS service errors are retriable.
+    /// Permanent AWS errors (`AccessDeniedException`, `TargetNotConnected`,
+    /// `InvalidInstanceId`, …) are not, and neither are configuration or
+    /// protocol errors — retrying those just wastes the caller's time.
     pub fn is_retriable(&self) -> bool {
         match self {
-            Error::Timeout => true,
-            Error::Transport(TransportError::HeartbeatTimeout) => true,
-            Error::Transport(TransportError::ConnectionFailed(_)) => true,
-            Error::Transport(TransportError::WebSocket(_)) => true,
-            // Only retry *transient* AWS errors — permanent failures (AccessDenied,
-            // InvalidInstanceId, TargetNotConnected) must propagate immediately.
-            Error::AwsSdk { code, message } => {
-                // Primary: typed error code from ProvideErrorMetadata (exact match).
-                // This is reliable and version-stable.
-                if let Some(code) = code {
-                    return matches!(
-                        code.as_str(),
-                        "ThrottlingException"
-                            | "Throttling"
-                            | "ThrottledExceptions"
-                            | "TooManyRequestsException"
-                            | "RequestThrottled"
-                            | "RequestThrottledException"
-                            | "ProvisionedThroughputExceededException"
-                            | "TransactionInProgressException"
-                            | "ServiceUnavailableException"
-                            | "ServiceUnavailable"
-                            | "InternalServerError"
-                            | "InternalFailure"
-                            | "RequestTimeout"
-                            | "RequestTimeoutException"
-                    );
-                }
-                // Fallback: substring match on the debug message for hand-constructed
-                // errors that have no typed code (e.g. aws_sdk_msg()).
-                let lower = message.to_lowercase();
-                lower.contains("throttling")
-                    || lower.contains("serviceunavailable")
-                    || lower.contains("internalservererror")
-                    || lower.contains("internalfailure")
-                    || lower.contains("requesttimeout")
-            }
-            _ => false,
-        }
-    }
-
-    /// Check if error is fatal (session should be terminated)
-    pub fn is_fatal(&self) -> bool {
-        matches!(
-            self,
-            Error::Session(SessionError::Terminated { .. })
-                | Error::Transport(TransportError::ConnectionClosed { .. })
-                | Error::Session(SessionError::InvalidState { .. })
-        )
-    }
-
-    /// Check if error indicates the connection is shutting down or already closed.
-    ///
-    /// Used to downgrade send errors to `debug!` level during graceful shutdown,
-    /// avoiding spurious `error!` log lines.
-    pub fn is_shutdown_related(&self) -> bool {
-        match self {
-            Error::Transport(TransportError::ConnectionClosed { .. }) => true,
-            // Only treat Channel errors whose message indicates the channel was
-            // *closed* (connection shutting down) as shutdown-related.  Other
-            // Channel messages (e.g. "lossless subscriber channel full") signal
-            // overload conditions and must remain visible as real errors.
-            Error::Transport(TransportError::Channel(msg)) => msg.to_lowercase().contains("closed"),
-            Error::Transport(TransportError::WebSocket(msg)) => {
-                let lower = msg.to_lowercase();
-                lower.contains("closed") || lower.contains("closing")
-            }
+            Error::Timeout(_) | Error::Transport(_) => true,
+            Error::Io(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::Interrupted
+            ),
+            Error::Aws { code, .. } => code.as_deref().is_some_and(is_transient_aws_code),
             _ => false,
         }
     }
 }
 
-// Implement conversion from AWS SDK errors.
-// The `ProvideErrorMetadata` bound lets us extract the typed error code (e.g.
-// "ThrottlingException") so `is_retriable()` can do an exact code match instead
-// of fragile substring matching on the debug string.
+/// AWS service error codes that indicate a transient condition.
+///
+/// Sourced from the AWS SDK's standard retry classifier.  Anything not listed
+/// is treated as permanent: a client that retries `AccessDeniedException` is
+/// broken, not resilient.
+fn is_transient_aws_code(code: &str) -> bool {
+    matches!(
+        code,
+        "ThrottlingException"
+            | "Throttling"
+            | "ThrottledException"
+            | "TooManyRequestsException"
+            | "RequestThrottled"
+            | "RequestThrottledException"
+            | "ProvisionedThroughputExceededException"
+            | "TransactionInProgressException"
+            | "ServiceUnavailable"
+            | "ServiceUnavailableException"
+            | "InternalServerError"
+            | "InternalFailure"
+            | "RequestTimeout"
+            | "RequestTimeoutException"
+    )
+}
+
 impl<E, R> From<aws_smithy_runtime_api::client::result::SdkError<E, R>> for Error
 where
     E: fmt::Debug + aws_smithy_types::error::metadata::ProvideErrorMetadata,
@@ -260,10 +141,13 @@ where
     fn from(err: aws_smithy_runtime_api::client::result::SdkError<E, R>) -> Self {
         use aws_smithy_types::error::metadata::ProvideErrorMetadata;
         let code = err.code().map(str::to_owned);
-        Error::AwsSdk {
-            message: format!("{:?}", err),
-            code,
-        }
+        // Prefer the service's own message; fall back to the Debug form, which
+        // carries dispatch/timeout detail that has no `message` field.
+        let message = err
+            .message()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{err:?}"));
+        Error::Aws { message, code }
     }
 }
 
@@ -271,153 +155,41 @@ where
 mod tests {
     use super::*;
 
-    /// Helper: construct an AwsSdk error with a typed error code (simulates a real SDK error).
-    fn sdk_code(code: &str) -> Error {
-        Error::AwsSdk {
-            message: format!("{code}: request details"),
-            code: Some(code.to_owned()),
-        }
-    }
-
-    /// Helper: construct an AwsSdk error with no typed code (simulates a hand-constructed error).
-    fn sdk_msg(msg: &str) -> Error {
-        Error::AwsSdk {
-            message: msg.to_owned(),
-            code: None,
+    fn aws_code(code: &str) -> Error {
+        Error::Aws {
+            message: "request failed".into(),
+            code: Some(code.into()),
         }
     }
 
     #[test]
-    fn test_error_is_retriable() {
-        // Retriable errors
-        assert!(Error::Timeout.is_retriable());
-        assert!(Error::Transport(TransportError::HeartbeatTimeout).is_retriable());
-        assert!(Error::Transport(TransportError::ConnectionFailed("test".into())).is_retriable());
-        assert!(Error::Transport(TransportError::WebSocket("test".into())).is_retriable());
-
-        // Typed code path — permanent AWS errors must NOT be retried
-        assert!(!sdk_code("AccessDeniedException").is_retriable());
-        assert!(!sdk_code("InvalidInstanceId").is_retriable());
-        assert!(!sdk_code("TargetNotConnected").is_retriable());
-
-        // Typed code path — transient AWS errors MUST be retried
-        assert!(sdk_code("ThrottlingException").is_retriable());
-        assert!(sdk_code("Throttling").is_retriable());
-        assert!(sdk_code("TooManyRequestsException").is_retriable());
-        assert!(sdk_code("ServiceUnavailableException").is_retriable());
-        assert!(sdk_code("InternalServerError").is_retriable());
-        assert!(sdk_code("InternalFailure").is_retriable());
-        assert!(sdk_code("RequestTimeout").is_retriable());
-
-        // Fallback string path (no typed code) — permanent errors must NOT be retried
-        assert!(!sdk_msg("AccessDeniedException: ...").is_retriable());
-        assert!(!sdk_msg("InvalidInstanceId: ...").is_retriable());
-        assert!(!sdk_msg("TargetNotConnected: ...").is_retriable());
-
-        // Fallback string path — transient errors MUST be retried
-        assert!(sdk_msg("ThrottlingException: rate exceeded").is_retriable());
-        assert!(sdk_msg("ServiceUnavailableException: service down").is_retriable());
-        assert!(sdk_msg("InternalServerError: internal failure").is_retriable());
-
-        // Non-retriable errors
-        assert!(!Error::Cancelled.is_retriable());
-        assert!(!Error::Config("bad config".into()).is_retriable());
-        assert!(!Error::InvalidState("invalid".into()).is_retriable());
-        assert!(!Error::Session(SessionError::NotFound("sess".into())).is_retriable());
+    fn transient_aws_errors_are_retriable() {
+        assert!(aws_code("ThrottlingException").is_retriable());
+        assert!(aws_code("ServiceUnavailable").is_retriable());
+        assert!(aws_code("InternalFailure").is_retriable());
     }
 
     #[test]
-    fn test_error_is_fatal() {
-        // Fatal errors
-        let terminated = Error::Session(SessionError::Terminated {
-            reason: "test".to_string(),
-        });
-        assert!(terminated.is_fatal());
-
-        let conn_closed = Error::Transport(TransportError::ConnectionClosed {
-            reason: "closed".to_string(),
-        });
-        assert!(conn_closed.is_fatal());
-
-        let invalid_state = Error::Session(SessionError::InvalidState {
-            expected: "Running".into(),
-            actual: "Terminated".into(),
-        });
-        assert!(invalid_state.is_fatal());
-
-        // Non-fatal errors
-        assert!(!Error::Timeout.is_fatal());
-        assert!(!Error::Cancelled.is_fatal());
-        assert!(!sdk_msg("error").is_fatal());
+    fn permanent_aws_errors_are_not_retriable() {
+        assert!(!aws_code("AccessDeniedException").is_retriable());
+        assert!(!aws_code("TargetNotConnected").is_retriable());
+        assert!(!aws_code("InvalidInstanceId").is_retriable());
+        // No typed code at all: cannot prove it is transient, so do not retry.
+        assert!(!Error::aws("no code here").is_retriable());
     }
 
     #[test]
-    fn test_error_display() {
-        let err = Error::Timeout;
-        assert_eq!(format!("{}", err), "Operation timed out");
-
-        let err = Error::Session(SessionError::NotFound("sess-123".into()));
-        assert!(format!("{}", err).contains("sess-123"));
-
-        let err = Error::Protocol(ProtocolError::ChecksumMismatch);
-        assert!(format!("{}", err).contains("Checksum"));
+    fn transport_and_timeout_are_retriable() {
+        assert!(Error::transport("reset by peer").is_retriable());
+        assert!(Error::Timeout(std::time::Duration::from_secs(1)).is_retriable());
+        assert!(!Error::Config("bad target".into()).is_retriable());
+        assert!(!Error::protocol("bad digest").is_retriable());
     }
 
     #[test]
-    fn test_session_error_variants() {
-        let err = SessionError::NotFound("sess-1".into());
-        assert!(format!("{}", err).contains("sess-1"));
-
-        let err = SessionError::AlreadyExists("sess-2".into());
-        assert!(format!("{}", err).contains("sess-2"));
-
-        let err = SessionError::InitializationFailed("handshake failed".into());
-        assert!(format!("{}", err).contains("handshake"));
-    }
-
-    #[test]
-    fn test_protocol_error_variants() {
-        let err = ProtocolError::InvalidMessage("bad header".into());
-        assert!(format!("{}", err).contains("bad header"));
-
-        let err = ProtocolError::UnknownMessageType("xyz".into());
-        assert!(format!("{}", err).contains("xyz"));
-
-        let err = ProtocolError::InvalidSequence {
-            expected: 5,
-            actual: 3,
-        };
-        assert!(format!("{}", err).contains("5"));
-        assert!(format!("{}", err).contains("3"));
-
-        let err = ProtocolError::Framing("truncated".into());
-        assert!(format!("{}", err).contains("truncated"));
-
-        let err = ProtocolError::UnsupportedVersion("2.0".into());
-        assert!(format!("{}", err).contains("2.0"));
-    }
-
-    #[test]
-    fn test_transport_error_variants() {
-        let err = TransportError::WebSocket("connection reset".into());
-        assert!(format!("{}", err).contains("connection reset"));
-
-        let err = TransportError::ConnectionClosed {
-            reason: "EOF".into(),
-        };
-        assert!(format!("{}", err).contains("EOF"));
-
-        let err = TransportError::Channel("send failed".into());
-        assert!(format!("{}", err).contains("send failed"));
-
-        let err = TransportError::HeartbeatTimeout;
-        assert!(format!("{}", err).contains("Heartbeat"));
-    }
-
-    #[test]
-    fn test_error_from_io() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-        let err: Error = io_err.into();
-        assert!(matches!(err, Error::Io(_)));
+    fn aws_error_display_includes_code() {
+        let msg = aws_code("ThrottlingException").to_string();
+        assert!(msg.contains("ThrottlingException"), "{msg}");
+        assert!(msg.contains("request failed"), "{msg}");
     }
 }

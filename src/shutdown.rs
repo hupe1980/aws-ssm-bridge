@@ -1,129 +1,91 @@
-//! Graceful shutdown utilities.
+//! Cooperative cancellation for long-running session work.
 //!
-//! Provides a cancellation token pattern for coordinating graceful shutdown
-//! across async tasks. This is critical for production deployments where
-//! you need to ensure all resources are properly cleaned up.
+//! [`PortForwarder::forward`] and friends run until told to stop. A
+//! [`ShutdownSignal`] is the "stop now" broadcast: clone it into every task,
+//! select on [`cancelled`](ShutdownSignal::cancelled), and trigger it from a
+//! signal handler or your own supervisor.
 //!
-//! # Example
-//!
-//! ```rust
-//! use aws_ssm_bridge::shutdown::ShutdownSignal;
-//! use std::time::Duration;
+//! ```no_run
+//! use aws_ssm_bridge::shutdown::{install_signal_handlers, ShutdownSignal};
 //!
 //! # async fn example() {
-//! // Create a shutdown signal
-//! let signal = ShutdownSignal::new();
+//! let shutdown = ShutdownSignal::new();
+//! install_signal_handlers(shutdown.clone());
 //!
-//! // Clone for each task that needs to respond to shutdown
-//! let worker_signal = signal.clone();
-//!
-//! tokio::spawn(async move {
-//!     loop {
-//!         tokio::select! {
-//!             _ = worker_signal.cancelled() => {
-//!                 println!("Worker shutting down");
-//!                 break;
-//!             }
-//!             _ = tokio::time::sleep(Duration::from_secs(1)) => {
-//!                 println!("Working...");
-//!             }
-//!         }
-//!     }
-//! });
-//!
-//! // Trigger shutdown after some time
-//! tokio::time::sleep(Duration::from_secs(5)).await;
-//! signal.shutdown();
+//! tokio::select! {
+//!     () = shutdown.cancelled() => println!("stopping"),
+//!     _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}
+//! }
 //! # }
 //! ```
+//!
+//! [`PortForwarder::forward`]: crate::PortForwarder::forward
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
-use tracing::{debug, info};
+use tracing::info;
 
-/// A clonable signal for coordinating graceful shutdown.
+/// A latching, clonable "stop" broadcast.
 ///
-/// The signal can be cloned and shared across multiple tasks. When `shutdown()`
-/// is called, all tasks waiting on `cancelled()` will be notified.
-#[derive(Clone)]
+/// Latching matters: a task that starts *after* shutdown was triggered still
+/// sees it immediately, so there is no race between spawning and cancelling.
+#[derive(Clone, Default)]
 pub struct ShutdownSignal {
-    inner: Arc<ShutdownInner>,
+    inner: Arc<Inner>,
 }
 
-struct ShutdownInner {
-    /// Whether shutdown has been triggered
+#[derive(Default)]
+struct Inner {
     triggered: AtomicBool,
-    /// Notify for waking waiters
     notify: Notify,
 }
 
 impl ShutdownSignal {
-    /// Create a new shutdown signal.
+    /// Create a signal that has not been triggered.
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(ShutdownInner {
-                triggered: AtomicBool::new(false),
-                notify: Notify::new(),
-            }),
-        }
+        Self::default()
     }
 
-    /// Trigger shutdown.
-    ///
-    /// This will notify all tasks waiting on `cancelled()`.
-    /// Calling this multiple times is safe and has no additional effect.
+    /// Trigger shutdown, waking every waiter. Idempotent.
     pub fn shutdown(&self) {
-        if !self.inner.triggered.swap(true, Ordering::SeqCst) {
-            info!("Shutdown signal triggered");
+        if !self.inner.triggered.swap(true, Ordering::AcqRel) {
+            info!("shutdown requested");
             self.inner.notify.notify_waiters();
         }
     }
 
-    /// Check if shutdown has been triggered.
+    /// Whether shutdown has been triggered.
     pub fn is_shutdown(&self) -> bool {
-        self.inner.triggered.load(Ordering::SeqCst)
+        self.inner.triggered.load(Ordering::Acquire)
     }
 
-    /// Wait for shutdown to be triggered.
+    /// Resolve once shutdown is triggered, immediately if it already was.
     ///
-    /// This returns a future that completes when `shutdown()` is called.
-    /// If shutdown was already triggered, this returns immediately.
+    /// Cancel-safe.
     pub async fn cancelled(&self) {
-        // IMPORTANT: create the Notified future BEFORE the flag check.
-        // `Notify::notify_waiters()` only wakes futures that are *currently*
-        // registered (i.e. already awaiting).  The wrong order is:
-        //   1. check triggered → false
-        //   2. shutdown() fires notify_waiters()   ← wakeup delivered but nobody is waiting
-        //   3. register notified()                 ← never woken, hangs indefinitely
-        // By pinning first we guarantee the wakeup is captured even if shutdown()
-        // fires between the pin and the select! arm.
+        // Register before checking the flag. `notify_waiters` only wakes futures
+        // that are already *enqueued*, and constructing a `Notified` does not
+        // enqueue it — the first poll does, or `enable()` up front. Without the
+        // `enable()` a shutdown landing in the gap between the check and the
+        // await would be dropped and this task would wait forever.
         let notified = self.inner.notify.notified();
         tokio::pin!(notified);
-
-        // Fast path: already triggered (checked after registering to close the race).
-        if self.inner.triggered.load(Ordering::SeqCst) {
+        notified.as_mut().enable();
+        if self.is_shutdown() {
             return;
         }
-
         notified.await;
     }
 
-    /// Wait for shutdown or timeout.
+    /// Wait for shutdown, giving up after `timeout`.
     ///
-    /// Returns `true` if shutdown was triggered, `false` if timeout elapsed.
+    /// Returns `true` if shutdown was triggered, `false` on timeout.
     pub async fn wait_timeout(&self, timeout: Duration) -> bool {
-        tokio::select! {
-            _ = self.cancelled() => true,
-            _ = tokio::time::sleep(timeout) => false,
-        }
-    }
-}
-
-impl Default for ShutdownSignal {
-    fn default() -> Self {
-        Self::new()
+        tokio::time::timeout(timeout, self.cancelled())
+            .await
+            .is_ok()
     }
 }
 
@@ -135,98 +97,64 @@ impl std::fmt::Debug for ShutdownSignal {
     }
 }
 
-/// Guard that triggers shutdown on drop.
+/// Trigger `signal` on the first termination signal from the OS.
 ///
-/// Useful for ensuring shutdown is triggered even if code panics or
-/// returns early.
-pub struct ShutdownGuard {
-    signal: ShutdownSignal,
-    armed: bool,
-}
-
-impl ShutdownGuard {
-    /// Create a new shutdown guard.
-    pub fn new(signal: ShutdownSignal) -> Self {
-        Self {
-            signal,
-            armed: true,
-        }
-    }
-
-    /// Disarm the guard without triggering shutdown.
-    pub fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ShutdownGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            debug!("ShutdownGuard dropped, triggering shutdown");
-            self.signal.shutdown();
-        }
-    }
-}
-
-/// Install OS signal handlers for graceful shutdown.
+/// Handles `SIGINT`, `SIGTERM` and `SIGQUIT` on Unix, and Ctrl-C on Windows.
+/// Spawns one background task and returns immediately.
 ///
-/// This sets up handlers for SIGINT (Ctrl+C) and SIGTERM that will
-/// trigger the provided shutdown signal.
-///
-/// # Platform Support
-///
-/// - **Unix**: Handles SIGINT, SIGTERM, SIGQUIT
-/// - **Windows**: Handles Ctrl+C, Ctrl+Break
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use aws_ssm_bridge::shutdown::{ShutdownSignal, install_signal_handlers};
-///
-/// # async fn example() {
-/// let signal = ShutdownSignal::new();
-/// install_signal_handlers(signal.clone());
-///
-/// // Your application code here
-/// signal.cancelled().await;
-/// println!("Shutting down gracefully");
-/// # }
-/// ```
+/// If a handler cannot be installed — typically because the process is not the
+/// signal group leader, or another library already claimed it — the failure is
+/// logged and the remaining handlers are still installed. Silently degrading is
+/// better than aborting the process at startup, but check the logs if Ctrl-C
+/// appears not to work.
 pub fn install_signal_handlers(signal: ShutdownSignal) {
     #[cfg(unix)]
-    {
+    tokio::spawn(async move {
         use tokio::signal::unix::{signal as unix_signal, SignalKind};
 
-        let signal_clone = signal.clone();
-        tokio::spawn(async move {
-            let mut sigint =
-                unix_signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
-            let mut sigterm =
-                unix_signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
-            let mut sigquit =
-                unix_signal(SignalKind::quit()).expect("Failed to install SIGQUIT handler");
-
-            tokio::select! {
-                _ = sigint.recv() => info!("Received SIGINT"),
-                _ = sigterm.recv() => info!("Received SIGTERM"),
-                _ = sigquit.recv() => info!("Received SIGQUIT"),
+        let mut streams: Vec<_> = [
+            ("SIGINT", SignalKind::interrupt()),
+            ("SIGTERM", SignalKind::terminate()),
+            ("SIGQUIT", SignalKind::quit()),
+        ]
+        .into_iter()
+        .filter_map(|(name, kind)| match unix_signal(kind) {
+            Ok(stream) => Some((name, stream)),
+            Err(e) => {
+                tracing::warn!(signal = name, error = %e, "could not install a signal handler");
+                None
             }
+        })
+        .collect();
 
-            signal_clone.shutdown();
-        });
-    }
+        if streams.is_empty() {
+            return;
+        }
+
+        let received =
+            futures_util::future::select_all(streams.iter_mut().map(|(name, stream)| {
+                Box::pin(async move { stream.recv().await.map(|()| *name) })
+            }))
+            .await
+            .0;
+
+        if let Some(name) = received {
+            info!(signal = name, "received termination signal");
+        }
+        signal.shutdown();
+    });
 
     #[cfg(windows)]
-    {
-        let signal_clone = signal.clone();
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl+C handler");
-            info!("Received Ctrl+C");
-            signal_clone.shutdown();
-        });
-    }
+    tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => info!("received Ctrl-C"),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not install the Ctrl-C handler");
+                return;
+            }
+        }
+        signal.shutdown();
+    });
 }
 
 #[cfg(test)]
@@ -234,90 +162,54 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_shutdown_signal_basic() {
+    async fn shutdown_is_observable_and_idempotent() {
         let signal = ShutdownSignal::new();
-
         assert!(!signal.is_shutdown());
+        signal.shutdown();
         signal.shutdown();
         assert!(signal.is_shutdown());
     }
 
     #[tokio::test]
-    async fn test_shutdown_signal_cancelled() {
+    async fn a_waiter_registered_first_is_woken() {
         let signal = ShutdownSignal::new();
-
-        let signal_clone = signal.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            signal_clone.shutdown();
+        let waiter = tokio::spawn({
+            let signal = signal.clone();
+            async move { signal.cancelled().await }
         });
-
-        signal.cancelled().await;
-        assert!(signal.is_shutdown());
-    }
-
-    #[tokio::test]
-    async fn test_shutdown_already_triggered() {
-        let signal = ShutdownSignal::new();
+        tokio::task::yield_now().await;
         signal.shutdown();
 
-        // Should return immediately
-        tokio::time::timeout(Duration::from_millis(10), signal.cancelled())
+        tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
-            .expect("Should complete immediately");
+            .expect("waiter must be woken")
+            .unwrap();
     }
 
+    /// The signal latches, so a task that starts after the trigger still stops.
     #[tokio::test]
-    async fn test_shutdown_wait_timeout() {
+    async fn cancellation_latches_for_late_waiters() {
         let signal = ShutdownSignal::new();
-
-        // Timeout should elapse
-        let result = signal.wait_timeout(Duration::from_millis(10)).await;
-        assert!(!result);
-
-        // Now trigger shutdown
         signal.shutdown();
-        let result = signal.wait_timeout(Duration::from_millis(10)).await;
-        assert!(result);
+        tokio::time::timeout(Duration::from_millis(50), signal.cancelled())
+            .await
+            .expect("a late waiter must return immediately");
     }
 
     #[tokio::test]
-    async fn test_shutdown_guard() {
+    async fn clones_share_one_state() {
         let signal = ShutdownSignal::new();
-
-        {
-            let _guard = ShutdownGuard::new(signal.clone());
-            // Guard will be dropped here
-        }
-
-        assert!(signal.is_shutdown());
+        let a = signal.clone();
+        let b = signal.clone();
+        a.shutdown();
+        assert!(b.is_shutdown() && signal.is_shutdown());
     }
 
     #[tokio::test]
-    async fn test_shutdown_guard_disarm() {
+    async fn wait_timeout_reports_which_happened() {
         let signal = ShutdownSignal::new();
-
-        {
-            let mut guard = ShutdownGuard::new(signal.clone());
-            guard.disarm();
-            // Guard is disarmed, won't trigger shutdown on drop
-        }
-
-        assert!(!signal.is_shutdown());
-    }
-
-    #[tokio::test]
-    async fn test_multiple_clones() {
-        let signal = ShutdownSignal::new();
-        let clone1 = signal.clone();
-        let clone2 = signal.clone();
-
-        // Trigger from one clone
-        clone1.shutdown();
-
-        // All clones should see shutdown
-        assert!(signal.is_shutdown());
-        assert!(clone1.is_shutdown());
-        assert!(clone2.is_shutdown());
+        assert!(!signal.wait_timeout(Duration::from_millis(20)).await);
+        signal.shutdown();
+        assert!(signal.wait_timeout(Duration::from_millis(20)).await);
     }
 }

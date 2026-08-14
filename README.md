@@ -1,136 +1,147 @@
 # aws-ssm-bridge
 
-A Rust library implementing the AWS Systems Manager (SSM) Session Manager protocol with Python bindings.
+A Rust implementation of the AWS Systems Manager **Session Manager** protocol,
+with async Python bindings.
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.81%2B-orange)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.94.1%2B-orange)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org)
-[![unsafe](https://img.shields.io/badge/unsafe-forbidden-red)](Cargo.toml)
+[![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)](Cargo.toml)
+
+> **Not affiliated with AWS.** This is an independent implementation of a
+> documented-by-observation protocol, not endorsed or sponsored by Amazon Web
+> Services, Inc.
 
 ---
 
-## ⚠️ Disclaimer
+## What this is for
 
-**This project is not affiliated with, endorsed by, or sponsored by Amazon Web Services, Inc. or any of its affiliates.**
+The official [`session-manager-plugin`][plugin] is a CLI binary: you shell out to
+it, hand it JSON on `argv`, and parse whatever it prints. That is fine for a
+terminal and awkward for everything else.
 
-This is an independent implementation of the SSM Session Manager protocol.
+`aws-ssm-bridge` is a **library**. Open sessions, stream bytes and forward ports
+from inside your own async application — no subprocess, no plugin to install, no
+output scraping.
 
----
+```rust
+use aws_ssm_bridge::SessionBuilder;
+use futures_util::StreamExt;
 
-## Overview
+let session = SessionBuilder::new("i-0123456789abcdef0").start().await?;
+session.wait_ready().await?;
 
-Unlike the [official AWS Session Manager Plugin](https://github.com/aws/session-manager-plugin) (a CLI binary written in Go), `aws-ssm-bridge` is a **library** designed for embedding in your applications.
+let mut output = session.output();
+session.send(&b"uname -a\r"[..]).await?;
 
-### Features
-
-- **Binary Protocol**: Full 120-byte AWS header, SHA-256 digest checking (advisory — mismatches warn but do not fail the session, to handle known SSM agent quirks)
-- **Reliable Delivery**: Sequence tracking, ACK/retransmission, RTT estimation (Jacobson/Karels)
-- **Bounded Writer Channel**: Dedicated writer task with backpressure — no mutex contention, no OOM under slow remotes
-- **Dead Connection Detection**: Pong-based heartbeat with auto-shutdown on missed responses
-- **Interactive Shell**: Raw terminal mode, resize handling (SIGWINCH)
-- **Port Forwarding**: TCP tunneling via `PortForwarder`
-- **Python Bindings**: Async support via PyO3, type stubs included
-- **Security**: `#![forbid(unsafe_code)]`, zeroize token scrubbing, rate limiting, SSRF protection, target validation
-
----
-
-## Installation
-
-### Rust
-
-```toml
-[dependencies]
-aws-ssm-bridge = "0.4"
-tokio = { version = "1", features = ["full"] }
+while let Some(chunk) = output.next().await {
+    print!("{}", String::from_utf8_lossy(&chunk));
+}
+session.terminate().await?;
 ```
 
-### Python
+---
 
-```bash
+## Install
+
+```toml
+# Cargo.toml
+[dependencies]
+aws-ssm-bridge = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+```sh
 pip install aws-ssm-bridge
 ```
 
+Requires the same IAM permissions as the official plugin: `ssm:StartSession` on
+the target, and `ssm:TerminateSession` on your own sessions.
+
 ---
 
-## Quick Start
+## Capabilities
 
-### Interactive Shell
+| | |
+|---|---|
+| **Shell and command sessions** | Interactive shells, `AWS-StartInteractiveCommand`, `AWS-StartNonInteractiveCommand` |
+| **Port forwarding** | smux-multiplexed, many concurrent TCP connections over one session |
+| **KMS session encryption** | AES-256-GCM end-to-end, for accounts that mandate encrypted sessions |
+| **Interactive terminal** | Raw byte passthrough, SIGWINCH resize, panic-safe restore |
+| **Reconnection** | Durable output stream across reconnects, full-jitter backoff |
+| **Pooling** | Bounded concurrent sessions with automatic reaping |
+| **Observability** | `tracing` spans throughout, pluggable metrics recorder |
+| **Python** | Full async API, type stubs, context managers |
+
+Verified against a live SSM agent (3.3.3572.0): shell sessions, handshake,
+six concurrent multiplexed TCP streams, and clean teardown.
+
+---
+
+## Guided tour
+
+### Shell session
 
 ```rust
-use aws_ssm_bridge::interactive::{InteractiveShell, InteractiveConfig};
+use aws_ssm_bridge::SessionBuilder;
+use futures_util::StreamExt;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = InteractiveConfig::default();
-    let mut shell = InteractiveShell::new(config)?;
+let session = SessionBuilder::new("i-0123456789abcdef0")
+    .region("eu-central-1")
+    .reason("incident 4711")     // recorded in CloudTrail
+    .start()
+    .await?;
 
-    // Handles raw mode, resize (SIGWINCH), signals (Ctrl+C/D/Z)
-    shell.connect("i-0123456789abcdef0").await?;
-    shell.run().await?;
-    Ok(())
-}
+let mut output = session.output();   // subscribe *before* sending
+session.wait_ready().await?;
+session.send(&b"df -h\r"[..]).await?;
 ```
 
-### Programmatic Session
+Send `\r`, not `\n`: a remote pty maps carriage return to newline, but Windows
+shells behind winpty do not accept a bare line feed.
+
+### Port forwarding
 
 ```rust
-use aws_ssm_bridge::{SessionManager, SessionConfig};
-use futures::StreamExt;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let manager = SessionManager::new().await?;
-
-    let mut session = manager.start_session(SessionConfig {
-        target: "i-0123456789abcdef0".into(),
-        ..Default::default()
-    }).await?;
-
-    let mut output = session.output();
-    tokio::spawn(async move {
-        while let Some(data) = output.next().await {
-            print!("{}", String::from_utf8_lossy(&data));
-        }
-    });
-
-    session.send(b"hostname\n").await?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    session.terminate().await?;
-    Ok(())
-}
-```
-
-### Port Forwarding
-
-```rust
-use std::net::SocketAddr;
 use std::sync::Arc;
-use aws_ssm_bridge::{SessionBuilder, PortForwardConfig, PortForwarder,
-                     ShutdownSignal, install_signal_handlers};
+use aws_ssm_bridge::{
+    documents::PortForwardingToRemoteHost, install_signal_handlers,
+    PortForwardConfig, PortForwarder, SessionBuilder, ShutdownSignal,
+};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let shutdown = ShutdownSignal::new();
-    install_signal_handlers(shutdown.clone());
+let shutdown = ShutdownSignal::new();
+install_signal_handlers(shutdown.clone());
 
-    // Remote port belongs in the session document, not PortForwardConfig.
-    let session = Arc::new(
-        SessionBuilder::new("i-0123456789abcdef0")
-            .port_forward(80)
-            .build()
-            .await?
-    );
+let session = Arc::new(
+    SessionBuilder::new("i-0123456789abcdef0")
+        .document(PortForwardingToRemoteHost::new("db.internal", 5432))
+        .start()
+        .await?,
+);
 
-    // bind() binds the local TCP port immediately; local_addr() returns the
-    // actual address (useful when port 0 was requested for an OS-assigned port).
-    let forwarder = PortForwarder::bind(PortForwardConfig {
-        local_addr: "127.0.0.1:8080".parse::<SocketAddr>()?,
-        ..Default::default()
-    }).await?;
-    println!("Forwarding {} -> remote:80", forwarder.local_addr());
-    forwarder.forward(session, shutdown).await?;
-    Ok(())
-}
+let forwarder = PortForwarder::bind(PortForwardConfig {
+    local_addr: "127.0.0.1:15432".parse()?,
+    ..Default::default()
+})
+.await?;
+
+println!("psql -h 127.0.0.1 -p {}", forwarder.local_addr().port());
+forwarder.forward(session, shutdown).await?;
+```
+
+Each accepted connection becomes its own smux stream inside one WebSocket, so
+concurrent connections neither block nor corrupt each other.
+
+### Typed documents
+
+```rust
+use aws_ssm_bridge::documents::*;
+
+PortForwardingSession::new(3306)                            // port on the instance
+PortForwardingToRemoteHost::new("db.internal", 5432)        // through the instance
+SshSession::new()                                           // ssh ProxyCommand transport
+InteractiveCommand::new("top")                              // with a pty
+NonInteractiveCommand::new("systemctl status nginx")        // without a pty
 ```
 
 ### Python
@@ -140,120 +151,133 @@ import asyncio
 from aws_ssm_bridge import SessionManager
 
 async def main():
-    manager = await SessionManager.new()
-
-    async with await manager.start_session(target="i-0123456789abcdef0") as session:
-        await session.send(b"hostname\n")
-        output = session.output()
-        async for chunk in output:
-            print(chunk.decode(), end="")
+    manager = await SessionManager.new(region="eu-central-1")
+    async with await manager.start_session("i-0123456789abcdef0") as session:
+        await session.send(b"uname -a\r")
+        async for chunk in session.output():
+            print(chunk.decode(errors="replace"), end="")
 
 asyncio.run(main())
 ```
 
-### Type-Safe Documents
+---
 
-Use type-safe document wrappers instead of magic strings:
+## Session lifetime
+
+A session is either running or closed. **Every** way it can end — a clean
+`terminate()`, the agent hanging up, a dead network, a protocol violation —
+resolves `Session::closed()` and records a `CloseReason`.
 
 ```rust
-use aws_ssm_bridge::{SessionBuilder, documents::*};
-
-// Port forwarding to instance (remote port 3306)
-let session = SessionBuilder::new("i-xxx")
-    .document(PortForwardingSession::new(3306))
-    .build().await?;
-
-// Port forwarding through bastion to RDS
-let session = SessionBuilder::new("i-bastion")
-    .document(PortForwardingToRemoteHost::new("mydb.rds.amazonaws.com", 3306))
-    .build().await?;
-
-// SSH over Session Manager
-let session = SessionBuilder::new("i-xxx")
-    .document(SshSession::new())
-    .build().await?;
-
-// Interactive command execution
-let session = SessionBuilder::new("i-xxx")
-    .document(InteractiveCommand::new("top"))
-    .build().await?;
+tokio::select! {
+    () = session.closed() => eprintln!("gone: {}", session.close_reason().unwrap()),
+    result = do_work(&session) => result?,
+}
 ```
+
+That one guarantee is what makes the layers above it work: the port forwarder
+stops accepting when the tunnel dies, the pool reaps dead entries, and
+`ReconnectingSession` knows when to rebuild. There is no state in which the
+handle looks alive but nothing is running.
+
+Reconnection restores *connectivity*, not continuity — a new session is a new
+process on the target, so shell state and anything printed while disconnected
+are gone.
 
 ---
 
-## Documentation
+## Feature flags
 
-- [Getting Started](docs/getting-started.md)
-- [Architecture](docs/architecture.md)
-- [Security](docs/security.md)
-- [Binary Protocol](docs/binary_protocol.md)
-- [Protocol Flow](docs/protocol_flow.md)
-- [Python Bindings](docs/python.md)
+| Feature | Default | Effect |
+|---|:---:|---|
+| `interactive` | ✅ | `terminal` and `InteractiveShell`; pulls in `crossterm` |
+| `kms` | ✅ | KMS session encryption; pulls in `aws-sdk-kms` and `aes-gcm` |
+| `python` | — | PyO3 bindings |
+| `extension-module` | — | Link the bindings as a Python extension module; set by `maturin` when building a wheel |
+
+Built without `kms`, a session whose account mandates encryption fails the
+handshake with an explicit error instead of quietly running in plaintext.
+
+`extension-module` is deliberately separate from `python`: it leaves the CPython
+symbols for the interpreter to resolve at load time, which is right for a wheel
+and fatal for a test binary. Because `--all-features` would enable it, name the
+features you want instead — `--features interactive,kms` is what CI runs.
 
 ---
 
 ## Examples
 
-### Rust Examples (`examples/`)
+| Rust | |
+|---|---|
+| `cargo run --example shell -- i-… "uname -a"` | Run a command, print the output |
+| `cargo run --example interactive -- i-…` | Full interactive shell |
+| `cargo run --example port_forward -- i-… 5432 127.0.0.1:15432` | TCP tunnel |
+| `cargo run --example reconnecting -- i-…` | Survive a dropped connection |
+| `cargo run --example fleet -- "uptime" i-… i-…` | One command, many instances |
+| `cargo run --example metrics -- i-…` | Wire up the metrics hooks |
 
-| Example | Description |
-|---------|-------------|
-| `interactive_shell.rs` | Full interactive shell with raw mode, resize, signals |
-| `shell_session.rs` | Programmatic shell session (send commands, read output) |
-| `port_forwarding.rs` | TCP port forwarding through SSM |
-| `session_pool.rs` | Managing multiple concurrent sessions |
-| `reconnecting.rs` | Auto-reconnection with exponential backoff |
-| `metrics_session.rs` | Session with observability hooks |
-
-Run with: `cargo run --example interactive_shell -- i-0123456789abcdef0`
-
-### Python Examples (`python_examples/`)
-
-| Example | Description |
-|---------|-------------|
-| `interactive_shell.py` | Full interactive shell with raw terminal mode |
-| `shell_session.py` | Basic shell session with context manager |
-| `port_forwarding.py` | TCP port forwarding |
-| `multiple_sessions.py` | Concurrent sessions to multiple instances |
-
-Run with: `python python_examples/interactive_shell.py i-0123456789abcdef0`
+Python equivalents live in [`python_examples/`](python_examples).
 
 ---
 
-## Architecture
+## Documentation
 
-```
-src/
-├── lib.rs              # Public API
-├── binary_protocol.rs  # 120-byte header, SHA-256
-├── session.rs          # Session lifecycle, target validation
-├── connection.rs       # WebSocket, bounded writer task, retransmit, heartbeat
-├── channels.rs         # BroadcastStream-backed output multiplexer
-├── ack.rs              # ACK tracking, RTT (Jacobson/Karels)
-├── handshake.rs        # 3-phase handshake
-├── mux.rs              # smux v1 multiplexer (port forwarding)
-├── port_forward.rs     # TCP tunneling
-├── rate_limit.rs       # Token bucket
-└── python/             # PyO3 bindings
-```
+Full documentation: **[hupe1980.github.io/aws-ssm-bridge](https://hupe1980.github.io/aws-ssm-bridge/)**
+
+| | |
+|---|---|
+| [Getting started](https://hupe1980.github.io/aws-ssm-bridge/docs/getting-started/) | Credentials, your first session, port forwarding, every `CloseReason` |
+| [Architecture](https://hupe1980.github.io/aws-ssm-bridge/docs/architecture/) | How it is layered, and why the non-obvious parts are that way |
+| [Wire protocol](https://hupe1980.github.io/aws-ssm-bridge/docs/protocol/) | The binary format, reliability, smux, KMS encryption |
+| [Security](https://hupe1980.github.io/aws-ssm-bridge/docs/security/) | Threat model, and what is explicitly not defended against |
+| [Python API](https://hupe1980.github.io/aws-ssm-bridge/docs/python/) | The full async binding surface |
+| [API reference](https://docs.rs/aws-ssm-bridge) | Every type and method, on docs.rs |
+| [Changelog](CHANGELOG.md) | What changed, and how to migrate |
+
+The site is built with [Zola](https://www.getzola.org) from [`site/`](site);
+`just site` serves it locally.
 
 ---
 
 ## Security
 
-- `#![forbid(unsafe_code)]`
-- `zeroize` scrubs session tokens from memory on drop
-- Target format validation (EC2 instance, managed instance, ARN)
-- SSRF protection (AWS endpoint validation)
-- Rate limiting (configurable token bucket)
-- TLS required (WSS only)
-- Dead connection detection via pong tracking
-- AWS transport encryption (all SSM traffic is encrypted)
+- `unsafe_code = "forbid"` for the whole crate, so any `unsafe` fails the build.
+- The session token travels only in the data-channel open message — never in a
+  URL, where proxies and traces would record it.
+- SHA-256 payload digests are **verified**, matching the reference
+  implementation; a mismatch ends the session rather than delivering corrupt
+  bytes.
+- The data channel refuses any endpoint that is not an AWS SSM messages host.
+- KMS session encryption is AES-256-GCM with a per-message nonce, and a client
+  that cannot negotiate it fails the handshake rather than downgrading.
 
-See [Security Documentation](docs/security.md) for threat model and details.
+See the [security model](https://hupe1980.github.io/aws-ssm-bridge/docs/security/) for the threat model and what is
+explicitly *not* defended against.
+
+---
+
+## Development
+
+```sh
+just                # list every recipe
+just check          # what CI runs: fmt, clippy, tests, docs
+just matrix         # every feature combination
+just bench          # framing and reliability micro-benchmarks
+just fuzz           # cargo-fuzz over the network-facing parsers
+just python         # build and install the wheel
+just site           # serve the documentation site locally
+just release-check  # everything above, plus MSRV, --locked, publish dry run
+```
+
+The MSRV is set by the AWS SDK, not by this crate's own code. `just msrv`
+verifies it against the committed lockfile — which is the only way the check
+means anything, since an unlocked resolve pulls in dependencies that need a
+newer toolchain than users actually get.
 
 ---
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
+
+[plugin]: https://github.com/aws/session-manager-plugin

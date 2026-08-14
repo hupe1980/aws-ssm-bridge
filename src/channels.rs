@@ -1,52 +1,71 @@
-//! Channel multiplexing for stdin/stdout/stderr/control streams
+//! Fan-out of agent output to session consumers.
+//!
+//! A session may have several readers — an interactive shell painting the
+//! terminal, a log tap, the smux demultiplexer behind a port forward.  They all
+//! see the same byte stream.
+//!
+//! # Why every subscriber is lossless
+//!
+//! An earlier design fanned out over a `broadcast` channel, which silently drops
+//! the oldest messages when a receiver falls behind.  For terminal output that
+//! is merely ugly; for the smux framing layer it is fatal, because a dropped
+//! chunk desynchronises the frame parser and every subsequent byte is garbage
+//! attributed to the wrong stream.
+//!
+//! Each subscriber therefore gets its own bounded queue.  When a queue fills,
+//! that one subscriber is evicted and its [`OutputStream`] reports
+//! [`lagged`](OutputStream::lagged) — an explicit, observable failure instead of
+//! silent corruption.  Other subscribers and the session itself are unaffected.
 
 use bytes::Bytes;
-use futures::Stream;
+use futures_util::Stream;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use tokio::sync::{broadcast, mpsc};
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::errors::Result;
-
-/// Capacity of the bounded lossless-tap channel.
+/// Default per-subscriber queue depth, in messages.
 ///
-/// If the smux `recv_task` falls more than this many messages behind,
-/// `send_output` treats it as a fatal overload and tears down the multiplexer.
-const DIRECT_SUB_CHANNEL_CAP: usize = 1024;
+/// At the 1 KiB default chunk size this is ~8 MiB of headroom, which is more
+/// than any consumer that is actually making progress will ever need.
+pub const DEFAULT_SUBSCRIBER_CAPACITY: usize = 8192;
 
-/// Stream of output data.
+/// A borrowed view of the session's output stream.
 ///
-/// Wraps a `BroadcastStream` that properly parks the waker instead of
-/// busy-spinning when no data is available.
+/// Implements [`Stream<Item = Bytes>`](futures_util::Stream); the chunk
+/// boundaries are those of the underlying protocol messages and carry no
+/// meaning, so consumers should treat this as a byte stream.
+///
+/// The stream ends when the session closes, or when this subscriber is evicted
+/// for falling too far behind — [`lagged`](Self::lagged) distinguishes the two.
 pub struct OutputStream {
-    inner: BroadcastStream<Bytes>,
-    closed: Arc<AtomicBool>,
+    rx: mpsc::Receiver<Bytes>,
+    lagged: Arc<AtomicBool>,
 }
 
 impl OutputStream {
-    fn new(rx: broadcast::Receiver<Bytes>, closed: Arc<AtomicBool>) -> Self {
-        Self {
-            inner: BroadcastStream::new(rx),
-            closed,
-        }
+    /// Receive the next chunk, or `None` once the stream has ended.
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        self.rx.recv().await
     }
 
-    /// Return a stream that immediately yields `None` (already-closed multiplexer).
+    /// Whether this subscriber was evicted for falling behind.
     ///
-    /// Used by `output_stream()` when called after `close()` to avoid panicking.
-    fn closed(closed: Arc<AtomicBool>) -> Self {
-        // Create a one-shot channel and immediately drop the sender so the
-        // receiver side yields None on its first poll.
-        let (tx, rx) = broadcast::channel(1);
-        drop(tx);
+    /// Only meaningful once the stream has ended.  `true` means bytes were lost
+    /// and any framing built on top of this stream must be considered corrupt;
+    /// `false` means the session closed normally.
+    pub fn lagged(&self) -> bool {
+        self.lagged.load(Ordering::Acquire)
+    }
+
+    /// An already-ended stream, for subscribing to a closed session.
+    fn ended() -> Self {
+        let (_tx, rx) = mpsc::channel(1);
         Self {
-            inner: BroadcastStream::new(rx),
-            closed,
+            rx,
+            lagged: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -54,266 +73,195 @@ impl OutputStream {
 impl Stream for OutputStream {
     type Item = Bytes;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Poll::Ready(None);
-        }
-
-        // BroadcastStream properly parks the waker — no busy-wait.
-        match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(item)),
-            Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
-                warn!(skipped, "Output stream lagged, messages were dropped");
-                // Re-poll to get the next available message
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => {
-                // Check close flag after pending (sender may have closed)
-                if self.closed.load(Ordering::SeqCst) {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Bytes>> {
+        self.rx.poll_recv(cx)
     }
 }
 
-/// Channel multiplexer for managing streams.
-///
-/// Production-grade implementation with broadcast channels for fan-out.
-/// On close, the sender is dropped so all `BroadcastStream` receivers are
-/// woken immediately (no polling delay).
-pub struct ChannelMultiplexer {
-    /// Broadcast sender for output data (stdout/stderr combined).
-    /// Wrapped in `Mutex<Option<_>>` so `close()` can drop it, which
-    /// wakes all parked receivers instantly.
-    output_tx: std::sync::Mutex<Option<broadcast::Sender<Bytes>>>,
-    /// Lossless direct subscribers (bounded mpsc-backed, never silently drops frames).
-    /// Used by the smux `recv_task` to avoid broadcast-lag data corruption.
-    direct_subs: std::sync::Mutex<Vec<mpsc::Sender<Bytes>>>,
-
-    /// Flag to signal channel closure (fast check without lock).
-    closed: Arc<AtomicBool>,
+impl std::fmt::Debug for OutputStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputStream")
+            .field("lagged", &self.lagged())
+            .finish()
+    }
 }
 
-impl ChannelMultiplexer {
-    /// Create a new channel multiplexer.
-    ///
-    /// Uses a broadcast channel with capacity of 8192 messages — large enough
-    /// for high-throughput shell output without silently dropping data for
-    /// typical consumers.
-    pub fn new() -> Self {
-        let (output_tx, _) = broadcast::channel(8192);
+#[derive(Debug)]
+struct Subscriber {
+    tx: mpsc::Sender<Bytes>,
+    lagged: Arc<AtomicBool>,
+}
 
-        Self {
-            output_tx: std::sync::Mutex::new(Some(output_tx)),
-            direct_subs: std::sync::Mutex::new(Vec::new()),
-            closed: Arc::new(AtomicBool::new(false)),
+/// Distributes agent output to every [`OutputStream`] subscriber.
+#[derive(Debug, Default)]
+pub(crate) struct OutputFanout {
+    subscribers: Mutex<Vec<Subscriber>>,
+    closed: AtomicBool,
+}
+
+impl OutputFanout {
+    /// Create an empty fan-out.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a subscriber with the given queue depth.
+    ///
+    /// Subscribing to an already-closed fan-out yields an immediately-ended
+    /// stream rather than one that blocks forever.
+    pub(crate) fn subscribe(&self, capacity: usize) -> OutputStream {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        let lagged = Arc::new(AtomicBool::new(false));
+
+        let mut subscribers = self.lock();
+        // Check `closed` while holding the lock: `close()` sets the flag and
+        // then takes the same lock, so this ordering cannot miss a concurrent
+        // close and leave a subscriber attached to a dead session.
+        if self.closed.load(Ordering::Acquire) {
+            return OutputStream::ended();
         }
+        subscribers.push(Subscriber {
+            tx,
+            lagged: Arc::clone(&lagged),
+        });
+
+        OutputStream { rx, lagged }
     }
 
-    /// Create an output stream that receives broadcasted data.
-    ///
-    /// If called after `close()`, returns a stream that immediately yields
-    /// `None` rather than panicking.  This prevents a process-killing race
-    /// during concurrent shutdown.
-    pub fn output_stream(&self) -> OutputStream {
-        let guard = self.output_tx.lock().expect("output_tx lock poisoned");
-        match guard.as_ref() {
-            Some(tx) => OutputStream::new(tx.subscribe(), Arc::clone(&self.closed)),
-            // Multiplexer already closed — return an immediately-terminated stream.
-            None => OutputStream::closed(Arc::clone(&self.closed)),
-        }
-    }
-
-    /// Close the output channel, causing all output streams to return None.
-    ///
-    /// Drops the broadcast sender so all parked `BroadcastStream` receivers
-    /// are woken immediately and yield `None`.
-    pub fn close(&self) {
-        debug!("Closing channel multiplexer");
-        self.closed.store(true, Ordering::SeqCst);
-        // Drop the sender — this wakes all receivers instantly
-        let _ = self
-            .output_tx
-            .lock()
-            .expect("output_tx lock poisoned")
-            .take();
-        // Clear direct subscribers so their channels close too.
-        self.direct_subs
-            .lock()
-            .expect("direct_subs lock poisoned")
-            .clear();
-    }
-
-    /// Send output data to all subscribed output streams.
-    ///
-    /// Synchronous — no async overhead (broadcast send is non-blocking).
-    pub fn send_output(&self, data: Bytes) -> Result<()> {
-        let guard = self.output_tx.lock().expect("output_tx lock poisoned");
-        if let Some(tx) = guard.as_ref() {
-            if tx.send(data.clone()).is_err() {
-                debug!("No active output stream receivers");
+    /// Deliver a chunk to every subscriber, evicting any that cannot keep up.
+    pub(crate) fn send(&self, data: Bytes) {
+        let mut subscribers = self.lock();
+        subscribers.retain(|sub| match sub.tx.try_send(data.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    bytes = data.len(),
+                    "output subscriber is not keeping up; evicting it to protect the session"
+                );
+                // Publish the flag before dropping the sender so a consumer that
+                // wakes on the channel close is guaranteed to observe it.
+                sub.lagged.store(true, Ordering::Release);
+                false
             }
-        }
-        drop(guard);
-        // Fan out to lossless direct subscribers.
-        // try_send keeps send_output synchronous.
-        //
-        // Overflow policy: if a single subscriber's channel is full, evict
-        // *only that subscriber* — do NOT close the entire multiplexer.  The
-        // smux recv_task will detect its channel closure (Closed variant) and
-        // initiate its own teardown, which keeps the shutdown path contained to
-        // the one component that actually overflowed.  Closing the whole mux
-        // here would abruptly cancel every other active stream for what is
-        // essentially a single slow consumer.
-        let direct_sub_count = self
-            .direct_subs
-            .lock()
-            .expect("direct_subs lock poisoned")
-            .len();
-        debug!(
-            direct_sub_count,
-            bytes = data.len(),
-            "send_output: fanning out to direct subscribers"
-        );
-        self.direct_subs
-            .lock()
-            .expect("direct_subs lock poisoned")
-            .retain(|tx| match tx.try_send(data.clone()) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        bytes = data.len(),
-                        "Lossless subscriber channel full — evicting slow subscriber"
-                    );
-                    false // evict this subscriber only
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => false, // dead subscriber
-            });
-        Ok(())
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
     }
 
-    /// Subscribe to a lossless output tap backed by a bounded mpsc channel.
-    ///
-    /// Unlike the broadcast-based [`output_stream`], this receiver never silently
-    /// drops frames — every byte written by `send_output` is queued until the
-    /// subscriber consumes it.  Use this for the smux `recv_task` where dropped
-    /// bytes corrupt framing.
-    ///
-    /// **Backpressure policy**: the channel has a fixed capacity of
-    /// `DIRECT_SUB_CHANNEL_CAP` messages.  If the consumer falls behind and the
-    /// channel fills up, `send_output` evicts this subscriber (drops the sender
-    /// for this receiver only) and emits a `warn!` log.  The multiplexer and all
-    /// other subscribers continue operating normally.  The evicted receiver will
-    /// see `None` on the next `recv()` call, signalling that it should treat the
-    /// gap as a fatal framing error and shut down its own pipeline.
-    pub fn subscribe_lossless(&self) -> mpsc::Receiver<Bytes> {
-        let (tx, rx) = mpsc::channel(DIRECT_SUB_CHANNEL_CAP);
-        let mut guard = self.direct_subs.lock().expect("direct_subs lock poisoned");
-        // Check the closed flag *while holding the lock* to close the race
-        // with close(), which sets `closed` before acquiring this same lock.
-        // If already closed, `tx` is dropped here so `rx.recv()` returns
-        // None immediately instead of hanging forever.
-        if !self.closed.load(Ordering::SeqCst) {
-            guard.push(tx);
+    /// End every subscriber's stream and reject future subscriptions.
+    pub(crate) fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
         }
-        rx
+        debug!("closing session output fan-out");
+        self.lock().clear();
     }
-}
 
-impl Default for ChannelMultiplexer {
-    fn default() -> Self {
-        Self::new()
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Subscriber>> {
+        self.subscribers.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
+    use futures_util::StreamExt;
 
     #[tokio::test]
-    async fn test_output_stream() {
-        let mux = ChannelMultiplexer::new();
-        let mut stream = mux.output_stream();
+    async fn every_subscriber_sees_every_chunk() {
+        let fanout = OutputFanout::new();
+        let mut a = fanout.subscribe(8);
+        let mut b = fanout.subscribe(8);
 
-        // Send some data
-        mux.send_output(Bytes::from("test1")).unwrap();
-        mux.send_output(Bytes::from("test2")).unwrap();
+        fanout.send(Bytes::from_static(b"one"));
+        fanout.send(Bytes::from_static(b"two"));
 
-        // BroadcastStream properly wakes — no sleep needed
-        let data1 = stream.next().await.unwrap();
-        assert_eq!(data1, Bytes::from("test1"));
-
-        let data2 = stream.next().await.unwrap();
-        assert_eq!(data2, Bytes::from("test2"));
+        assert_eq!(a.next().await.unwrap(), Bytes::from_static(b"one"));
+        assert_eq!(a.next().await.unwrap(), Bytes::from_static(b"two"));
+        assert_eq!(b.next().await.unwrap(), Bytes::from_static(b"one"));
+        assert_eq!(b.next().await.unwrap(), Bytes::from_static(b"two"));
     }
 
     #[tokio::test]
-    async fn test_multiple_output_streams() {
-        let mux = ChannelMultiplexer::new();
-        let mut stream1 = mux.output_stream();
-        let mut stream2 = mux.output_stream();
+    async fn close_ends_open_streams() {
+        let fanout = OutputFanout::new();
+        let mut stream = fanout.subscribe(8);
+        fanout.send(Bytes::from_static(b"before"));
+        fanout.close();
 
-        mux.send_output(Bytes::from("broadcast")).unwrap();
-
-        let data1 = stream1.next().await.unwrap();
-        let data2 = stream2.next().await.unwrap();
-
-        assert_eq!(data1, Bytes::from("broadcast"));
-        assert_eq!(data2, Bytes::from("broadcast"));
+        // Buffered data is still delivered, then the stream ends.
+        assert_eq!(stream.next().await.unwrap(), Bytes::from_static(b"before"));
+        assert!(stream.next().await.is_none());
+        assert!(!stream.lagged(), "a clean close is not a lag");
     }
 
     #[tokio::test]
-    async fn test_close_terminates_stream() {
-        let mux = ChannelMultiplexer::new();
-        let mut stream = mux.output_stream();
-
-        mux.send_output(Bytes::from("before_close")).unwrap();
-        let data = stream.next().await.unwrap();
-        assert_eq!(data, Bytes::from("before_close"));
-
-        // Close the multiplexer
-        mux.close();
-
-        // Stream should terminate
-        let result =
-            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
-        assert!(result.is_ok(), "Stream should terminate after close");
-        assert!(result.unwrap().is_none());
+    async fn subscribing_after_close_yields_an_ended_stream() {
+        let fanout = OutputFanout::new();
+        fanout.close();
+        let mut stream = fanout.subscribe(8);
+        assert!(stream.next().await.is_none());
     }
 
+    /// A slow consumer must be evicted rather than back-pressuring the session,
+    /// and must be able to tell that it lost bytes.
     #[tokio::test]
-    async fn test_output_stream_after_close_returns_none() {
-        // H-1: output_stream() after close() must return a closed stream, not panic.
-        let mux = ChannelMultiplexer::new();
-        mux.close();
-        let mut stream = mux.output_stream(); // must not panic
-        let result =
-            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
-        assert!(result.is_ok());
+    async fn slow_subscriber_is_evicted_and_reports_lagging() {
+        let fanout = OutputFanout::new();
+        let mut slow = fanout.subscribe(2);
+        let mut healthy = fanout.subscribe(64);
+
+        for i in 0..10u8 {
+            fanout.send(Bytes::from(vec![i]));
+        }
+
+        // The slow subscriber gets what fitted, then ends with the lag flag set.
+        let mut received = 0;
+        while slow.next().await.is_some() {
+            received += 1;
+        }
         assert!(
-            result.unwrap().is_none(),
-            "Post-close stream should be empty"
+            received <= 2,
+            "received {received} chunks from a depth-2 queue"
         );
+        assert!(slow.lagged(), "eviction must be observable");
+
+        // The healthy subscriber is untouched.
+        for i in 0..10u8 {
+            assert_eq!(healthy.next().await.unwrap(), Bytes::from(vec![i]));
+        }
     }
 
     #[tokio::test]
-    async fn test_no_busy_wait_on_empty() {
-        // Verify that polling an empty stream doesn't consume CPU.
-        // BroadcastStream parks the waker properly, so a timeout should
-        // return Err (timeout) instead of spinning forever.
-        let mux = ChannelMultiplexer::new();
-        let mut stream = mux.output_stream();
+    async fn dropped_subscribers_are_reaped() {
+        let fanout = OutputFanout::new();
+        let keep = fanout.subscribe(8);
+        drop(fanout.subscribe(8));
 
+        fanout.send(Bytes::from_static(b"x"));
+        assert_eq!(
+            fanout.lock().len(),
+            1,
+            "the dropped subscriber must be reaped"
+        );
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn close_is_idempotent() {
+        let fanout = OutputFanout::new();
+        fanout.close();
+        fanout.close();
+        let mut stream = fanout.subscribe(4);
+        assert!(stream.next().await.is_none());
+    }
+
+    /// Polling an idle stream must park the task rather than spin.
+    #[tokio::test]
+    async fn idle_stream_parks_instead_of_spinning() {
+        let fanout = OutputFanout::new();
+        let mut stream = fanout.subscribe(8);
         let result =
             tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await;
-
-        // Should timeout (Err), NOT return None (which would mean busy-spin)
-        assert!(result.is_err(), "Empty stream should park, not spin");
+        assert!(result.is_err(), "an idle stream must not resolve");
     }
 }

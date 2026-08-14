@@ -1,205 +1,142 @@
-//! # AWS SSM Bridge
+//! A Rust implementation of the AWS Systems Manager Session Manager protocol.
 //!
-//! A high-performance Rust library implementing the AWS Systems Manager (SSM)
-//! Session Manager protocol with first-class Python bindings.
+//! The official [`session-manager-plugin`] is a CLI binary. This is a library:
+//! open sessions, stream bytes, and forward ports from inside your own async
+//! application, with no subprocess and no plugin to install.
 //!
-//! ## Architecture Philosophy
+//! ```no_run
+//! use aws_ssm_bridge::SessionBuilder;
+//! use futures_util::StreamExt;
 //!
-//! **Flat module structure** - Following Rust best practices (tokio, serde, reqwest):
-//! - Direct module access without deep nesting
-//! - Clear naming makes deep hierarchies unnecessary
-//! - The crate boundary provides encapsulation
+//! # async fn example() -> aws_ssm_bridge::Result<()> {
+//! let session = SessionBuilder::new("i-0123456789abcdef0").start().await?;
+//! session.wait_ready().await?;
 //!
-//! ## Module Organization
-//!
-//! ### Public API (re-exported at crate root)
-//! - [`SessionManager`] - High-level session management
-//! - [`Session`] - Active session handle with streaming API
-//! - [`SessionConfig`] - Session configuration
-//! - [`Error`], [`Result`] - Error handling
-//!
-//! ### Public Modules (for advanced usage)
-//! - [`errors`] - Domain-specific error types with retry classification
-//! - [`protocol`] - SSM protocol message types and framing
-//! - [`session`] - Session management internals
-//! - [`retry`] - Exponential backoff and circuit breaker patterns
-//!
-//! ### Internal Modules (implementation details)
-//! - `connection` - WebSocket connection lifecycle
-//! - `channels` - Channel multiplexing for stdin/stdout/stderr
-//!
-//! ## Usage
-//!
-//! ```rust,no_run
-//! use aws_ssm_bridge::{SessionConfig, SessionManager};
-//! use futures::StreamExt;
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Create session manager
-//! let manager = SessionManager::new().await?;
-//!
-//! // Start a session
-//! let mut session = manager.start_session(SessionConfig {
-//!     target: "i-1234567890abcdef0".to_string(),
-//!     ..Default::default()
-//! }).await?;
-//!
-//! // Stream output
 //! let mut output = session.output();
-//! tokio::spawn(async move {
-//!     while let Some(data) = output.next().await {
-//!         print!("{}", String::from_utf8_lossy(&data));
-//!     }
-//! });
+//! session.send(&b"uname -a\r"[..]).await?;
 //!
-//! // Send commands
-//! session.send(bytes::Bytes::from("ls -la\n")).await?;
-//!
-//! // Clean shutdown
+//! while let Some(chunk) = output.next().await {
+//!     print!("{}", String::from_utf8_lossy(&chunk));
+//! }
 //! session.terminate().await?;
-//! # Ok(())
-//! # }
+//! # Ok(()) }
 //! ```
 //!
-//! ## Disclaimer
+//! # What you get
 //!
-//! This project is not affiliated with, endorsed by, or sponsored by
-//! Amazon Web Services, Inc. or any of its affiliates.
+//! | Capability | Where |
+//! |---|---|
+//! | Shell and command sessions | [`Session`], [`documents`] |
+//! | TCP port forwarding (smux-multiplexed) | [`PortForwarder`] |
+//! | End-to-end KMS session encryption | [`crypto`] (feature `kms`) |
+//! | Interactive terminal | [`InteractiveShell`] (feature `interactive`) |
+//! | Automatic reconnection | [`ReconnectingSession`] |
+//! | Many concurrent sessions | [`SessionPool`] |
+//! | Metrics hooks | [`metrics`] |
+//!
+//! # Session lifetime
+//!
+//! A [`Session`] is either running or closed, and every way it can end —
+//! [`terminate`](Session::terminate), the agent hanging up, a dead network, a
+//! protocol violation — resolves [`Session::closed`] and records a
+//! [`CloseReason`]. Build on that signal rather than polling:
+//!
+//! ```no_run
+//! # use std::sync::Arc;
+//! # async fn example(session: Arc<aws_ssm_bridge::Session>) {
+//! tokio::select! {
+//!     () = session.closed() => {
+//!         eprintln!("session ended: {}", session.close_reason().unwrap());
+//!     }
+//!     _ = do_work(&session) => {}
+//! }
+//! # }
+//! # async fn do_work(_: &aws_ssm_bridge::Session) {}
+//! ```
+//!
+//! # Ordering and delivery
+//!
+//! The protocol layer handles sequencing, acknowledgement, retransmission and
+//! reordering, so [`Session::send`] and [`Session::output`] behave like an
+//! ordered, lossless byte stream. Message boundaries are an artefact of chunking
+//! and carry no meaning.
+//!
+//! # Feature flags
+//!
+//! | Feature | Default | Effect |
+//! |---|---|---|
+//! | `interactive` | yes | [`terminal`] and [`InteractiveShell`]; pulls in `crossterm` |
+//! | `kms` | yes | KMS session encryption; pulls in `aws-sdk-kms` and `aes-gcm` |
+//! | `python` | no | PyO3 bindings |
+//! | `extension-module` | no | Link the bindings as a Python extension module; set by `maturin` |
+//!
+//! Without `kms`, a session whose account requires encrypted sessions fails the
+//! handshake with an explicit error rather than downgrading to plaintext.
+//!
+//! `extension-module` is separate from `python` because it leaves the CPython
+//! symbols for the interpreter to resolve at load time: correct for a wheel,
+//! fatal for a test binary. `--all-features` therefore does not link; name the
+//! features you want.
+//!
+//! # Not affiliated with AWS
+//!
+//! This is an independent implementation, not endorsed by or sponsored by
+//! Amazon Web Services, Inc.
+//!
+//! [`session-manager-plugin`]: https://github.com/aws/session-manager-plugin
 
-#![deny(unsafe_code)]
-#![warn(missing_docs, rust_2018_idioms)]
+// ---------------------------------------------------------------------------
+// Modules
+// ---------------------------------------------------------------------------
 
-/// Library version
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Maximum message payload size (10MB)
-pub const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024;
-
-// ============================================================================
-// Public Modules
-// ============================================================================
-
-/// Error types and result aliases
-pub mod errors;
-
-/// SSM protocol message types and framing
-pub mod protocol;
-
-/// Binary protocol implementation (AWS-compatible)
-pub mod binary_protocol;
-
-/// Session management and lifecycle
-pub mod session;
-
-/// Retry logic with exponential backoff and circuit breaker
-pub mod retry;
-
-/// Token bucket rate limiting for DoS protection
-pub mod rate_limit;
-
-/// Session builder for fluent API
-pub mod builder;
-
-/// Type-safe SSM document definitions
-pub mod documents;
-
-/// Port forwarding implementation
-pub mod port_forward;
-
-/// AWS SSM handshake protocol (3-phase)
-pub mod handshake;
-
-/// Acknowledgment and retransmission with RTT tracking
 pub mod ack;
-
-/// Cross-platform terminal handling for interactive shells
-pub mod terminal;
-
-/// Interactive shell sessions with full terminal support
-pub mod interactive;
-
-/// Metrics and observability hooks
+pub mod binary_protocol;
+pub mod builder;
+pub mod crypto;
+pub mod documents;
+pub mod errors;
+pub mod handshake;
 pub mod metrics;
-
-/// Graceful shutdown utilities
+pub mod mux;
+pub mod pool;
+pub mod port_forward;
+pub mod reconnect;
+pub mod session;
 pub mod shutdown;
 
-/// Session pool for managing multiple concurrent sessions
-pub mod pool;
-
-/// Session reconnection with exponential backoff
-pub mod reconnect;
-
-/// Structured tracing for distributed observability
-pub mod tracing_ext;
-
-// ============================================================================
-// Internal Modules (not re-exported)
-// ============================================================================
+#[cfg(feature = "interactive")]
+pub mod interactive;
+#[cfg(feature = "interactive")]
+pub mod terminal;
 
 mod channels;
 mod connection;
-pub mod mux;
 
-// ============================================================================
-// Feature-Gated Modules
-// ============================================================================
-
-/// Python bindings via PyO3
+/// PyO3 bindings.
 #[cfg(feature = "python")]
 pub mod python;
 
-// ============================================================================
-// Crate-Root Re-exports (convenience)
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Re-exports
+// ---------------------------------------------------------------------------
 
-// Primary API types
-pub use session::{Session, SessionConfig, SessionManager, SessionState};
-
-// Builder pattern for ergonomic session creation
 pub use builder::SessionBuilder;
-
-// Error handling
-pub use errors::{Error, Result};
-
-// Protocol types
-pub use protocol::{MessageType, SessionType};
-
-// Retry utilities
-pub use retry::{RetryConfig, RetryStrategy};
-
-// Rate limiting
-pub use rate_limit::{RateLimitConfig, RateLimitResult, RateLimiter};
-
-// Port forwarding
-pub use port_forward::{PortForwardConfig, PortForwarder};
-
-// smux stream diagnostics (close reason for forwarded streams)
-pub use mux::StreamCloseReason;
-
-// Streaming API
 pub use channels::OutputStream;
-
-// Terminal handling
-pub use terminal::{Terminal, TerminalConfig, TerminalInput, TerminalSize};
-
-// Interactive shell
-pub use interactive::{InteractiveConfig, InteractiveShell};
-
-// Metrics (observability hooks)
-pub use metrics::{register_metrics, MetricsRecorder};
-
-// Graceful shutdown
-pub use shutdown::{install_signal_handlers, ShutdownGuard, ShutdownSignal};
-
-// Session pool
+pub use connection::EndpointPolicy;
+pub use documents::{SessionType, SsmDocument};
+pub use errors::{Error, Result};
+pub use metrics::MetricsRecorder;
+pub use mux::{SmuxConfig, SmuxSession, SmuxStream};
 pub use pool::{PoolConfig, PoolStats, SessionPool};
+pub use port_forward::{PortForwardConfig, PortForwarder};
+pub use reconnect::{ReconnectConfig, ReconnectEvent, ReconnectingSession};
+pub use session::{CloseReason, DocumentSpec, Session, SessionConfig, SessionManager};
+pub use shutdown::{install_signal_handlers, ShutdownSignal};
 
-// Reconnection
-pub use reconnect::{ReconnectConfig, ReconnectEvent, ReconnectStats, ReconnectingSession};
+#[cfg(feature = "interactive")]
+pub use interactive::{InteractiveConfig, InteractiveShell};
+#[cfg(feature = "interactive")]
+pub use terminal::TerminalSize;
 
-// Tracing
-pub use tracing_ext::{
-    span_connection, span_handshake, span_receive, span_send, span_session, SessionSpan,
-    TraceContext,
-};
+/// The version of this crate.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

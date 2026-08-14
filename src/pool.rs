@@ -1,61 +1,44 @@
-//! Session pool for managing multiple concurrent SSM sessions.
+//! Managing many concurrent sessions.
 //!
-//! Provides efficient management of multiple sessions with:
-//! - Automatic cleanup of terminated sessions
-//! - Configurable pool size limits
-//! - Session lookup by ID or target
-//! - Graceful shutdown of all sessions
+//! A pool is worth having when you fan out across a fleet: it caps how many
+//! sessions you hold open, indexes them by ID and target, and terminates the lot
+//! on shutdown so nothing is left running on the AWS side.
 //!
-//! # Example
+//! Sessions that end on their own — a dead network, an agent restart, an idle
+//! timeout — are dropped from the pool the next time it is inspected. There is
+//! no background reaper: [`Session::is_closed`] is authoritative, so filtering on
+//! access is both cheaper and impossible to get out of sync.
 //!
-//! ```rust,no_run
-//! use aws_ssm_bridge::pool::{SessionPool, PoolConfig};
+//! ```no_run
+//! use aws_ssm_bridge::{PoolConfig, SessionPool};
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Create a pool with max 10 concurrent sessions
-//! let pool = SessionPool::new(PoolConfig {
-//!     max_sessions: 10,
-//!     ..Default::default()
-//! }).await?;
+//! # async fn example() -> aws_ssm_bridge::Result<()> {
+//! let pool = SessionPool::new(PoolConfig { max_sessions: 25, ..Default::default() }).await?;
 //!
-//! // Start sessions (automatically tracked)
-//! let session1 = pool.start_session("i-instance1").await?;
-//! let session2 = pool.start_session("i-instance2").await?;
+//! let session = pool.start("i-0123456789abcdef0").await?;
+//! session.wait_ready().await?;
+//! session.send(&b"uptime\r"[..]).await?;
 //!
-//! // Get session by ID
-//! if let Some(session) = pool.get(&session1.id()).await {
-//!     session.send(bytes::Bytes::from("ls\n")).await?;
-//! }
-//!
-//! // List all active sessions
-//! for id in pool.list_sessions().await {
-//!     println!("Active session: {}", id);
-//! }
-//!
-//! // Graceful shutdown of all sessions
+//! println!("{} sessions live", pool.stats().live);
 //! pool.shutdown().await;
-//! # Ok(())
-//! # }
+//! # Ok(()) }
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use std::sync::{Arc, Mutex};
 
 use crate::errors::{Error, Result};
-use crate::session::{Session, SessionConfig, SessionId, SessionManager, SessionState};
-use crate::shutdown::ShutdownSignal;
+use crate::session::{Session, SessionConfig, SessionManager};
 
-/// Configuration for the session pool.
+/// Limits and defaults for a [`SessionPool`].
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
-    /// Maximum number of concurrent sessions (0 = unlimited)
+    /// Maximum live sessions; `0` means unlimited.
     pub max_sessions: usize,
-    /// Whether to allow multiple sessions to the same target
+    /// Allow more than one session to the same target.
     pub allow_duplicate_targets: bool,
-    /// Default session configuration template
-    pub default_session_config: SessionConfig,
+    /// Template applied to sessions started through [`SessionPool::start`].
+    pub session_defaults: SessionConfig,
 }
 
 impl Default for PoolConfig {
@@ -63,409 +46,302 @@ impl Default for PoolConfig {
         Self {
             max_sessions: 100,
             allow_duplicate_targets: true,
-            default_session_config: SessionConfig::default(),
+            session_defaults: SessionConfig::default(),
         }
     }
 }
 
-/// Statistics about the session pool.
-#[derive(Debug, Clone, Default)]
+/// A point-in-time view of a pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PoolStats {
-    /// Number of currently active sessions
-    pub active_sessions: usize,
-    /// Total sessions started since pool creation
-    pub total_started: u64,
-    /// Total sessions terminated since pool creation
-    pub total_terminated: u64,
-    /// Number of sessions by target
-    pub sessions_per_target: HashMap<String, usize>,
+    /// Sessions currently open.
+    pub live: usize,
+    /// Sessions started over the pool's lifetime.
+    pub started: u64,
+    /// Sessions that have ended, however they ended.
+    pub ended: u64,
 }
 
-/// A pool for managing multiple concurrent SSM sessions.
-///
-/// The pool automatically tracks sessions and provides utilities for
-/// managing their lifecycle.
+/// A bounded collection of concurrent sessions.
 pub struct SessionPool {
-    /// Pool configuration
-    config: PoolConfig,
-    /// Session manager for creating new sessions
     manager: SessionManager,
-    /// Active sessions indexed by session ID
-    sessions: Arc<RwLock<HashMap<SessionId, SessionEntry>>>,
-    /// Sessions indexed by target for quick lookup
-    by_target: Arc<RwLock<HashMap<String, Vec<SessionId>>>>,
-    /// Statistics
-    stats: Arc<RwLock<PoolStats>>,
-    /// Shutdown signal
-    shutdown: ShutdownSignal,
-}
-
-/// Internal entry tracking a session.
-struct SessionEntry {
-    session: Session,
-    target: String,
+    config: PoolConfig,
+    sessions: Mutex<HashMap<String, Arc<Session>>>,
+    started: Mutex<u64>,
 }
 
 impl SessionPool {
-    /// Create a new session pool with the given configuration.
+    /// Build a pool with its own [`SessionManager`].
     pub async fn new(config: PoolConfig) -> Result<Self> {
-        let manager = SessionManager::new().await?;
-
-        Ok(Self {
-            config,
-            manager,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            by_target: Arc::new(RwLock::new(HashMap::new())),
-            stats: Arc::new(RwLock::new(PoolStats::default())),
-            shutdown: ShutdownSignal::new(),
-        })
+        Ok(Self::with_manager(config, SessionManager::new().await?))
     }
 
-    /// Create a session pool with a custom session manager.
+    /// Build a pool around an existing manager.
     pub fn with_manager(config: PoolConfig, manager: SessionManager) -> Self {
         Self {
-            config,
             manager,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            by_target: Arc::new(RwLock::new(HashMap::new())),
-            stats: Arc::new(RwLock::new(PoolStats::default())),
-            shutdown: ShutdownSignal::new(),
+            config,
+            sessions: Mutex::new(HashMap::new()),
+            started: Mutex::new(0),
         }
     }
 
-    /// Start a new session to the given target.
+    /// Start a shell session against `target` using the pool's defaults.
+    pub async fn start(&self, target: impl Into<String>) -> Result<Arc<Session>> {
+        let config = SessionConfig {
+            target: target.into(),
+            ..self.config.session_defaults.clone()
+        };
+        self.start_with(config).await
+    }
+
+    /// Start a session with an explicit configuration.
     ///
-    /// Uses the pool's default session configuration.
-    pub async fn start_session(&self, target: &str) -> Result<SessionHandle<'_>> {
-        let mut config = self.config.default_session_config.clone();
-        config.target = target.to_string();
-        self.start_session_with_config(config).await
-    }
-
-    /// Start a new session with custom configuration.
-    pub async fn start_session_with_config(
-        &self,
-        config: SessionConfig,
-    ) -> Result<SessionHandle<'_>> {
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if the pool is full, or if a session to this
+    /// target already exists and duplicates are disallowed.
+    pub async fn start_with(&self, config: SessionConfig) -> Result<Arc<Session>> {
         let target = config.target.clone();
+        self.check_admission(&target)?;
 
-        // Pre-check with read lock (fast path rejection)
-        // Note: This is an optimization; the authoritative check happens below with write lock
-        {
-            let sessions = self.sessions.read().await;
-            if self.config.max_sessions > 0 && sessions.len() >= self.config.max_sessions {
-                return Err(Error::Config(format!(
-                    "Pool limit reached: {} sessions (max: {})",
-                    sessions.len(),
-                    self.config.max_sessions
-                )));
-            }
-        }
+        let session = Arc::new(self.manager.start_session(config).await?);
 
-        // Check duplicate target policy (fast path)
-        if !self.config.allow_duplicate_targets {
-            let by_target = self.by_target.read().await;
-            if let Some(existing) = by_target.get(&target) {
-                if !existing.is_empty() {
-                    return Err(Error::Config(format!(
-                        "Session already exists for target: {}",
-                        target
-                    )));
+        // Re-check under the lock: another task may have filled the last slot
+        // while this one was waiting on StartSession. Terminating the session we
+        // just opened is the only way to honour the limit without leaking it.
+        let rejection = {
+            let mut sessions = self.lock();
+            reap(&mut sessions);
+            match admit(&self.config, &sessions, &target) {
+                Ok(()) => {
+                    sessions.insert(session.id().to_owned(), Arc::clone(&session));
+                    None
                 }
+                Err(e) => Some(e),
             }
+        };
+
+        if let Some(e) = rejection {
+            let _ = session.terminate().await;
+            return Err(e);
         }
+        *lock(&self.started) += 1;
 
-        // Start the session (this is the slow network call)
-        let session = self.manager.start_session(config).await?;
-        let session_id = session.id().to_string();
-
-        // Track in pool with write lock - re-check limits to prevent TOCTOU race
-        {
-            let mut sessions = self.sessions.write().await;
-
-            // Re-check pool limits under write lock to prevent race condition
-            if self.config.max_sessions > 0 && sessions.len() >= self.config.max_sessions {
-                // Pool filled while we were starting session - terminate and return error
-                // We already started the session so we need to clean it up
-                drop(sessions); // Release lock before async termination
-                let session = session;
-                let _ = session.terminate().await;
-                return Err(Error::Config(
-                    "Pool limit reached while starting session (race condition)".to_string(),
-                ));
-            }
-
-            let mut by_target = self.by_target.write().await;
-
-            // Re-check duplicate target under write lock
-            if !self.config.allow_duplicate_targets {
-                if let Some(existing) = by_target.get(&target) {
-                    if !existing.is_empty() {
-                        drop(sessions);
-                        drop(by_target);
-                        let session = session;
-                        let _ = session.terminate().await;
-                        return Err(Error::Config(format!(
-                            "Session already exists for target: {} (race condition)",
-                            target
-                        )));
-                    }
-                }
-            }
-
-            let mut stats = self.stats.write().await;
-
-            sessions.insert(
-                session_id.clone(),
-                SessionEntry {
-                    session,
-                    target: target.clone(),
-                },
-            );
-
-            by_target
-                .entry(target.clone())
-                .or_default()
-                .push(session_id.clone());
-
-            stats.active_sessions = sessions.len();
-            stats.total_started += 1;
-            *stats.sessions_per_target.entry(target).or_insert(0) += 1;
-        }
-
-        info!(session_id = %session_id, "Session added to pool");
-
-        Ok(SessionHandle {
-            session_id,
-            pool: self,
-        })
+        Ok(session)
     }
 
-    /// Get a session by ID.
-    pub async fn get(&self, session_id: &str) -> Option<SessionRef<'_>> {
-        let sessions = self.sessions.read().await;
-        if sessions.contains_key(session_id) {
-            Some(SessionRef {
-                session_id: session_id.to_string(),
-                pool: self,
-            })
-        } else {
-            None
-        }
+    /// Add an externally created session to the pool.
+    ///
+    /// Useful when a session was built with [`SessionBuilder`] but should share
+    /// the pool's lifecycle management.
+    ///
+    /// [`SessionBuilder`]: crate::SessionBuilder
+    pub fn insert(&self, session: Arc<Session>) -> Result<Arc<Session>> {
+        let target = session.config().target.clone();
+        let mut sessions = self.lock();
+        reap(&mut sessions);
+        admit(&self.config, &sessions, &target)?;
+        sessions.insert(session.id().to_owned(), Arc::clone(&session));
+        drop(sessions);
+        *lock(&self.started) += 1;
+        Ok(session)
     }
 
-    /// Get all sessions for a target.
-    pub async fn get_by_target(&self, target: &str) -> Vec<String> {
-        let by_target = self.by_target.read().await;
-        by_target.get(target).cloned().unwrap_or_default()
+    /// Look up a live session by ID.
+    pub fn get(&self, session_id: &str) -> Option<Arc<Session>> {
+        let mut sessions = self.lock();
+        reap(&mut sessions);
+        sessions.get(session_id).cloned()
     }
 
-    /// List all active session IDs.
-    pub async fn list_sessions(&self) -> Vec<String> {
-        let sessions = self.sessions.read().await;
+    /// Every live session against `target`.
+    pub fn for_target(&self, target: &str) -> Vec<Arc<Session>> {
+        let mut sessions = self.lock();
+        reap(&mut sessions);
+        sessions
+            .values()
+            .filter(|s| s.config().target == target)
+            .cloned()
+            .collect()
+    }
+
+    /// Every live session.
+    pub fn sessions(&self) -> Vec<Arc<Session>> {
+        let mut sessions = self.lock();
+        reap(&mut sessions);
+        sessions.values().cloned().collect()
+    }
+
+    /// IDs of every live session.
+    pub fn session_ids(&self) -> Vec<String> {
+        let mut sessions = self.lock();
+        reap(&mut sessions);
         sessions.keys().cloned().collect()
     }
 
-    /// Get pool statistics.
-    pub async fn stats(&self) -> PoolStats {
-        self.stats.read().await.clone()
-    }
-
-    /// Terminate a session by ID.
-    pub async fn terminate(&self, session_id: &str) -> Result<()> {
-        let entry = {
-            let mut sessions = self.sessions.write().await;
-            sessions.remove(session_id)
-        };
-
-        if let Some(entry) = entry {
-            // Remove from target index
-            {
-                let mut by_target = self.by_target.write().await;
-                if let Some(ids) = by_target.get_mut(&entry.target) {
-                    ids.retain(|id| id != session_id);
-                }
-            }
-
-            // Update stats
-            {
-                let mut stats = self.stats.write().await;
-                stats.active_sessions = stats.active_sessions.saturating_sub(1);
-                stats.total_terminated += 1;
-                if let Some(count) = stats.sessions_per_target.get_mut(&entry.target) {
-                    *count = count.saturating_sub(1);
-                }
-            }
-
-            // Terminate the session
-            entry.session.terminate().await?;
-
-            info!(session_id = %session_id, "Session removed from pool");
-        } else {
-            warn!(session_id = %session_id, "Session not found in pool");
+    /// Current counts.
+    pub fn stats(&self) -> PoolStats {
+        let mut sessions = self.lock();
+        reap(&mut sessions);
+        let live = sessions.len();
+        let started = *lock(&self.started);
+        PoolStats {
+            live,
+            started,
+            ended: started.saturating_sub(live as u64),
         }
-
-        Ok(())
     }
 
-    /// Terminate all sessions for a target.
-    pub async fn terminate_target(&self, target: &str) -> Result<()> {
-        let session_ids = self.get_by_target(target).await;
-        for session_id in session_ids {
-            self.terminate(&session_id).await?;
-        }
-        Ok(())
-    }
-
-    /// Shutdown the pool, terminating all sessions.
-    pub async fn shutdown(&self) {
-        info!("Shutting down session pool");
-        self.shutdown.shutdown();
-
-        // Get all session IDs
-        let session_ids: Vec<String> = {
-            let sessions = self.sessions.read().await;
-            sessions.keys().cloned().collect()
-        };
-
-        // Terminate all sessions
-        for session_id in session_ids {
-            if let Err(e) = self.terminate(&session_id).await {
-                warn!(session_id = %session_id, error = ?e, "Failed to terminate session during shutdown");
-            }
-        }
-
-        info!("Session pool shutdown complete");
-    }
-
-    /// Get the shutdown signal for this pool.
-    pub fn shutdown_signal(&self) -> ShutdownSignal {
-        self.shutdown.clone()
-    }
-
-    /// Clean up terminated sessions (garbage collection).
+    /// Terminate one session and drop it from the pool.
     ///
-    /// This removes sessions that have been terminated but not yet removed
-    /// from the pool's tracking structures.
-    pub async fn cleanup(&self) {
-        let mut to_remove = Vec::new();
-
-        {
-            let sessions = self.sessions.read().await;
-            for (id, entry) in sessions.iter() {
-                if entry.session.state().await == SessionState::Terminated {
-                    to_remove.push(id.clone());
-                }
-            }
-        }
-
-        for session_id in to_remove {
-            debug!(session_id = %session_id, "Cleaning up terminated session");
-            let _ = self.terminate(&session_id).await;
-        }
-    }
-}
-
-/// A handle to a session in the pool.
-///
-/// This provides access to the session while keeping it tracked in the pool.
-pub struct SessionHandle<'a> {
-    session_id: String,
-    pool: &'a SessionPool,
-}
-
-impl<'a> SessionHandle<'a> {
-    /// Get the session ID.
-    pub fn id(&self) -> &str {
-        &self.session_id
-    }
-
-    /// Send data to the session.
-    pub async fn send(&self, data: bytes::Bytes) -> Result<()> {
-        let sessions = self.pool.sessions.read().await;
-        if let Some(entry) = sessions.get(&self.session_id) {
-            entry.session.send(data).await
-        } else {
-            Err(Error::InvalidState("Session no longer in pool".to_string()))
+    /// Unknown IDs are not an error — the session may already have ended and
+    /// been reaped.
+    pub async fn terminate(&self, session_id: &str) -> Result<()> {
+        let session = self.lock().remove(session_id);
+        match session {
+            Some(session) => session.terminate().await,
+            None => Ok(()),
         }
     }
 
-    /// Get the output stream for the session.
-    pub async fn output(&self) -> Option<crate::channels::OutputStream> {
-        let sessions = self.pool.sessions.read().await;
-        sessions.get(&self.session_id).map(|e| e.session.output())
+    /// Terminate every session against `target`.
+    pub async fn terminate_target(&self, target: &str) -> Result<()> {
+        let doomed: Vec<Arc<Session>> = {
+            let mut sessions = self.lock();
+            let ids: Vec<String> = sessions
+                .iter()
+                .filter(|(_, s)| s.config().target == target)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| sessions.remove(id)).collect()
+        };
+        terminate_all(doomed).await;
+        Ok(())
     }
 
-    /// Terminate this session.
-    pub async fn terminate(self) -> Result<()> {
-        self.pool.terminate(&self.session_id).await
+    /// Terminate everything.
+    ///
+    /// Sessions are terminated concurrently, so a fleet-wide shutdown costs one
+    /// round trip rather than one per session. Failures are logged, not
+    /// returned: there is nothing useful a caller can do about a session that
+    /// refuses to die, and AWS reclaims it on its own timeout.
+    pub async fn shutdown(&self) {
+        let doomed: Vec<Arc<Session>> = self.lock().drain().map(|(_, s)| s).collect();
+        tracing::info!(count = doomed.len(), "shutting down the session pool");
+        terminate_all(doomed).await;
+    }
+
+    fn check_admission(&self, target: &str) -> Result<()> {
+        let mut sessions = self.lock();
+        reap(&mut sessions);
+        admit(&self.config, &sessions, target)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Session>>> {
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-/// A reference to a session in the pool (for get operations).
-pub struct SessionRef<'a> {
-    session_id: String,
-    pool: &'a SessionPool,
+impl std::fmt::Debug for SessionPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionPool")
+            .field("stats", &self.stats())
+            .field("max_sessions", &self.config.max_sessions)
+            .finish()
+    }
 }
 
-impl<'a> SessionRef<'a> {
-    /// Get the session ID.
-    pub fn id(&self) -> &str {
-        &self.session_id
-    }
+/// Drop sessions that have already ended.
+fn reap(sessions: &mut HashMap<String, Arc<Session>>) {
+    sessions.retain(|_, session| !session.is_closed());
+}
 
-    /// Send data to the session.
-    pub async fn send(&self, data: bytes::Bytes) -> Result<()> {
-        let sessions = self.pool.sessions.read().await;
-        if let Some(entry) = sessions.get(&self.session_id) {
-            entry.session.send(data).await
-        } else {
-            Err(Error::InvalidState("Session no longer in pool".to_string()))
-        }
+fn admit(
+    config: &PoolConfig,
+    sessions: &HashMap<String, Arc<Session>>,
+    target: &str,
+) -> Result<()> {
+    if config.max_sessions > 0 && sessions.len() >= config.max_sessions {
+        return Err(Error::Config(format!(
+            "session pool is full ({} of {} in use)",
+            sessions.len(),
+            config.max_sessions
+        )));
     }
-
-    /// Get the output stream for the session.
-    pub async fn output(&self) -> Option<crate::channels::OutputStream> {
-        let sessions = self.pool.sessions.read().await;
-        sessions.get(&self.session_id).map(|e| e.session.output())
+    if !config.allow_duplicate_targets && sessions.values().any(|s| s.config().target == target) {
+        return Err(Error::Config(format!(
+            "a session to {target} is already open and PoolConfig::allow_duplicate_targets is false"
+        )));
     }
+    Ok(())
+}
 
-    /// Check if the session is ready to send.
-    pub async fn is_ready(&self) -> bool {
-        let sessions = self.pool.sessions.read().await;
+async fn terminate_all(sessions: Vec<Arc<Session>>) {
+    let outcomes = futures_util::future::join_all(
         sessions
-            .get(&self.session_id)
-            .map(|e| e.session.is_ready())
-            .unwrap_or(false)
-    }
+            .iter()
+            .map(|session| async move { (session.id(), session.terminate().await) }),
+    )
+    .await;
 
-    /// Get the session state.
-    pub async fn state(&self) -> Option<SessionState> {
-        let sessions = self.pool.sessions.read().await;
-        if let Some(entry) = sessions.get(&self.session_id) {
-            Some(entry.session.state().await)
-        } else {
-            None
+    for (id, result) in outcomes {
+        if let Err(e) = result {
+            tracing::warn!(session_id = %id, error = %e, "failed to terminate a pooled session");
         }
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn config(max_sessions: usize, allow_duplicates: bool) -> PoolConfig {
+        PoolConfig {
+            max_sessions,
+            allow_duplicate_targets: allow_duplicates,
+            session_defaults: SessionConfig::default(),
+        }
+    }
+
     #[test]
-    fn test_pool_config_default() {
+    fn defaults_are_permissive_but_bounded() {
         let config = PoolConfig::default();
         assert_eq!(config.max_sessions, 100);
         assert!(config.allow_duplicate_targets);
     }
 
     #[test]
-    fn test_pool_stats_default() {
-        let stats = PoolStats::default();
-        assert_eq!(stats.active_sessions, 0);
-        assert_eq!(stats.total_started, 0);
-        assert_eq!(stats.total_terminated, 0);
+    fn an_empty_pool_admits_under_every_policy() {
+        let sessions = HashMap::new();
+        assert!(
+            admit(&config(0, true), &sessions, "i-a").is_ok(),
+            "0 means unlimited"
+        );
+        assert!(admit(&config(1, true), &sessions, "i-a").is_ok());
+        assert!(admit(&config(1, false), &sessions, "i-a").is_ok());
+    }
+
+    #[test]
+    fn stats_start_at_zero() {
+        assert_eq!(
+            PoolStats::default(),
+            PoolStats {
+                live: 0,
+                started: 0,
+                ended: 0
+            }
+        );
+    }
+
+    #[test]
+    fn reaping_an_empty_map_is_a_no_op() {
+        let mut sessions: HashMap<String, Arc<Session>> = HashMap::new();
+        reap(&mut sessions);
+        assert!(sessions.is_empty());
     }
 }

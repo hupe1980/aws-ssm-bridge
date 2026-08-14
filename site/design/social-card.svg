@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#12151b"/>
+      <stop offset="1" stop-color="#0d0f14"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="0%" r="70%">
+      <stop offset="0" stop-color="#b7410e" stop-opacity=".38"/>
+      <stop offset="1" stop-color="#b7410e" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
+
+  <!-- Mark -->
+  <g transform="translate(80,74)">
+    <rect width="76" height="76" rx="18" fill="#b7410e"/>
+    <g transform="translate(6,6) scale(2)" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round">
+      <path d="M6 20V13"/><path d="M26 20V13"/><path d="M6 13c3.6-4.6 16.4-4.6 20 0"/>
+    </g>
+    <circle cx="38" cy="26" r="5.7" fill="#fff"/>
+  </g>
+
+  <text x="180" y="126" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="34" font-weight="600" fill="#a3abba">aws-ssm-bridge</text>
+
+  <text x="80" y="268" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="82" font-weight="700" fill="#e6e9ef" letter-spacing="-2">AWS Session Manager,</text>
+  <text x="80" y="362" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="82" font-weight="700" fill="#ff8a5c" letter-spacing="-2">as a library.</text>
+
+  <text x="80" y="437" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="30" fill="#a3abba">Shell, port forwarding and KMS-encrypted sessions from Rust or Python —</text>
+  <text x="80" y="479" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="30" fill="#a3abba">no plugin binary, no subprocess.</text>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="22">
+    <rect x="80" y="524" width="366" height="54" rx="10" fill="#ffffff" fill-opacity=".05" stroke="#242932"/>
+    <text x="104" y="557" fill="#e6e9ef">cargo add aws-ssm-bridge</text>
+    <rect x="466" y="524" width="392" height="54" rx="10" fill="#ffffff" fill-opacity=".05" stroke="#242932"/>
+    <text x="490" y="557" fill="#e6e9ef">pip install aws-ssm-bridge</text>
+  </g>
+</svg>

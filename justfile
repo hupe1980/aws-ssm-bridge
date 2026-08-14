@@ -1,219 +1,206 @@
-# aws-ssm-bridge justfile
-# Run `just --list` to see all available commands
+# aws-ssm-bridge development tasks
+#
+#   just --list      show everything
+#   just check       what CI runs, locally
 
 set shell := ["bash", "-uc"]
 
-# Default recipe - show help
-default:
+# `--all-features` would enable `extension-module`, which leaves the CPython
+# symbols unresolved for the interpreter to supply at load time — right for a
+# wheel, fatal for a test binary. Name the features instead.
+FEATURES := "interactive,kms"
+
+# An instance to run the live checks against. Override per invocation:
+#   just live-shell TARGET=i-0123456789abcdef0
+TARGET := env_var_or_default("SSM_TARGET", "")
+
+_default:
     @just --list
 
-# ============================================================================
-# Development
-# ============================================================================
+# ---------------------------------------------------------------------------
+# The main loop
+# ---------------------------------------------------------------------------
 
-# Run all tests
+# Everything CI checks, in the order it fails fastest.
+check: fmt-check lint test doc
+
+# Run every test: unit, integration and doc.
 test:
-    cargo test
+    cargo test --all-targets --features {{FEATURES}}
+    cargo test --doc --features {{FEATURES}}
 
-# Run library tests only (faster)
+# Unit tests only — the fast inner loop.
 test-lib:
-    cargo test --lib
+    cargo test --lib --features {{FEATURES}}
 
-# Run tests with output
-test-verbose:
-    cargo test -- --nocapture
-
-# Run a specific test
+# Run one test by name, with output.
 test-one NAME:
-    cargo test {{NAME}} -- --nocapture
+    cargo test --features {{FEATURES}} {{NAME}} -- --nocapture
 
-# Run clippy lints
+# Clippy with warnings denied, as CI does.
 lint:
-    cargo clippy --all-targets --all-features
+    cargo clippy --all-targets --features {{FEATURES}} -- -D warnings
 
-# Format code
+# Format everything in place.
 fmt:
-    cargo fmt
+    cargo fmt --all
 
-# Check formatting without changes
+# Fail if anything is unformatted, as CI does.
 fmt-check:
-    cargo fmt -- --check
+    cargo fmt --all -- --check
 
-# Full CI check (format, lint, test)
-ci: fmt-check lint test
-    @echo "✅ All CI checks passed!"
+# Build the docs and fail on any rustdoc warning.
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features {{FEATURES}}
 
-# ============================================================================
-# Build
-# ============================================================================
+# Build the docs and open them.
+doc-open:
+    cargo doc --no-deps --features {{FEATURES}} --open
 
-# Debug build
-build:
-    cargo build
+# ---------------------------------------------------------------------------
+# Feature matrix
+# ---------------------------------------------------------------------------
 
-# Release build with optimizations
-build-release:
-    cargo build --release
+# Regressions here are usually a missing `#[cfg]` on something only one feature
+# needs.
 
-# Build Python wheel
-build-python:
+# Build and unit-test every feature combination.
+matrix:
+    cargo test --lib --no-default-features
+    cargo test --lib --no-default-features --features kms
+    cargo test --lib --no-default-features --features interactive
+    cargo test --lib --no-default-features --features interactive,kms
+    # `python` without `extension-module` links against libpython, so the
+    # bindings are type-checked here rather than only at wheel-build time.
+    cargo clippy --lib --features python -- -D warnings
+    cargo clippy --lib --features python,extension-module -- -D warnings
+
+# ---------------------------------------------------------------------------
+# Benchmarks and fuzzing
+# ---------------------------------------------------------------------------
+
+# Framing and reliability micro-benchmarks.
+bench:
+    cargo bench --features {{FEATURES}}
+
+# Fuzz one parser until you stop it (needs nightly and cargo-fuzz).
+fuzz TARGET="fuzz_binary_protocol":
+    cargo +nightly fuzz run {{TARGET}}
+
+# A short run of every fuzz target, as CI does.
+fuzz-smoke:
+    for t in fuzz_binary_protocol fuzz_handshake fuzz_acknowledge; do \
+        cargo +nightly fuzz run "$t" -- -max_total_time=60; \
+    done
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+
+# Build the extension and install it into the active virtualenv.
+python:
+    maturin develop --release
+
+# Build a release wheel.
+python-wheel:
     maturin build --release
 
-# Build Python wheel for development (faster)
-build-python-dev:
-    maturin develop
+# ---------------------------------------------------------------------------
+# Live checks
+# ---------------------------------------------------------------------------
+#
+# These talk to real AWS and cost real sessions. Set SSM_TARGET first:
+#   export SSM_TARGET=i-0123456789abcdef0
 
-# ============================================================================
-# Documentation
-# ============================================================================
+_require-target:
+    @[ -n "{{TARGET}}" ] || { echo "set SSM_TARGET, or pass TARGET=i-…"; exit 1; }
 
-# Generate Rust docs
-docs:
-    cargo doc --no-deps --open
+# Run a command on the target and print the output.
+live-shell CMD="uname -a": _require-target
+    RUST_LOG=aws_ssm_bridge=info cargo run --example shell --features {{FEATURES}} -- {{TARGET}} "{{CMD}}"
 
-# Generate docs without opening
-docs-build:
-    cargo doc --no-deps
+# Forward a port from the target. Ctrl-C to stop.
+live-forward PORT="22" LOCAL="127.0.0.1:0": _require-target
+    RUST_LOG=aws_ssm_bridge=info cargo run --example port_forward --features {{FEATURES}} -- {{TARGET}} {{PORT}} {{LOCAL}}
 
-# Serve docs locally (uses _config_dev.yml with no baseurl)
-docs-serve:
-    cd docs && jekyll serve --config _config_dev.yml --livereload
+# Open an interactive shell on the target.
+live-interactive: _require-target
+    cargo run --example interactive --features {{FEATURES}} -- {{TARGET}}
 
-# Serve docs locally with Python (no Jekyll required)
-docs-serve-simple:
-    cd docs && python3 -m http.server 4000
+# ---------------------------------------------------------------------------
+# Release
+# ---------------------------------------------------------------------------
 
-# Build Jekyll docs for production
-docs-jekyll:
-    cd docs && jekyll build
+# Keep VERSION in step with `rust-version` in Cargo.toml. CI pins the same one,
+# and a drift between the two makes the check meaningless.
+#
+# `--locked` is the whole point: without it cargo re-resolves to the newest
+# semver-compatible dependencies, which routinely need a newer toolchain than
+# the lockfile users actually get — so the check fails for a reason that has
+# nothing to do with the declared MSRV.
 
-# Build Jekyll docs for local testing
-docs-jekyll-dev:
-    cd docs && jekyll build --config _config_dev.yml
+# Build against the oldest supported toolchain.
+msrv VERSION="1.94.1":
+    @rustup run {{VERSION}} cargo --version >/dev/null 2>&1 \
+        || { echo "install it first: rustup toolchain install {{VERSION}}"; exit 1; }
+    rustup run {{VERSION}} cargo check --locked --features {{FEATURES}}
 
-# ============================================================================
-# Benchmarks
-# ============================================================================
+# The optional tools are skipped rather than fatal, so this runs usefully on a
+# fresh checkout: cargo install cargo-semver-checks cargo-machete
 
-# Run all benchmarks
-bench:
-    cargo bench
+# Everything that must hold before cutting a release.
+release-check: check matrix audit msrv
+    # The lockfile must already satisfy the manifest — a release that silently
+    # resolves new versions is not the thing that was tested.
+    cargo check --locked --features {{FEATURES}}
+    cargo build --release --features {{FEATURES}}
+    cargo publish --dry-run --features {{FEATURES}}
+    @command -v cargo-semver-checks >/dev/null \
+        && cargo semver-checks check-release \
+        || echo "skipped: cargo-semver-checks not installed"
+    @command -v cargo-machete >/dev/null \
+        && cargo machete \
+        || echo "skipped: cargo-machete not installed"
+    @command -v maturin >/dev/null \
+        && maturin build --release \
+        || echo "skipped: maturin not installed"
 
-# Run specific benchmark
-bench-one NAME:
-    cargo bench -- {{NAME}}
+# ---------------------------------------------------------------------------
+# Documentation site
+# ---------------------------------------------------------------------------
+#
+# The site under `site/` is built with Zola and published to GitHub Pages by
+# .github/workflows/pages.yml. Install it with `brew install zola` or from
+# https://www.getzola.org.
 
-# ============================================================================
-# Fuzzing (requires nightly)
-# ============================================================================
+# Serve the site locally with live reload.
+site PORT="1111":
+    cd site && zola serve --port {{PORT}}
 
-# Run binary protocol fuzzer
-fuzz-binary:
-    cd fuzz && cargo +nightly fuzz run fuzz_binary_protocol -- -max_total_time=60
+# Build the site into site/public.
+site-build:
+    cd site && zola build
 
-# Run handshake fuzzer
-fuzz-handshake:
-    cd fuzz && cargo +nightly fuzz run fuzz_handshake -- -max_total_time=60
+# Fail on any internal link to a page that does not exist.
+site-check:
+    cd site && zola check --skip-external-links
 
-# Run JSON messages fuzzer
-fuzz-json:
-    cd fuzz && cargo +nightly fuzz run fuzz_json_messages -- -max_total_time=60
+# Re-render the Open Graph card from its SVG source (needs librsvg).
+social-card:
+    rsvg-convert -w 1200 -h 630 site/design/social-card.svg -o site/static/social-card.png
 
-# Run all fuzzers for 1 minute each
-fuzz-all: fuzz-binary fuzz-handshake fuzz-json
+# ---------------------------------------------------------------------------
+# Housekeeping
+# ---------------------------------------------------------------------------
 
-# ============================================================================
-# Security
-# ============================================================================
-
-# Run security audit
+# Check dependencies for known advisories.
 audit:
     cargo audit
 
-# Check for outdated dependencies
-outdated:
-    cargo outdated
+# Everything before opening a pull request.
+pre-commit: fmt check matrix audit site-check
 
-# Update dependencies
-update:
-    cargo update
-
-# ============================================================================
-# Examples
-# ============================================================================
-
-# Run shell session example
-example-shell INSTANCE:
-    cargo run --example shell_session -- {{INSTANCE}}
-
-# Run port forwarding example
-example-port-forward INSTANCE LOCAL_PORT REMOTE_PORT:
-    cargo run --example port_forwarding -- {{INSTANCE}} {{LOCAL_PORT}} {{REMOTE_PORT}}
-
-# Run session pool example
-example-pool *INSTANCES:
-    cargo run --example session_pool -- {{INSTANCES}}
-
-# Run reconnecting session example
-example-reconnect INSTANCE:
-    cargo run --example reconnecting -- {{INSTANCE}}
-
-# Run metrics example
-example-metrics INSTANCE:
-    cargo run --example metrics_session -- {{INSTANCE}}
-
-# ============================================================================
-# Release
-# ============================================================================
-
-# Create a release build and show binary size
-release-size:
-    cargo build --release
-    @echo "Binary sizes:"
-    @ls -lh target/release/*.rlib 2>/dev/null || true
-    @ls -lh target/release/libaws_ssm_bridge.* 2>/dev/null || true
-
-# Build and strip release binary
-release-strip:
-    cargo build --release
-    strip target/release/libaws_ssm_bridge.so 2>/dev/null || true
-    @echo "Stripped binary sizes:"
-    @ls -lh target/release/libaws_ssm_bridge.* 2>/dev/null || true
-
-# ============================================================================
-# Cleanup
-# ============================================================================
-
-# Clean build artifacts
+# Remove build artefacts, including the fuzz and docs output.
 clean:
     cargo clean
-
-# Clean everything including fuzz corpus
-clean-all: clean
-    rm -rf fuzz/target
-    rm -rf fuzz/corpus
-
-# ============================================================================
-# Info
-# ============================================================================
-
-# Show project info
-info:
-    @echo "aws-ssm-bridge"
-    @echo "=============="
-    @cargo --version
-    @rustc --version
-    @echo ""
-    @echo "Test count:"
-    @cargo test --lib 2>&1 | grep -E "^test result" || true
-    @echo ""
-    @echo "Lines of code:"
-    @find src -name '*.rs' | xargs wc -l | tail -1
-
-# Show dependency tree
-deps:
-    cargo tree
-
-# Show features
-features:
-    cargo tree --features compression,encryption,interactive,python -e features
+    rm -rf fuzz/target site/public

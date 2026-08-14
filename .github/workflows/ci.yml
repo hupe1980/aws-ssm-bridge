@@ -9,6 +9,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # `--all-features` would enable `extension-module`, which leaves the CPython
+  # symbols for the interpreter to resolve at load time — right for a wheel,
+  # fatal for a test binary. Name the features instead.
+  FEATURES: interactive,kms
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -16,54 +24,138 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      
-      - name: Check formatting
-        run: cargo fmt -- --check
-      
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      
-      - name: Run tests
-        run: cargo test --all-features
-      
-      - name: Run doc tests
-        run: cargo test --doc
+      - uses: Swatinem/rust-cache@v2
 
-  # Build for multiple platforms
-  build:
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --features $FEATURES -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets --features $FEATURES
+
+      - name: Doc tests
+        run: cargo test --doc --features $FEATURES
+
+      - name: Documentation builds without warnings
+        run: cargo doc --no-deps --features $FEATURES
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  features:
+    name: Feature matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""                    # no default features
+          - "kms"
+          - "interactive"
+          - "interactive,kms"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and test
+        run: |
+          cargo test --lib --no-default-features --features "${{ matrix.features }}"
+
+  bindings:
+    name: Python bindings type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Both shapes must compile: `python` alone (linked against libpython, the
+      # form `cargo test` can use) and with `extension-module` (the wheel).
+      - name: Clippy both linkage modes
+        run: |
+          cargo clippy --lib --features python -- -D warnings
+          cargo clippy --lib --features python,extension-module -- -D warnings
+
+  python:
+    name: Python bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the wheel
+        run: |
+          pip install maturin
+          maturin build --release
+
+      - name: Install and import
+        run: |
+          pip install target/wheels/*.whl
+          python - <<'PY'
+          import aws_ssm_bridge as m
+          # Every documented export must actually exist.
+          for name in m.__all__:
+              assert hasattr(m, name), f"missing export: {name}"
+          print("aws_ssm_bridge", m.__version__, "imported cleanly")
+          PY
+
+  platforms:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release --all-features
+        run: cargo build --release --features interactive,kms
 
-  # Security audit
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keep in step with `rust-version` in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+      # `--locked` is required here: without it cargo re-resolves to the newest
+      # semver-compatible dependencies, which often need a newer toolchain than
+      # the committed lockfile, and the job then fails for a reason unrelated to
+      # the declared MSRV.
+      - name: Build
+        run: cargo build --locked --features interactive,kms
+
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run each target briefly
+        # A short run per PR catches regressions in the network-facing parsers
+        # without turning CI into a fuzzing farm.
+        run: |
+          for target in fuzz_binary_protocol fuzz_handshake fuzz_acknowledge; do
+            cargo fuzz run "$target" -- -max_total_time=60
+          done
+
   audit:
-    name: Security Audit
+    name: Security audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

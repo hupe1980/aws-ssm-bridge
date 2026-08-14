@@ -1,0 +1,86 @@
+{#- Shared chrome for every documentation page: sidebar, article, table of
+    contents, prev/next. Both `page.html` and the docs `section.html` extend
+    this and fill in `doc_title` / `doc_body`. -#}
+{% extends "base.html" %}
+
+{% block body %}
+{%- set docs = get_section(path="docs/_index.md") -%}
+{%- set here = node_url -%}
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <nav aria-label="Documentation">
+      <p class="side-heading">Documentation</p>
+      <ul>
+        <li>
+          <a href="{{ docs.permalink }}" {% if here == docs.permalink %}aria-current="page"{% endif %}>Overview</a>
+        </li>
+        {%- for p in docs.pages %}
+        <li>
+          <a href="{{ p.permalink }}" {% if here == p.permalink %}aria-current="page"{% endif %}>{{ p.title }}</a>
+          {%- if here == p.permalink and p.toc %}
+          <ul class="side-toc">
+            {%- for h in p.toc %}
+            <li><a href="#{{ h.id }}">{{ h.title }}</a></li>
+            {%- endfor %}
+          </ul>
+          {%- endif %}
+        </li>
+        {%- endfor %}
+      </ul>
+
+      <p class="side-heading">Reference</p>
+      <ul>
+        <li><a href="{{ config.extra.docs_rs }}">Rust API (docs.rs)</a></li>
+        <li><a href="{{ config.extra.crate }}">crates.io</a></li>
+        <li><a href="{{ config.extra.pypi }}">PyPI</a></li>
+      </ul>
+    </nav>
+  </aside>
+
+  <main class="doc" id="main">
+    <article>
+      <h1>{{ node_title }}</h1>
+      {%- if node_desc and node_desc != config.description %}
+      <p class="lede">{{ node_desc }}</p>
+      {%- endif %}
+      {% block doc_body %}{% endblock doc_body %}
+    </article>
+
+    {%- if page %}
+    <nav class="pager" aria-label="Pagination">
+      {%- if page.lower %}
+      <a class="pager-prev" href="{{ page.lower.permalink }}">
+        <span>Previous</span><strong>{{ page.lower.title }}</strong>
+      </a>
+      {%- else %}<span></span>{% endif %}
+      {%- if page.higher %}
+      <a class="pager-next" href="{{ page.higher.permalink }}">
+        <span>Next</span><strong>{{ page.higher.title }}</strong>
+      </a>
+      {%- endif %}
+    </nav>
+    {%- endif %}
+  </main>
+
+  {%- if page and page.toc %}
+  <aside class="toc" aria-label="On this page">
+    <p class="side-heading">On this page</p>
+    <ul>
+      {%- for h in page.toc %}
+      <li>
+        <a href="#{{ h.id }}">{{ h.title }}</a>
+        {%- if h.children %}
+        <ul>
+          {%- for c in h.children %}
+          <li><a href="#{{ c.id }}">{{ c.title }}</a></li>
+          {%- endfor %}
+        </ul>
+        {%- endif %}
+      </li>
+      {%- endfor %}
+    </ul>
+  </aside>
+  {%- endif %}
+</div>
+{% endblock body %}

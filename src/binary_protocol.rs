@@ -1,341 +1,358 @@
-//! AWS SSM Session Manager Binary Protocol Implementation
+//! The AWS SSM Session Manager binary wire format.
 //!
-//! This module implements the official AWS SSM binary protocol as specified in
-//! github.com/aws/session-manager-plugin (Go implementation).
-//!
-//! ## Binary Message Format
-//!
-//! Messages use a 116-byte fixed header followed by variable-length payload:
+//! Messages on the MGS data channel are a fixed 120-byte header followed by a
+//! variable-length payload.  The layout below is byte-for-byte compatible with
+//! the reference implementation in
+//! [`aws/session-manager-plugin`](https://github.com/aws/session-manager-plugin)
+//! (`src/message/messageparser.go`).
 //!
 //! ```text
-//! | HL(4) | MessageType(32) | Ver(4) | CD(8) | Seq(8) | Flags(8) |
-//! | MessageId(16) | PayloadDigest(32) | PayType(4) | PayLen(4) |
-//! | Payload(variable) |
+//! offset  size  field
+//! ------  ----  ---------------------------------------------
+//!      0     4  HeaderLength   u32  — always 116 (excludes itself)
+//!      4    32  MessageType         — ASCII, space-padded
+//!     36     4  SchemaVersion  u32  — always 1
+//!     40     8  CreatedDate    u64  — Unix milliseconds
+//!     48     8  SequenceNumber i64  — per-direction, starts at 0
+//!     56     8  Flags          u64  — SYN = 1, FIN = 2
+//!     64    16  MessageId           — UUID, Java long-pair order
+//!     80    32  PayloadDigest       — SHA-256 of the payload
+//!    112     4  PayloadType    u32  — see [`PayloadType`]
+//!    116     4  PayloadLength  u32
+//!    120     …  Payload
 //! ```
 //!
-//! Total header: 120 bytes (4 + 32 + 4 + 8 + 8 + 8 + 16 + 32 + 4 + 4)
+//! All integers are big-endian.
 //!
-//! ## Field Specifications
+//! # MessageId byte order
 //!
-//! - **HeaderLength** (4 bytes, u32): Always 116 (size excluding HL field itself)
-//! - **MessageType** (32 bytes): UTF-8 string, space-padded
-//! - **SchemaVersion** (4 bytes, u32): Protocol version (1)
-//! - **CreatedDate** (8 bytes, u64): Unix timestamp in milliseconds
-//! - **SequenceNumber** (8 bytes, i64): Message sequence number
-//! - **Flags** (8 bytes, u64): Bit flags (SYN=1, FIN=2)
-//! - **MessageId** (16 bytes): UUID in binary format (no hyphens)
-//! - **PayloadDigest** (32 bytes): SHA-256 hash of payload
-//! - **PayloadType** (4 bytes, u32): Payload type enum (1-12)
-//! - **PayloadLength** (4 bytes, u32): Length of payload in bytes
-//! - **Payload** (variable): Raw payload bytes
+//! The SSM agent stores UUIDs the way Java does — as two `long`s
+//! (`mostSigBits`, `leastSigBits`) — and the reference plugin writes the
+//! **least**-significant half first (`putUuid` in `messageparser.go`).  That is
+//! *not* RFC 4122 order, so the two 8-byte halves are swapped on the way in and
+//! out.  Getting this wrong produces messages the agent silently ignores.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::errors::{ProtocolError, Result};
-use crate::protocol::MessageType;
+use crate::errors::{Error, Result};
 
-// Binary protocol constants
-const HEADER_LENGTH: u32 = 116; // Excludes the 4-byte HL field
-const MESSAGE_TYPE_LENGTH: usize = 32;
-const MESSAGE_ID_LENGTH: usize = 16;
-const PAYLOAD_DIGEST_LENGTH: usize = 32;
-const TOTAL_HEADER_SIZE: usize = 120; // 4 + 116
+/// Value of the `HeaderLength` field: the header size excluding the field itself.
+const HEADER_LENGTH: u32 = 116;
+/// Total on-wire header size, including the 4-byte `HeaderLength` field.
+pub(crate) const HEADER_SIZE: usize = 120;
 
-/// Maximum payload size (10MB) - prevents memory exhaustion attacks
-pub const MAX_PAYLOAD_SIZE: u32 = 10 * 1024 * 1024;
+const MESSAGE_TYPE_LEN: usize = 32;
+const MESSAGE_ID_LEN: usize = 16;
+const DIGEST_LEN: usize = 32;
 
-// Field offsets within the 120-byte binary header (for reference):
-//
-//   Offset  Size  Field
-//   ------  ----  ------------------
-//     0       4   HL (header length = 116)
-//     4      32   MessageType
-//    36       4   SchemaVersion
-//    40       8   CreatedDate (ms since epoch)
-//    48       8   SequenceNumber
-//    56       8   Flags
-//    64      16   MessageId (UUID bytes)
-//    80      32   PayloadDigest (SHA-256)
-//   112       4   PayloadType
-//   116       4   PayloadLength
-//   120       …   Payload
+/// Largest payload this client will emit or accept in a single message (10 MiB).
+///
+/// Guards against a hostile or malfunctioning peer declaring a huge
+/// `PayloadLength` and forcing a large allocation.
+pub const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024;
 
-/// Payload type enumeration (AWS official specification)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Payload chunk size used when splitting caller data into stream messages.
+///
+/// Matches `config.StreamDataPayloadSize` in the reference plugin.  Every
+/// chunk costs a 120-byte header and one round-trip ACK, so this is the
+/// throughput/latency knob — see [`SessionConfig::payload_chunk_size`].
+///
+/// [`SessionConfig::payload_chunk_size`]: crate::SessionConfig::payload_chunk_size
+pub const DEFAULT_PAYLOAD_CHUNK_SIZE: usize = 1024;
+
+// ---------------------------------------------------------------------------
+// MessageType
+// ---------------------------------------------------------------------------
+
+/// The `MessageType` header field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MessageType {
+    /// Client → agent stream data.
+    InputStreamData,
+    /// Agent → client stream data.
+    OutputStreamData,
+    /// Acknowledgement of a received stream-data message.
+    Acknowledge,
+    /// The agent closed the channel.
+    ChannelClosed,
+    /// The service is ready to accept client data.
+    StartPublication,
+    /// The service asks the client to stop sending.
+    PausePublication,
+}
+
+impl MessageType {
+    /// The on-wire ASCII name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MessageType::InputStreamData => "input_stream_data",
+            MessageType::OutputStreamData => "output_stream_data",
+            MessageType::Acknowledge => "acknowledge",
+            MessageType::ChannelClosed => "channel_closed",
+            MessageType::StartPublication => "start_publication",
+            MessageType::PausePublication => "pause_publication",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "input_stream_data" => MessageType::InputStreamData,
+            "output_stream_data" => MessageType::OutputStreamData,
+            "acknowledge" => MessageType::Acknowledge,
+            "channel_closed" => MessageType::ChannelClosed,
+            "start_publication" => MessageType::StartPublication,
+            "pause_publication" => MessageType::PausePublication,
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for MessageType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PayloadType
+// ---------------------------------------------------------------------------
+
+/// The `PayloadType` header field: what the payload bytes mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum PayloadType {
-    /// Undefined/unset payload type (initial messages)
+    /// No specific type. Some agents use this for early shell output.
     Undefined = 0,
-    /// Standard output (stdout)
+    /// Standard output, and the type used for client keystrokes.
     Output = 1,
-    /// Error output
+    /// Error text.
     Error = 2,
-    /// Terminal size change
+    /// Terminal dimensions, as `{"cols":N,"rows":M}`.
     Size = 3,
-    /// Session parameters
+    /// Session parameters.
     Parameter = 4,
-    /// Handshake request from agent
+    /// Agent → client handshake request.
     HandshakeRequest = 5,
-    /// Handshake response from client
+    /// Client → agent handshake response.
     HandshakeResponse = 6,
-    /// Handshake complete notification
+    /// Agent → client handshake completion.
     HandshakeComplete = 7,
-    /// Encryption challenge request
+    /// Agent → client encryption challenge.
     EncChallengeRequest = 8,
-    /// Encryption challenge response
+    /// Client → agent encryption challenge response.
     EncChallengeResponse = 9,
-    /// Control flag
+    /// Control flag; see [`ControlFlag`].
     Flag = 10,
-    /// Explicit stderr stream
+    /// Standard error stream.
     StdErr = 11,
-    /// Process exit code
+    /// Remote process exit code.
     ExitCode = 12,
 }
 
 impl PayloadType {
-    /// Convert from u32 wire format
+    /// Parse from the wire representation.
     pub fn from_u32(value: u32) -> Result<Self> {
-        match value {
-            0 => Ok(PayloadType::Undefined),
-            1 => Ok(PayloadType::Output),
-            2 => Ok(PayloadType::Error),
-            3 => Ok(PayloadType::Size),
-            4 => Ok(PayloadType::Parameter),
-            5 => Ok(PayloadType::HandshakeRequest),
-            6 => Ok(PayloadType::HandshakeResponse),
-            7 => Ok(PayloadType::HandshakeComplete),
-            8 => Ok(PayloadType::EncChallengeRequest),
-            9 => Ok(PayloadType::EncChallengeResponse),
-            10 => Ok(PayloadType::Flag),
-            11 => Ok(PayloadType::StdErr),
-            12 => Ok(PayloadType::ExitCode),
-            _ => {
-                Err(ProtocolError::InvalidMessage(format!("Invalid PayloadType: {}", value)).into())
-            }
-        }
+        Ok(match value {
+            0 => PayloadType::Undefined,
+            1 => PayloadType::Output,
+            2 => PayloadType::Error,
+            3 => PayloadType::Size,
+            4 => PayloadType::Parameter,
+            5 => PayloadType::HandshakeRequest,
+            6 => PayloadType::HandshakeResponse,
+            7 => PayloadType::HandshakeComplete,
+            8 => PayloadType::EncChallengeRequest,
+            9 => PayloadType::EncChallengeResponse,
+            10 => PayloadType::Flag,
+            11 => PayloadType::StdErr,
+            12 => PayloadType::ExitCode,
+            other => return Err(Error::protocol(format!("unknown PayloadType {other}"))),
+        })
     }
 
-    /// Convert to u32 wire format
-    pub fn to_u32(self) -> u32 {
-        self as u32
+    /// Whether this payload is subject to KMS session encryption.
+    ///
+    /// The agent encrypts `Output`, `StdErr` and `ExitCode` payloads; the
+    /// client encrypts only `Output`.  Handshake and control payloads always
+    /// travel in the clear because they carry the key agreement itself.
+    pub(crate) const fn is_encrypted_inbound(self) -> bool {
+        matches!(
+            self,
+            PayloadType::Output | PayloadType::StdErr | PayloadType::ExitCode
+        )
     }
 }
 
-/// Control flags for payload type Flag (type 10)
+/// Payload of a [`PayloadType::Flag`] message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-pub enum PayloadTypeFlag {
-    /// Disconnect from port
+pub enum ControlFlag {
+    /// The remote end disconnected from the forwarded port.
     DisconnectToPort = 1,
-    /// Terminate session
+    /// The session is being terminated.
     TerminateSession = 2,
-    /// Connection to port failed
+    /// The agent could not connect to the forwarded port.
     ConnectToPortError = 3,
 }
 
-/// Message flags (bit flags)
+impl ControlFlag {
+    /// Parse a big-endian `u32` flag payload.
+    pub fn from_payload(payload: &[u8]) -> Option<Self> {
+        let raw = u32::from_be_bytes(payload.get(..4)?.try_into().ok()?);
+        Some(match raw {
+            1 => ControlFlag::DisconnectToPort,
+            2 => ControlFlag::TerminateSession,
+            3 => ControlFlag::ConnectToPortError,
+            _ => return None,
+        })
+    }
+}
+
+/// Bit values for the `Flags` header field.
 pub mod flags {
-    /// First message in stream (SYN)
+    /// First message of a stream.
     pub const SYN: u64 = 1 << 0;
-    /// Final message in sequence (FIN)
+    /// Last message of a stream.
     pub const FIN: u64 = 1 << 1;
 }
 
-/// Binary ClientMessage structure (AWS official format)
-///
-/// This represents the complete message structure used by AWS SSM Session Manager.
-/// All fields are in network byte order (big-endian).
+// ---------------------------------------------------------------------------
+// ClientMessage
+// ---------------------------------------------------------------------------
+
+/// A single message on the SSM data channel.
 #[derive(Debug, Clone)]
 pub struct ClientMessage {
-    /// Header length (always 116)
-    pub header_length: u32,
-    /// Message type (32-byte padded string)
+    /// Message type.
     pub message_type: MessageType,
-    /// Schema version (always 1)
+    /// Protocol schema version; always 1.
     pub schema_version: u32,
-    /// Created timestamp (Unix milliseconds)
+    /// Creation time, Unix milliseconds.
     pub created_date: u64,
-    /// Sequence number for ordering
+    /// Sequence number within this direction's stream.
     pub sequence_number: i64,
-    /// Bit flags (SYN, FIN)
+    /// SYN/FIN bits; see [`flags`].
     pub flags: u64,
-    /// Unique message identifier
+    /// Unique message identifier, echoed back in acknowledgements.
     pub message_id: Uuid,
-    /// SHA-256 hash of payload
-    pub payload_digest: [u8; 32],
-    /// Payload type enum
+    /// SHA-256 of [`payload`](Self::payload) as it appears on the wire.
+    pub payload_digest: [u8; DIGEST_LEN],
+    /// Payload discriminator.
     pub payload_type: PayloadType,
-    /// Payload length in bytes
-    pub payload_length: u32,
-    /// Raw payload bytes
+    /// Payload bytes.
     pub payload: Bytes,
 }
 
 impl ClientMessage {
-    /// Create a new message with automatic field population
+    /// Build a message, computing the digest and timestamp automatically.
     pub fn new(
         message_type: MessageType,
         sequence_number: i64,
         payload_type: PayloadType,
         payload: Bytes,
     ) -> Self {
-        let payload_length = payload.len() as u32;
-        let payload_digest = compute_digest(&payload);
-        // Use saturating conversion to handle edge case of system time before UNIX epoch
-        let created_date = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
         Self {
-            header_length: HEADER_LENGTH,
             message_type,
             schema_version: 1,
-            created_date,
+            created_date: now_millis(),
             sequence_number,
             flags: 0,
             message_id: Uuid::new_v4(),
-            payload_digest,
+            payload_digest: sha256(&payload),
             payload_type,
-            payload_length,
             payload,
         }
     }
 
-    /// Serialize to binary format (AWS wire protocol)
-    pub fn serialize(&self) -> Result<Bytes> {
-        let total_len = TOTAL_HEADER_SIZE + self.payload.len();
-        let mut buf = BytesMut::with_capacity(total_len);
+    /// Encode to the on-wire byte representation.
+    pub fn serialize(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(HEADER_SIZE + self.payload.len());
 
-        // Header length (4 bytes)
-        buf.put_u32(self.header_length);
-
-        // Message type (32 bytes, space-padded)
-        buf.put_slice(&message_type_to_padded(&self.message_type));
-
-        // Schema version (4 bytes)
+        buf.put_u32(HEADER_LENGTH);
+        buf.put_slice(&padded_message_type(self.message_type));
         buf.put_u32(self.schema_version);
-
-        // Created date (8 bytes)
         buf.put_u64(self.created_date);
-
-        // Sequence number (8 bytes)
         buf.put_i64(self.sequence_number);
-
-        // Flags (8 bytes)
         buf.put_u64(self.flags);
 
-        // Message ID (16 bytes, binary UUID)
-        // AWS/Java interop: The SSM agent is written in Java, which stores UUIDs as
-        // two longs (mostSigBits, leastSigBits). When Java serializes via DataOutputStream,
-        // it writes MSB first, then LSB. But the Go plugin's twinj/uuid library expects
-        // RFC 4122 byte order. To match the Java agent's wire format, we must swap the
-        // two 8-byte halves: write bytes[8..16] first, then bytes[0..8].
-        let uuid_bytes = self.message_id.as_bytes();
-        buf.put_slice(&uuid_bytes[8..16]); // LSB half first (Java's MSB position)
-        buf.put_slice(&uuid_bytes[0..8]); // MSB half second (Java's LSB position)
+        // Java long-pair order: least-significant half first. See module docs.
+        let uuid = self.message_id.as_bytes();
+        buf.put_slice(&uuid[8..16]);
+        buf.put_slice(&uuid[0..8]);
 
-        // Payload digest (32 bytes)
         buf.put_slice(&self.payload_digest);
-
-        // Payload type (4 bytes)
-        buf.put_u32(self.payload_type.to_u32());
-
-        // Payload length (4 bytes)
-        buf.put_u32(self.payload_length);
-
-        // Payload (variable)
+        buf.put_u32(self.payload_type as u32);
+        buf.put_u32(self.payload.len() as u32);
         buf.put_slice(&self.payload);
 
-        Ok(buf.freeze())
+        buf.freeze()
     }
 
-    /// Deserialize from binary format
+    /// Decode from the on-wire byte representation.
+    ///
+    /// Structural checks (header length, payload length, sequence number) and
+    /// the SHA-256 payload digest are all verified here, matching
+    /// `ClientMessage.Validate()` in the reference plugin.  A message that
+    /// fails any of them is a protocol violation, not a recoverable condition.
+    ///
+    /// `start_publication` and `pause_publication` skip validation entirely —
+    /// the service sends them with an empty payload and a zeroed digest, and
+    /// the reference implementation exempts them by name.
     pub fn deserialize(mut data: Bytes) -> Result<Self> {
-        if data.len() < TOTAL_HEADER_SIZE {
-            return Err(ProtocolError::InvalidMessage(format!(
-                "Message too short: {} bytes (need at least {})",
-                data.len(),
-                TOTAL_HEADER_SIZE
-            ))
-            .into());
+        if data.len() < HEADER_SIZE {
+            return Err(Error::protocol(format!(
+                "message truncated: {} bytes, need at least {HEADER_SIZE}",
+                data.len()
+            )));
         }
 
-        // Parse header length
         let header_length = data.get_u32();
         if header_length != HEADER_LENGTH {
-            return Err(ProtocolError::InvalidMessage(format!(
-                "Invalid header length: {} (expected {})",
-                header_length, HEADER_LENGTH
-            ))
-            .into());
+            return Err(Error::protocol(format!(
+                "bad HeaderLength {header_length}, expected {HEADER_LENGTH}"
+            )));
         }
 
-        // Parse message type (32 bytes)
-        let mut msg_type_bytes = [0u8; MESSAGE_TYPE_LENGTH];
-        data.copy_to_slice(&mut msg_type_bytes);
-        let message_type = message_type_from_padded(&msg_type_bytes)?;
+        let mut type_bytes = [0u8; MESSAGE_TYPE_LEN];
+        data.copy_to_slice(&mut type_bytes);
+        let message_type = parse_message_type(&type_bytes)?;
 
-        // Parse schema version
         let schema_version = data.get_u32();
-
-        // Parse created date
         let created_date = data.get_u64();
-
-        // Parse sequence number
         let sequence_number = data.get_i64();
-
-        // Parse flags
         let flags = data.get_u64();
 
-        // Parse message ID (16 bytes)
-        // AWS/Java interop: The SSM agent (Java) writes UUIDs with swapped halves.
-        // Wire format has LSB at offset+0 and MSB at offset+8, but Rust's Uuid expects
-        // RFC 4122 order (MSB first). We read both halves and swap them back.
-        let mut wire_uuid = [0u8; MESSAGE_ID_LENGTH];
+        let mut wire_uuid = [0u8; MESSAGE_ID_LEN];
         data.copy_to_slice(&mut wire_uuid);
-        let mut message_id_bytes = [0u8; MESSAGE_ID_LENGTH];
-        message_id_bytes[0..8].copy_from_slice(&wire_uuid[8..16]); // MSB from wire's second half
-        message_id_bytes[8..16].copy_from_slice(&wire_uuid[0..8]); // LSB from wire's first half
-        let message_id = Uuid::from_bytes(message_id_bytes);
+        let mut uuid_bytes = [0u8; MESSAGE_ID_LEN];
+        uuid_bytes[0..8].copy_from_slice(&wire_uuid[8..16]);
+        uuid_bytes[8..16].copy_from_slice(&wire_uuid[0..8]);
+        let message_id = Uuid::from_bytes(uuid_bytes);
 
-        // Parse payload digest (32 bytes)
-        let mut payload_digest = [0u8; PAYLOAD_DIGEST_LENGTH];
+        let mut payload_digest = [0u8; DIGEST_LEN];
         data.copy_to_slice(&mut payload_digest);
 
-        // Parse payload type
-        let payload_type_u32 = data.get_u32();
-        let payload_type = PayloadType::from_u32(payload_type_u32)?;
+        let payload_type = PayloadType::from_u32(data.get_u32())?;
+        let payload_length = data.get_u32() as usize;
 
-        // Parse payload length
-        let payload_length = data.get_u32();
-
-        // Security check: prevent memory exhaustion attacks
         if payload_length > MAX_PAYLOAD_SIZE {
-            return Err(ProtocolError::InvalidMessage(format!(
-                "Payload too large: {} bytes (max {})",
-                payload_length, MAX_PAYLOAD_SIZE
-            ))
-            .into());
+            return Err(Error::protocol(format!(
+                "declared payload of {payload_length} bytes exceeds the {MAX_PAYLOAD_SIZE}-byte limit"
+            )));
         }
-
-        // Parse payload
-        if data.remaining() < payload_length as usize {
-            return Err(ProtocolError::InvalidMessage(format!(
-                "Payload length mismatch: declared {}, have {}",
-                payload_length,
+        if data.remaining() < payload_length {
+            return Err(Error::protocol(format!(
+                "declared payload of {payload_length} bytes but only {} remain",
                 data.remaining()
-            ))
-            .into());
+            )));
         }
-
-        let payload = data.copy_to_bytes(payload_length as usize);
+        let payload = data.copy_to_bytes(payload_length);
 
         let msg = Self {
-            header_length,
             message_type,
             schema_version,
             created_date,
@@ -344,388 +361,349 @@ impl ClientMessage {
             message_id,
             payload_digest,
             payload_type,
-            payload_length,
             payload,
         };
-
-        // Validate message
         msg.validate()?;
-
         Ok(msg)
     }
 
-    /// Validate structural integrity of the message.
-    ///
-    /// Checks bounds and length fields that, if wrong, indicate a framing
-    /// error or protocol violation — the message cannot be safely processed.
-    ///
-    /// **Digest validation is intentionally excluded here.**  Some AWS SSM agent
-    /// versions send messages where `payload_digest` was computed over a
-    /// different byte sequence (e.g. the pre-encryption buffer rather than the
-    /// on-wire payload).  These messages are valid and must be processed.  The
-    /// Go reference implementation (`session-manager-plugin`) logs a warning on
-    /// digest mismatch but does not drop the message.  Call [`verify_digest`]
-    /// separately to obtain the advisory digest result.
-    ///
-    /// [`verify_digest`]: Self::verify_digest
-    pub fn validate(&self) -> Result<()> {
-        // Check header length
-        if self.header_length != HEADER_LENGTH {
-            return Err(
-                ProtocolError::InvalidMessage("HeaderLength must be 116".to_string()).into(),
-            );
+    fn validate(&self) -> Result<()> {
+        // Publication control messages carry no payload and no digest.
+        if matches!(
+            self.message_type,
+            MessageType::StartPublication | MessageType::PausePublication
+        ) {
+            return Ok(());
         }
 
-        // Check sequence number is within safe bounds (prevents overflow attacks)
-        // Leave headroom of 1000 from i64 boundaries
-        const MAX_SAFE_SEQUENCE: i64 = i64::MAX - 1000;
-        const MIN_SAFE_SEQUENCE: i64 = i64::MIN + 1000;
-        if self.sequence_number > MAX_SAFE_SEQUENCE || self.sequence_number < MIN_SAFE_SEQUENCE {
-            return Err(ProtocolError::InvalidMessage(format!(
-                "Sequence number {} outside safe bounds [{}, {}]",
-                self.sequence_number, MIN_SAFE_SEQUENCE, MAX_SAFE_SEQUENCE
-            ))
-            .into());
+        if self.sequence_number < 0 {
+            return Err(Error::protocol(format!(
+                "negative sequence number {}",
+                self.sequence_number
+            )));
         }
 
-        // Check payload length matches actual payload
-        if self.payload_length != self.payload.len() as u32 {
-            return Err(ProtocolError::InvalidMessage(format!(
-                "PayloadLength mismatch: declared {}, actual {}",
-                self.payload_length,
-                self.payload.len()
-            ))
-            .into());
+        // A zero-length payload has no digest to check; the reference
+        // implementation skips the comparison in exactly this case.
+        if !self.payload.is_empty() && sha256(&self.payload) != self.payload_digest {
+            return Err(Error::protocol(format!(
+                "payload digest mismatch on {} seq {}",
+                self.message_type, self.sequence_number
+            )));
         }
 
         Ok(())
     }
-
-    /// Check whether the payload digest matches the actual payload (advisory).
-    ///
-    /// Returns `true` if the digest is valid.  This is an advisory check only:
-    /// callers should log a warning on `false` but still process the message.
-    ///
-    /// The check is skipped (returns `true`) when the digest field is
-    /// all-zeros, which AWS uses to signal "not applicable" for control
-    /// messages whose payload digest was intentionally omitted.
-    ///
-    /// # Why advisory?
-    ///
-    /// Some AWS SSM agent versions send messages where `payload_digest` was
-    /// computed over a different byte sequence than the on-wire payload (a
-    /// known agent-side quirk).  Authentication is provided by the TLS session
-    /// and AWS SigV4 credentials on the WebSocket — the digest field is a
-    /// data-integrity hint, not the primary authenticity mechanism.  The Go
-    /// reference implementation matches this advisory semantics.
-    pub fn verify_digest(&self) -> bool {
-        // Zero-filled digest is an explicit "not applicable" signal.
-        if self.payload_digest == [0u8; 32] {
-            return true;
-        }
-        compute_digest(&self.payload) == self.payload_digest
-    }
 }
 
-/// Compute SHA-256 digest of payload
-fn compute_digest(payload: &[u8]) -> [u8; 32] {
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn sha256(data: &[u8]) -> [u8; DIGEST_LEN] {
     let mut hasher = Sha256::new();
-    hasher.update(payload);
+    hasher.update(data);
     hasher.finalize().into()
 }
 
-/// Convert MessageType to 32-byte space-padded array
-fn message_type_to_padded(msg_type: &MessageType) -> [u8; MESSAGE_TYPE_LENGTH] {
-    let s = match msg_type {
-        MessageType::InputStreamData => "input_stream_data",
-        MessageType::OutputStreamData => "output_stream_data",
-        MessageType::Acknowledge => "acknowledge",
-        MessageType::ChannelClosed => "channel_closed",
-        MessageType::StartPublication => "start_publication",
-        MessageType::PausePublication => "pause_publication",
-    };
-
-    let mut bytes = [b' '; MESSAGE_TYPE_LENGTH];
-    let len = s.len().min(MESSAGE_TYPE_LENGTH);
-    bytes[..len].copy_from_slice(&s.as_bytes()[..len]);
-    bytes
+fn padded_message_type(message_type: MessageType) -> [u8; MESSAGE_TYPE_LEN] {
+    let s = message_type.as_str().as_bytes();
+    debug_assert!(s.len() <= MESSAGE_TYPE_LEN);
+    let mut out = [b' '; MESSAGE_TYPE_LEN];
+    out[..s.len()].copy_from_slice(s);
+    out
 }
 
-/// Parse MessageType from 32-byte padded array
-fn message_type_from_padded(bytes: &[u8; MESSAGE_TYPE_LENGTH]) -> Result<MessageType> {
-    let s = std::str::from_utf8(bytes)
-        .map_err(|e| ProtocolError::InvalidMessage(format!("Invalid UTF-8 in MessageType: {}", e)))?
-        .trim()
-        .trim_end_matches('\0'); // AWS uses null-padding, not space-padding
-
-    match s {
-        "input_stream_data" => Ok(MessageType::InputStreamData),
-        "output_stream_data" => Ok(MessageType::OutputStreamData),
-        "acknowledge" => Ok(MessageType::Acknowledge),
-        "channel_closed" => Ok(MessageType::ChannelClosed),
-        "start_publication" => Ok(MessageType::StartPublication),
-        "pause_publication" => Ok(MessageType::PausePublication),
-        _ => Err(ProtocolError::InvalidMessage(format!("Unknown MessageType: {}", s)).into()),
-    }
+fn parse_message_type(bytes: &[u8; MESSAGE_TYPE_LEN]) -> Result<MessageType> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| Error::protocol(format!("MessageType is not valid UTF-8: {e}")))?;
+    // Agents pad with spaces; some builds pad with NULs. Trim both.
+    let name = text.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    MessageType::parse(name).ok_or_else(|| Error::protocol(format!("unknown MessageType {name:?}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_payload_type_conversion() {
-        assert_eq!(PayloadType::from_u32(1).unwrap(), PayloadType::Output);
-        assert_eq!(PayloadType::from_u32(12).unwrap(), PayloadType::ExitCode);
-        assert!(PayloadType::from_u32(99).is_err());
-
-        assert_eq!(PayloadType::Output.to_u32(), 1);
-        assert_eq!(PayloadType::ExitCode.to_u32(), 12);
-    }
-
-    #[test]
-    fn test_message_type_padding() {
-        let msg_type = MessageType::InputStreamData;
-        let padded = message_type_to_padded(&msg_type);
-
-        assert_eq!(padded.len(), MESSAGE_TYPE_LENGTH);
-        assert_eq!(&padded[..17], b"input_stream_data");
-        assert_eq!(&padded[17..], &[b' '; 15]);
-
-        let parsed = message_type_from_padded(&padded).unwrap();
-        assert_eq!(parsed, msg_type);
-    }
-
-    #[test]
-    fn test_digest_computation() {
-        let payload = b"test payload";
-        let digest = compute_digest(payload);
-
-        // SHA-256 is deterministic
-        let digest2 = compute_digest(payload);
-        assert_eq!(digest, digest2);
-
-        // Different payload = different digest
-        let digest3 = compute_digest(b"different");
-        assert_ne!(digest, digest3);
-    }
-
-    #[test]
-    fn test_message_serialization_roundtrip() {
-        let payload = Bytes::from_static(b"Hello, SSM!");
-        let msg = ClientMessage::new(
+    fn sample(payload: &'static [u8]) -> ClientMessage {
+        ClientMessage::new(
             MessageType::OutputStreamData,
-            42,
+            7,
             PayloadType::Output,
-            payload.clone(),
-        );
-
-        let serialized = msg.serialize().unwrap();
-        assert_eq!(serialized.len(), TOTAL_HEADER_SIZE + payload.len());
-
-        let deserialized = ClientMessage::deserialize(serialized).unwrap();
-
-        assert_eq!(deserialized.message_type, msg.message_type);
-        assert_eq!(deserialized.sequence_number, msg.sequence_number);
-        assert_eq!(deserialized.payload_type, msg.payload_type);
-        assert_eq!(deserialized.payload, msg.payload);
-        assert_eq!(deserialized.payload_digest, msg.payload_digest);
+            Bytes::from_static(payload),
+        )
     }
 
     #[test]
-    fn test_message_validation() {
-        let payload = Bytes::from_static(b"test");
+    fn roundtrip_preserves_every_field() {
+        let msg = sample(b"hello, session manager");
+        let wire = msg.serialize();
+        assert_eq!(wire.len(), HEADER_SIZE + msg.payload.len());
+
+        let back = ClientMessage::deserialize(wire).expect("valid message");
+        assert_eq!(back.message_type, msg.message_type);
+        assert_eq!(back.sequence_number, msg.sequence_number);
+        assert_eq!(back.payload_type, msg.payload_type);
+        assert_eq!(back.payload, msg.payload);
+        assert_eq!(back.message_id, msg.message_id);
+        assert_eq!(back.payload_digest, msg.payload_digest);
+        assert_eq!(back.created_date, msg.created_date);
+    }
+
+    /// The agent writes the least-significant UUID half first (Java long-pair
+    /// order).  Pin the exact byte layout so a "cleanup" cannot silently break
+    /// wire compatibility.
+    #[test]
+    fn message_id_uses_java_long_pair_order() {
+        let mut msg = sample(b"x");
+        msg.message_id = Uuid::from_bytes([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ]);
+        let wire = msg.serialize();
+        assert_eq!(
+            &wire[64..72],
+            &[0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]
+        );
+        assert_eq!(
+            &wire[72..80],
+            &[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
+        );
+
+        let back = ClientMessage::deserialize(wire).unwrap();
+        assert_eq!(back.message_id, msg.message_id);
+    }
+
+    #[test]
+    fn header_field_offsets_match_the_spec() {
+        let msg = sample(b"abc");
+        let wire = msg.serialize();
+        assert_eq!(u32::from_be_bytes(wire[0..4].try_into().unwrap()), 116);
+        assert_eq!(&wire[4..21], b"output_stream_data"[..17].as_ref());
+        assert_eq!(u32::from_be_bytes(wire[36..40].try_into().unwrap()), 1);
+        assert_eq!(i64::from_be_bytes(wire[48..56].try_into().unwrap()), 7);
+        assert_eq!(u32::from_be_bytes(wire[112..116].try_into().unwrap()), 1);
+        assert_eq!(u32::from_be_bytes(wire[116..120].try_into().unwrap()), 3);
+    }
+
+    #[test]
+    fn digest_mismatch_is_rejected() {
+        let msg = sample(b"payload bytes");
+        let mut wire = msg.serialize().to_vec();
+        wire[80] ^= 0xff; // corrupt the first digest byte
+        let err = ClientMessage::deserialize(Bytes::from(wire)).unwrap_err();
+        assert!(err.to_string().contains("digest mismatch"), "{err}");
+    }
+
+    #[test]
+    fn corrupt_payload_is_rejected() {
+        let msg = sample(b"payload bytes");
+        let mut wire = msg.serialize().to_vec();
+        wire[HEADER_SIZE] ^= 0xff; // flip a payload byte, digest now stale
+        let err = ClientMessage::deserialize(Bytes::from(wire)).unwrap_err();
+        assert!(err.to_string().contains("digest mismatch"), "{err}");
+    }
+
+    /// Publication control messages arrive with an all-zero digest and must be
+    /// accepted, otherwise the session never learns it may start sending.
+    #[test]
+    fn publication_messages_skip_validation() {
         let mut msg = ClientMessage::new(
-            MessageType::InputStreamData,
-            1,
-            PayloadType::Output,
-            payload,
-        );
-
-        // Valid message
-        assert!(msg.validate().is_ok());
-
-        // Invalid header length
-        msg.header_length = 100;
-        assert!(msg.validate().is_err());
-        msg.header_length = HEADER_LENGTH;
-
-        // Digest is no longer checked in validate() — it is an advisory check
-        // via verify_digest().  Structural checks (header_length, payload_length,
-        // sequence bounds) are still enforced.
-    }
-
-    #[test]
-    fn test_verify_digest() {
-        let payload = Bytes::from_static(b"hello");
-        let msg = ClientMessage::new(
-            MessageType::InputStreamData,
+            MessageType::StartPublication,
             0,
-            PayloadType::Output,
-            payload,
-        );
-        // Freshly created message has correct digest
-        assert!(msg.verify_digest());
-
-        // Zero-filled digest = "not applicable" → always valid
-        let mut zero_digest = msg.clone();
-        zero_digest.payload_digest = [0u8; 32];
-        assert!(zero_digest.verify_digest());
-
-        // Wrong non-zero digest → invalid
-        let mut bad_digest = msg;
-        bad_digest.payload_digest = [0xFFu8; 32];
-        assert!(!bad_digest.verify_digest());
-    }
-
-    #[test]
-    fn test_empty_payload_digest() {
-        // Empty payload: correct SHA-256("") digest passes
-        let msg = ClientMessage::new(
-            MessageType::InputStreamData,
-            0,
-            PayloadType::Output,
+            PayloadType::Undefined,
             Bytes::new(),
         );
-        assert!(msg.verify_digest());
-        assert!(msg.validate().is_ok());
-
-        // Zero-filled digest on empty payload also valid (AWS "not applicable")
-        let mut zeros = msg;
-        zeros.payload_digest = [0u8; 32];
-        assert!(zeros.verify_digest());
-        assert!(zeros.validate().is_ok());
+        msg.payload_digest = [0u8; 32];
+        ClientMessage::deserialize(msg.serialize()).expect("start_publication must be accepted");
     }
 
     #[test]
-    fn test_flags() {
-        assert_eq!(flags::SYN, 1);
-        assert_eq!(flags::FIN, 2);
-        assert_eq!(flags::SYN | flags::FIN, 3);
+    fn empty_payload_needs_no_digest() {
+        let mut msg = ClientMessage::new(
+            MessageType::OutputStreamData,
+            0,
+            PayloadType::Undefined,
+            Bytes::new(),
+        );
+        msg.payload_digest = [0u8; 32];
+        ClientMessage::deserialize(msg.serialize()).expect("empty payload is always valid");
+    }
+
+    #[test]
+    fn negative_sequence_number_is_rejected() {
+        let mut msg = sample(b"data");
+        msg.sequence_number = -1;
+        let err = ClientMessage::deserialize(msg.serialize()).unwrap_err();
+        assert!(err.to_string().contains("negative sequence"), "{err}");
+    }
+
+    #[test]
+    fn oversized_declared_payload_is_rejected_without_allocating() {
+        let msg = sample(b"tiny");
+        let mut wire = msg.serialize().to_vec();
+        wire[116..120].copy_from_slice(&u32::MAX.to_be_bytes());
+        let err = ClientMessage::deserialize(Bytes::from(wire)).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    /// Document the integrity envelope precisely: the digest covers the payload
+    /// and nothing else, so a corrupted timestamp, sequence number, flag or
+    /// message ID is *not* detectable at this layer. That is by design — the
+    /// wire format has no header checksum — and callers relying on those fields
+    /// for anything security-sensitive would be relying on nothing.
+    #[test]
+    fn header_metadata_is_outside_the_integrity_envelope() {
+        let msg = sample(b"payload");
+        // CreatedDate, SequenceNumber, Flags and MessageId: bytes 40..80.
+        for offset in [40usize, 56, 64, 79] {
+            let mut wire = msg.serialize().to_vec();
+            wire[offset] ^= 0x01;
+            assert!(
+                ClientMessage::deserialize(Bytes::from(wire)).is_ok(),
+                "byte {offset} is not digest-covered, so it must still parse"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_message_is_rejected() {
+        let wire = sample(b"data").serialize();
+        let err = ClientMessage::deserialize(wire.slice(..50)).unwrap_err();
+        assert!(err.to_string().contains("truncated"), "{err}");
+    }
+
+    #[test]
+    fn message_type_padding_roundtrips() {
+        for mt in [
+            MessageType::InputStreamData,
+            MessageType::OutputStreamData,
+            MessageType::Acknowledge,
+            MessageType::ChannelClosed,
+            MessageType::StartPublication,
+            MessageType::PausePublication,
+        ] {
+            assert_eq!(parse_message_type(&padded_message_type(mt)).unwrap(), mt);
+        }
+    }
+
+    #[test]
+    fn nul_padded_message_type_is_accepted() {
+        let mut bytes = [0u8; MESSAGE_TYPE_LEN];
+        bytes[..11].copy_from_slice(b"acknowledge");
+        assert_eq!(
+            parse_message_type(&bytes).unwrap(),
+            MessageType::Acknowledge
+        );
+    }
+
+    #[test]
+    fn payload_type_rejects_unknown_discriminants() {
+        assert_eq!(PayloadType::from_u32(1).unwrap(), PayloadType::Output);
+        assert_eq!(PayloadType::from_u32(12).unwrap(), PayloadType::ExitCode);
+        assert!(PayloadType::from_u32(13).is_err());
+    }
+
+    #[test]
+    fn control_flag_parses_big_endian() {
+        assert_eq!(
+            ControlFlag::from_payload(&2u32.to_be_bytes()),
+            Some(ControlFlag::TerminateSession)
+        );
+        assert_eq!(ControlFlag::from_payload(&[0, 0]), None);
+        assert_eq!(ControlFlag::from_payload(&99u32.to_be_bytes()), None);
     }
 }
-
-// =============================================================================
-// Property-Based Tests
-// =============================================================================
 
 #[cfg(test)]
 mod proptests {
     use super::*;
     use proptest::prelude::*;
 
-    // Strategy for generating valid PayloadType values
-    fn payload_type_strategy() -> impl Strategy<Value = PayloadType> {
-        prop_oneof![
-            Just(PayloadType::Undefined),
-            Just(PayloadType::Output),
-            Just(PayloadType::Error),
-            Just(PayloadType::Size),
-            Just(PayloadType::Parameter),
-            Just(PayloadType::HandshakeRequest),
-            Just(PayloadType::HandshakeResponse),
-            Just(PayloadType::HandshakeComplete),
-            Just(PayloadType::EncChallengeRequest),
-            Just(PayloadType::EncChallengeResponse),
-            Just(PayloadType::Flag),
-            Just(PayloadType::StdErr),
-            Just(PayloadType::ExitCode),
-        ]
-    }
-
-    // Strategy for generating valid MessageType values
-    fn message_type_strategy() -> impl Strategy<Value = MessageType> {
+    fn any_message_type() -> impl Strategy<Value = MessageType> {
         prop_oneof![
             Just(MessageType::InputStreamData),
             Just(MessageType::OutputStreamData),
             Just(MessageType::Acknowledge),
             Just(MessageType::ChannelClosed),
-            Just(MessageType::StartPublication),
-            Just(MessageType::PausePublication),
         ]
     }
 
     proptest! {
-        /// Property: Serialization followed by deserialization is identity
         #[test]
-        fn roundtrip_preserves_data(
-            seq_num in any::<i64>(),
+        fn roundtrip_is_lossless(
+            seq in 0i64..i64::MAX,
             payload in prop::collection::vec(any::<u8>(), 0..4096),
-            payload_type in payload_type_strategy(),
-            message_type in message_type_strategy(),
+            message_type in any_message_type(),
         ) {
             let msg = ClientMessage::new(
                 message_type,
-                seq_num,
-                payload_type,
+                seq,
+                PayloadType::Output,
                 Bytes::from(payload.clone()),
             );
-
-            let serialized = msg.serialize().expect("serialization should succeed");
-            let deserialized = ClientMessage::deserialize(serialized)
-                .expect("deserialization should succeed");
-
-            prop_assert_eq!(deserialized.message_type, msg.message_type);
-            prop_assert_eq!(deserialized.sequence_number, msg.sequence_number);
-            prop_assert_eq!(deserialized.payload_type, msg.payload_type);
-            prop_assert_eq!(deserialized.payload.as_ref(), payload.as_slice());
+            let back = ClientMessage::deserialize(msg.serialize()).expect("valid");
+            prop_assert_eq!(back.sequence_number, seq);
+            prop_assert_eq!(back.message_type, message_type);
+            prop_assert_eq!(back.payload.as_ref(), payload.as_slice());
         }
 
-        /// Property: Deserialization of random bytes never panics
+        /// Arbitrary bytes must produce an error, never a panic.
         #[test]
         fn deserialize_never_panics(data in prop::collection::vec(any::<u8>(), 0..8192)) {
-            // This should return Ok or Err, but never panic
             let _ = ClientMessage::deserialize(Bytes::from(data));
         }
 
-        /// Property: Serialized message has correct length
+        /// The digest covers the payload, so flipping any payload bit must be
+        /// caught. This is the guarantee callers actually depend on: header
+        /// fields are metadata, but payload bytes become terminal output or
+        /// forwarded TCP data, where silent corruption is indistinguishable
+        /// from the remote having sent something else.
         #[test]
-        fn serialized_length_correct(
-            payload in prop::collection::vec(any::<u8>(), 0..4096),
+        fn payload_corruption_is_always_detected(
+            payload in prop::collection::vec(any::<u8>(), 1..512),
+            offset in 0usize..512,
+            bit in 0u32..8,
         ) {
+            let len = payload.len();
             let msg = ClientMessage::new(
                 MessageType::OutputStreamData,
-                0,
+                1,
                 PayloadType::Output,
-                Bytes::from(payload.clone()),
-            );
-
-            let serialized = msg.serialize().expect("serialization should succeed");
-            prop_assert_eq!(serialized.len(), TOTAL_HEADER_SIZE + payload.len());
-        }
-
-        /// Property: Payload digest matches payload
-        #[test]
-        fn digest_matches_payload(
-            payload in prop::collection::vec(any::<u8>(), 0..4096),
-        ) {
-            let msg = ClientMessage::new(
-                MessageType::OutputStreamData,
-                0,
-                PayloadType::Output,
-                Bytes::from(payload.clone()),
-            );
-
-            let expected_digest = compute_digest(&payload);
-            prop_assert_eq!(msg.payload_digest, expected_digest);
-        }
-
-        /// Property: Validation passes for correctly constructed messages
-        #[test]
-        fn validation_passes_for_valid_messages(
-            seq_num in any::<i64>(),
-            payload in prop::collection::vec(any::<u8>(), 0..1024),
-            payload_type in payload_type_strategy(),
-            message_type in message_type_strategy(),
-        ) {
-            let msg = ClientMessage::new(
-                message_type,
-                seq_num,
-                payload_type,
                 Bytes::from(payload),
             );
+            let mut wire = msg.serialize().to_vec();
+            wire[HEADER_SIZE + offset % len] ^= 1 << bit;
 
-            prop_assert!(msg.validate().is_ok(), "Valid message should pass validation");
+            prop_assert!(
+                ClientMessage::deserialize(Bytes::from(wire)).is_err(),
+                "payload corruption at offset {} went undetected",
+                offset % len,
+            );
+        }
+
+        /// Corrupting the digest itself must also be caught — otherwise an
+        /// attacker who can rewrite the digest could rewrite the payload too.
+        #[test]
+        fn digest_corruption_is_always_detected(
+            payload in prop::collection::vec(any::<u8>(), 1..512),
+            offset in 0usize..32,
+            bit in 0u32..8,
+        ) {
+            let msg = ClientMessage::new(
+                MessageType::OutputStreamData,
+                1,
+                PayloadType::Output,
+                Bytes::from(payload),
+            );
+            let mut wire = msg.serialize().to_vec();
+            wire[80 + offset] ^= 1 << bit;
+
+            prop_assert!(ClientMessage::deserialize(Bytes::from(wire)).is_err());
         }
     }
 }

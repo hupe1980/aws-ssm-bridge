@@ -1,208 +1,226 @@
-//! Session builder for ergonomic session creation
-//!
-//! Provides a fluent API for configuring and creating sessions.
+//! Fluent construction of sessions.
 
-use crate::documents::SsmDocument;
+use std::time::Duration;
+
+use crate::connection::EndpointPolicy;
+use crate::documents::{PortForwardingSession, SsmDocument};
 use crate::errors::Result;
-use crate::protocol::SessionType;
-use crate::session::{Session, SessionConfig, SessionManager};
-use std::collections::HashMap;
+use crate::session::{DocumentSpec, Session, SessionConfig, SessionManager};
 
-/// Builder for creating SSM sessions with a fluent API
+/// Builds and starts a [`Session`].
 ///
-/// # Example
+/// ```no_run
+/// use aws_ssm_bridge::{SessionBuilder, documents::PortForwardingToRemoteHost};
 ///
-/// ```rust,no_run
-/// use aws_ssm_bridge::{SessionBuilder, SessionType};
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let session = SessionBuilder::new("i-1234567890abcdef0")
-///     .region("us-east-1")
-///     .session_type(SessionType::StandardStream)
-///     .build()
+/// # async fn example() -> aws_ssm_bridge::Result<()> {
+/// let session = SessionBuilder::new("i-0123456789abcdef0")
+///     .region("eu-central-1")
+///     .document(PortForwardingToRemoteHost::new("db.internal", 5432))
+///     .reason("incident 4711: inspect replica lag")
+///     .start()
 ///     .await?;
-/// # Ok(())
-/// # }
+/// # Ok(()) }
 /// ```
+///
+/// Starting several sessions? Build one [`SessionManager`] and use
+/// [`start_with`](Self::start_with) so they share a connection pool and
+/// credential cache.
+#[derive(Debug, Clone)]
 pub struct SessionBuilder {
-    target: String,
     region: Option<String>,
-    session_type: SessionType,
-    document_name: Option<String>,
-    parameters: HashMap<String, Vec<String>>,
-    reason: Option<String>,
+    config: SessionConfig,
 }
 
 impl SessionBuilder {
-    /// Create a new session builder for the given target
+    /// Start building a session against `target`.
     ///
-    /// # Arguments
-    ///
-    /// * `target` - EC2 instance ID (e.g., "i-1234567890abcdef0")
+    /// See [`SessionManager::start_session`] for the accepted target forms.
     pub fn new(target: impl Into<String>) -> Self {
         Self {
-            target: target.into(),
             region: None,
-            session_type: SessionType::StandardStream,
-            document_name: None,
-            parameters: HashMap::new(),
-            reason: None,
+            config: SessionConfig::new(target),
         }
     }
 
-    /// Set the AWS region
+    /// Pin the session to an AWS region.
+    ///
+    /// Only affects [`start`](Self::start), which builds its own manager.
+    /// [`start_with`](Self::start_with) uses the region its manager was built
+    /// with, since the manager already owns a configured SSM client.
     pub fn region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
         self
     }
 
-    /// Set the AWS region if Some, otherwise no-op
+    /// Pin the region only if `region` is `Some`.
+    ///
+    /// Convenient for plumbing an optional CLI flag through without a branch.
     pub fn maybe_region(mut self, region: Option<impl Into<String>>) -> Self {
-        self.region = region.map(Into::into);
+        if let Some(region) = region {
+            self.region = Some(region.into());
+        }
         self
     }
 
-    /// Set the session type
-    pub fn session_type(mut self, session_type: SessionType) -> Self {
-        self.session_type = session_type;
+    /// Run a specific SSM document; see [`crate::documents`].
+    pub fn document(mut self, document: impl SsmDocument) -> Self {
+        self.config.document = Some(DocumentSpec::new(&document));
         self
     }
 
-    /// Set the SSM document name
-    pub fn document_name(mut self, document_name: impl Into<String>) -> Self {
-        self.document_name = Some(document_name.into());
-        self
+    /// Forward `remote_port` on the target instance.
+    ///
+    /// Shorthand for `.document(PortForwardingSession::new(remote_port))`.
+    pub fn port_forward(self, remote_port: u16) -> Self {
+        self.document(PortForwardingSession::new(remote_port))
     }
 
-    /// Add a parameter for the session document
-    pub fn parameter(mut self, key: impl Into<String>, values: Vec<String>) -> Self {
-        self.parameters.insert(key.into(), values);
-        self
-    }
-
-    /// Set the reason for starting the session (for auditing)
+    /// Record why this session was opened. Shows up in CloudTrail.
     pub fn reason(mut self, reason: impl Into<String>) -> Self {
-        self.reason = Some(reason.into());
+        self.config.reason = Some(reason.into());
         self
     }
 
-    /// Configure session using a type-safe SSM document
-    ///
-    /// This is the preferred way to configure sessions - it eliminates
-    /// magic strings and provides compile-time validation.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use aws_ssm_bridge::{SessionBuilder, documents::PortForwardingSession};
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let session = SessionBuilder::new("i-1234567890abcdef0")
-    ///     .document(PortForwardingSession::new(3306))
-    ///     .build()
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn document(mut self, doc: impl SsmDocument) -> Self {
-        let doc_name = doc.document_name();
-        if !doc_name.is_empty() {
-            self.document_name = Some(doc_name.to_string());
-        }
-        self.session_type = doc.session_type();
-        self.parameters = doc.parameters();
+    /// How long to wait for the agent handshake.
+    pub fn ready_timeout(mut self, timeout: Duration) -> Self {
+        self.config.ready_timeout = timeout;
         self
     }
 
-    /// Build a port forwarding session (convenience method)
+    /// Keep-alive ping interval and the idle window that declares the peer dead.
     ///
-    /// Equivalent to `.document(PortForwardingSession::new(port))`
-    ///
-    /// # Arguments
-    ///
-    /// * `port` - Remote port to forward to
-    pub fn port_forward(mut self, port: u16) -> Self {
-        self.session_type = SessionType::Port;
-        self.document_name = Some("AWS-StartPortForwardingSession".to_string());
-        self.parameters
-            .insert("portNumber".to_string(), vec![port.to_string()]);
+    /// `idle_timeout` must be longer than `interval`; starting the session fails
+    /// otherwise.
+    pub fn keepalive(mut self, interval: Duration, idle_timeout: Duration) -> Self {
+        self.config.heartbeat_interval = interval;
+        self.config.idle_timeout = idle_timeout;
         self
     }
 
-    /// Build and start the session
+    /// Bytes per protocol message when splitting outbound data.
     ///
-    /// This creates a SessionManager, configures it, and starts the session.
-    pub async fn build(self) -> Result<Session> {
-        let manager = SessionManager::new().await?;
-        self.build_with(&manager).await
+    /// The default matches the reference plugin. Raising it improves throughput
+    /// for bulk transfers at the cost of coarser acknowledgements; leave it
+    /// alone for interactive sessions.
+    pub fn payload_chunk_size(mut self, bytes: usize) -> Self {
+        self.config.payload_chunk_size = bytes;
+        self
     }
 
-    /// Build and start the session using an existing SessionManager
+    /// Queue depth for each [`Session::output`] subscriber.
     ///
-    /// Use this when you want to reuse a manager for multiple sessions.
-    pub async fn build_with(self, manager: &SessionManager) -> Result<Session> {
-        let config = SessionConfig {
-            target: self.target,
-            region: self.region,
-            session_type: self.session_type,
-            document_name: self.document_name,
-            parameters: self.parameters,
-            reason: self.reason,
-            ..Default::default()
+    /// [`Session::output`]: crate::Session::output
+    pub fn output_buffer(mut self, messages: usize) -> Self {
+        self.config.output_buffer = messages;
+        self
+    }
+
+    /// Relax or restore endpoint validation for the data channel.
+    ///
+    /// Only useful for pointing tests at a local mock gateway.
+    pub fn endpoint_policy(mut self, policy: EndpointPolicy) -> Self {
+        self.config.endpoint_policy = policy;
+        self
+    }
+
+    /// The configuration, without starting anything.
+    pub fn config(&self) -> &SessionConfig {
+        &self.config
+    }
+
+    /// Consume the builder and return its configuration.
+    pub fn into_config(self) -> SessionConfig {
+        self.config
+    }
+
+    /// Build a manager and start the session.
+    pub async fn start(self) -> Result<Session> {
+        let manager = match &self.region {
+            Some(region) => SessionManager::for_region(region.clone()).await?,
+            None => SessionManager::new().await?,
         };
-
-        manager.start_session(config).await
+        manager.start_session(self.config).await
     }
 
-    /// Build the configuration without starting a session
-    ///
-    /// Useful if you want to reuse the same manager for multiple sessions.
-    pub fn build_config(self) -> SessionConfig {
-        SessionConfig {
-            target: self.target,
-            region: self.region,
-            session_type: self.session_type,
-            document_name: self.document_name,
-            parameters: self.parameters,
-            reason: self.reason,
-            ..Default::default()
-        }
+    /// Start the session using an existing manager.
+    pub async fn start_with(self, manager: &SessionManager) -> Result<Session> {
+        manager.start_session(self.config).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::documents::SessionType;
 
     #[test]
-    fn test_builder_basic() {
-        let config = SessionBuilder::new("i-test")
-            .region("us-west-2")
-            .build_config();
-
-        assert_eq!(config.target, "i-test");
-        assert_eq!(config.region, Some("us-west-2".to_string()));
+    fn port_forward_shorthand_matches_the_document() {
+        let config = SessionBuilder::new("i-abc")
+            .port_forward(3306)
+            .into_config();
+        let document = config.document.expect("a document must be set");
+        assert_eq!(document.name, "AWS-StartPortForwardingSession");
+        assert_eq!(document.parameters["portNumber"], vec!["3306".to_string()]);
+        assert_eq!(document.session_type, SessionType::Port);
     }
 
     #[test]
-    fn test_builder_port_forward() {
-        let config = SessionBuilder::new("i-test")
-            .port_forward(3389)
-            .build_config();
+    fn a_plain_builder_starts_a_shell() {
+        let config = SessionBuilder::new("i-abc").into_config();
+        assert!(config.document.is_none());
+        assert_eq!(config.session_type(), SessionType::StandardStream);
+    }
 
-        assert_eq!(config.session_type, SessionType::Port);
+    /// `region()` used to be silently ignored. Pin it to the builder state so a
+    /// refactor cannot quietly drop it again.
+    #[test]
+    fn region_is_recorded() {
         assert_eq!(
-            config.parameters.get("portNumber"),
-            Some(&vec!["3389".to_string()])
+            SessionBuilder::new("i-abc").region("eu-west-1").region,
+            Some("eu-west-1".to_owned())
         );
+        assert_eq!(SessionBuilder::new("i-abc").region, None);
     }
 
     #[test]
-    fn test_builder_with_reason() {
-        let config = SessionBuilder::new("i-test")
-            .reason("Security audit")
-            .build_config();
+    fn maybe_region_leaves_the_region_alone_when_none() {
+        let builder = SessionBuilder::new("i-abc")
+            .region("eu-west-1")
+            .maybe_region(Option::<String>::None);
+        assert_eq!(builder.region, Some("eu-west-1".to_owned()));
 
-        assert_eq!(config.reason, Some("Security audit".to_string()));
+        let builder = builder.maybe_region(Some("us-east-1"));
+        assert_eq!(builder.region, Some("us-east-1".to_owned()));
+    }
+
+    #[test]
+    fn tuning_knobs_reach_the_config() {
+        let config = SessionBuilder::new("i-abc")
+            .reason("audit")
+            .ready_timeout(Duration::from_secs(5))
+            .keepalive(Duration::from_secs(10), Duration::from_secs(45))
+            .payload_chunk_size(8192)
+            .output_buffer(64)
+            .endpoint_policy(EndpointPolicy::AllowAny)
+            .into_config();
+
+        assert_eq!(config.reason.as_deref(), Some("audit"));
+        assert_eq!(config.ready_timeout, Duration::from_secs(5));
+        assert_eq!(config.heartbeat_interval, Duration::from_secs(10));
+        assert_eq!(config.idle_timeout, Duration::from_secs(45));
+        assert_eq!(config.payload_chunk_size, 8192);
+        assert_eq!(config.output_buffer, 64);
+        assert_eq!(config.endpoint_policy, EndpointPolicy::AllowAny);
+    }
+
+    #[test]
+    fn the_last_document_wins() {
+        let config = SessionBuilder::new("i-abc")
+            .port_forward(1234)
+            .document(crate::documents::SshSession::new())
+            .into_config();
+        let document = config.document.unwrap();
+        assert_eq!(document.name, "AWS-StartSSHSession");
+        assert_eq!(document.session_type, SessionType::StandardStream);
     }
 }

@@ -1,122 +1,115 @@
-"""
-AWS SSM Bridge - Python bindings for AWS Systems Manager Session Manager protocol.
+"""Async Python bindings for the AWS Systems Manager Session Manager protocol.
 
-This package provides a high-level Python interface to the aws-ssm-bridge Rust library,
-enabling secure, high-performance connections to EC2 instances via AWS Systems Manager.
+Open sessions, stream bytes and forward ports from Python, without the
+`session-manager-plugin` binary or a subprocess.
 
-Example (context manager - recommended):
-    >>> import asyncio
-    >>> from aws_ssm_bridge import SessionManager
-    >>> 
-    >>> async def main():
-    ...     manager = await SessionManager.new()
-    ...     async with await manager.start_session("i-1234567890abcdef0") as session:
-    ...         await session.send(b"hostname\\n")
-    ...         async for chunk in session.output():
-    ...             print(chunk.decode(), end='')
-    ...     # Session automatically terminated
-    >>> 
-    >>> asyncio.run(main())
+    import asyncio
+    from aws_ssm_bridge import SessionManager
 
-Example (manual):
-    >>> async def main():
-    ...     manager = await SessionManager.new()
-    ...     session = await manager.start_session("i-1234567890abcdef0")
-    ...     try:
-    ...         await session.send(b"hostname\\n")
-    ...     finally:
-    ...         await session.terminate()
+    async def main():
+        manager = await SessionManager.new()
+        async with await manager.start_session("i-0123456789abcdef0") as session:
+            await session.send(b"uname -a\\r")
+            async for chunk in session.output():
+                print(chunk.decode(errors="replace"), end="")
 
-Features:
-    - Full AWS SSM binary protocol implementation
-    - Async/await API with streaming output
-    - Async context manager for automatic cleanup
-    - Automatic retry with exponential backoff
-    - Secure: zeroized keys, constant-time comparisons
-    - High performance: Rust core with zero-copy where possible
+    asyncio.run(main())
+
+Send ``\\r``, not ``\\n``, for Enter: a remote pty maps carriage return to
+newline, but Windows shells behind winpty do not accept a bare line feed.
+
+Credentials come from the standard AWS chain -- environment variables,
+``~/.aws/config``, SSO, or instance metadata.
 """
 
-from typing import Dict, List, Optional
+# The wheel is abi3-py38, so `str | None` in a signature would raise at import
+# time on Python 3.8 and 3.9. Deferring annotation evaluation keeps the modern
+# spelling working everywhere.
+from __future__ import annotations
 
 from ._internal import (
-    SessionManager,
-    Session,
-    SessionConfig,
-    SessionType,
-    OutputStream,
     InteractiveShell,
-    InteractiveConfig,
-    run_shell,
-    configure_logging,
-    AwsSsmBridgeError,
-    SsmSessionError,
+    OutputStream,
+    PortForwarder,
+    Session,
+    SessionManager,
+    SsmAwsError,
+    SsmClosedError,
+    SsmCryptoError,
+    SsmError,
     SsmProtocolError,
-    SsmTransportError,
-    SsmAwsSdkError,
     SsmTimeoutError,
-    SsmCancelledError,
+    SsmTransportError,
     __version__,
+    configure_logging,
 )
-
-
-async def connect(
-    target: str,
-    region: Optional[str] = None,
-    session_type: Optional[str] = None,
-    document_name: Optional[str] = None,
-    parameters: Optional[Dict[str, List[str]]] = None,
-    reason: Optional[str] = None,
-) -> Session:
-    """
-    Convenience function to quickly connect to an instance.
-    
-    Creates a SessionManager and starts a session in one call.
-    For multiple sessions, prefer creating a SessionManager directly.
-    
-    Args:
-        target: Instance ID to connect to (e.g., 'i-1234567890abcdef0')
-        region: AWS region (uses default if not specified)
-        session_type: Type of session ('standard_stream', 'port', etc.)
-        document_name: SSM document for custom sessions
-        parameters: Document parameters
-        reason: Audit reason for session
-    
-    Returns:
-        Session: Connected session ready for use
-    
-    Example:
-        >>> session = await connect("i-1234567890abcdef0")
-        >>> await session.send(b"whoami\\n")
-        >>> await session.terminate()
-    """
-    manager = await SessionManager.new()
-    return await manager.start_session(
-        target=target,
-        region=region,
-        session_type=session_type,
-        document_name=document_name,
-        parameters=parameters,
-        reason=reason,
-    )
-
 
 __all__ = [
     "SessionManager",
     "Session",
-    "SessionConfig",
-    "SessionType",
     "OutputStream",
+    "PortForwarder",
     "InteractiveShell",
-    "InteractiveConfig",
-    "run_shell",
     "configure_logging",
     "connect",
-    "AwsSsmBridgeError",
-    "SsmSessionError",
+    "run_command",
+    "SsmError",
+    "SsmAwsError",
     "SsmProtocolError",
     "SsmTransportError",
-    "SsmAwsSdkError",
+    "SsmClosedError",
+    "SsmCryptoError",
     "SsmTimeoutError",
-    "SsmCancelledError",
     "__version__",
 ]
+
+
+async def connect(target: str, *, region: str | None = None, reason: str | None = None) -> Session:
+    """Open a shell session in one call.
+
+    Convenient for scripts. Starting several sessions? Build one
+    :class:`SessionManager` and reuse it, so they share a connection pool and
+    credential cache.
+
+    The returned session is *not* waited on; call ``await session.wait_ready()``
+    or use it as an async context manager before sending.
+    """
+    manager = await SessionManager.new(region=region)
+    return await manager.start_session(target, reason=reason)
+
+
+async def run_command(
+    target: str,
+    command: str,
+    *,
+    region: str | None = None,
+    timeout: float = 30.0,
+) -> str:
+    """Run one command and return everything it printed.
+
+    Uses ``AWS-StartNonInteractiveCommand``, so there is no pty and no shell
+    prompt in the output. The session ends when the command exits; anything
+    still streaming after ``timeout`` seconds is discarded.
+    """
+    import asyncio
+
+    manager = await SessionManager.new(region=region)
+    session = await manager.start_session(
+        target,
+        document_name="AWS-StartNonInteractiveCommand",
+        parameters={"command": [command]},
+    )
+
+    async def collect() -> str:
+        chunks = []
+        async for chunk in session.output():
+            chunks.append(chunk)
+        return b"".join(chunks).decode(errors="replace")
+
+    try:
+        await session.wait_ready()
+        return await asyncio.wait_for(collect(), timeout=timeout)
+    except asyncio.TimeoutError:
+        return ""
+    finally:
+        await session.terminate()

@@ -1,55 +1,19 @@
-# Fuzz Testing for AWS SSM Bridge
+# Fuzz targets
 
-This directory contains fuzz testing targets using `cargo-fuzz` (libFuzzer).
+Coverage-guided fuzzing for everything that parses data from the network.
 
-## Setup
-
-```bash
-# Install cargo-fuzz (requires nightly)
+```sh
 cargo install cargo-fuzz
-
-# Switch to nightly for fuzzing
-rustup override set nightly
+cargo fuzz run fuzz_binary_protocol
+cargo fuzz run fuzz_handshake
+cargo fuzz run fuzz_acknowledge
 ```
 
-## Running Fuzz Tests
+| Target | What it protects |
+|---|---|
+| `fuzz_binary_protocol` | The 120-byte header parser — the first code to touch bytes off the wire. Also checks that a message this crate produced always re-parses. |
+| `fuzz_handshake` | The agent's handshake JSON, which is parsed before any session state exists. |
+| `fuzz_acknowledge` | Acknowledgement payloads, which drive the retransmission buffer. |
 
-```bash
-# Fuzz the binary protocol parser (most critical)
-cargo +nightly fuzz run fuzz_binary_protocol
-
-# Fuzz the handshake parser
-cargo +nightly fuzz run fuzz_handshake
-
-# Fuzz JSON message parsing
-cargo +nightly fuzz run fuzz_json_messages
-
-# Run with specific options
-cargo +nightly fuzz run fuzz_binary_protocol -- -max_len=65536 -jobs=4
-```
-
-## Targets
-
-| Target | Description | Priority |
-|--------|-------------|----------|
-| `fuzz_binary_protocol` | 116-byte header + payload parsing | **Critical** |
-| `fuzz_handshake` | Handshake request/response JSON | High |
-| `fuzz_json_messages` | ACK, control messages | High |
-
-## Coverage
-
-```bash
-# Generate coverage report
-cargo +nightly fuzz coverage fuzz_binary_protocol
-```
-
-## Findings
-
-Any crashes or hangs found by fuzzing should be:
-1. Documented in this file
-2. Added to the corpus as regression tests
-3. Fixed with a unit test
-
-### Known Issues
-
-None yet - fuzzing in progress.
+A panic in any of these is a remotely triggerable denial of service, so the bar
+is: arbitrary bytes in, `Result` out, never a panic.

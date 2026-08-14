@@ -1,25 +1,12 @@
-//! Fuzz target for handshake protocol parsing
-//!
-//! Tests parsing of HandshakeRequest, HandshakeResponse, and HandshakeComplete
-//! JSON messages that come from the SSM agent.
-
+//! The agent's handshake JSON is attacker-adjacent input: it arrives before any
+//! session state exists and is parsed by serde. Malformed input must produce an
+//! error, never a panic.
 #![no_main]
 
+use aws_ssm_bridge::handshake::{HandshakeComplete, HandshakeRequest};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // Try parsing as UTF-8 first (JSON requires valid UTF-8)
-    if let Ok(json_str) = std::str::from_utf8(data) {
-        // Try parsing as HandshakeRequest
-        let _: Result<aws_ssm_bridge::handshake::HandshakeRequest, _> = 
-            serde_json::from_str(json_str);
-        
-        // Try parsing as HandshakeResponse
-        let _: Result<aws_ssm_bridge::handshake::HandshakeResponse, _> = 
-            serde_json::from_str(json_str);
-        
-        // Try parsing as HandshakeComplete
-        let _: Result<aws_ssm_bridge::handshake::HandshakeComplete, _> = 
-            serde_json::from_str(json_str);
-    }
+    let _ = serde_json::from_slice::<HandshakeRequest>(data);
+    let _ = serde_json::from_slice::<HandshakeComplete>(data);
 });

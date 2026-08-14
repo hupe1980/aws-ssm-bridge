@@ -1,117 +1,122 @@
-//! Type-safe AWS SSM document definitions
+//! Typed wrappers for the AWS-managed Session Manager documents.
 //!
-//! This module provides strongly-typed representations of AWS SSM Session Manager
-//! documents and their parameters, eliminating magic strings and enabling
-//! compile-time validation.
+//! `StartSession` takes a document name and a `HashMap<String, Vec<String>>` of
+//! parameters. Getting a key wrong there fails at runtime, in the API response,
+//! after the round trip. These types encode each document's real parameters so
+//! the compiler catches the mistake instead.
 //!
-//! # AWS SSM Session Manager Documents
+//! | Document | Type | What it does |
+//! |----------|------|--------------|
+//! | *(none)* | [`ShellSession`] | Interactive shell — the default |
+//! | `AWS-StartPortForwardingSession` | [`PortForwardingSession`] | Forward a port on the instance itself |
+//! | `AWS-StartPortForwardingSessionToRemoteHost` | [`PortForwardingToRemoteHost`] | Forward through the instance to another host |
+//! | `AWS-StartSSHSession` | [`SshSession`] | SSH transport for `ProxyCommand` |
+//! | `AWS-StartInteractiveCommand` | [`InteractiveCommand`] | Run a command with a pty attached |
+//! | `AWS-StartNonInteractiveCommand` | [`NonInteractiveCommand`] | Run a command without a pty |
 //!
-//! AWS SSM Session Manager supports exactly **4 built-in documents**:
+//! Non-interactive *fleet* automation (`AWS-RunShellScript` and friends) belongs
+//! to Run Command, a different service; those documents will not start a session.
 //!
-//! | Document | Rust Type | Purpose |
-//! |----------|-----------|---------|
-//! | (none) | [`ShellSession`] | Standard interactive shell |
-//! | `AWS-StartPortForwardingSession` | [`PortForwardingSession`] | Port forward to instance |
-//! | `AWS-StartPortForwardingSessionToRemoteHost` | [`PortForwardingToRemoteHost`] | Port forward through instance |
-//! | `AWS-StartInteractiveCommand` | [`InteractiveCommand`] | Execute specific commands |
-//! | `AWS-StartSSHSession` | [`SshSession`] | SSH over Session Manager |
+//! # Session types and port forwarding
 //!
-//! **Note:** Non-interactive commands are handled by AWS Run Command (a different
-//! service), not Session Manager. Documents like `AWS-RunShellScript` are for
-//! Run Command, not sessions.
+//! Only the two port-forwarding documents produce a [`SessionType::Port`]
+//! session, and only those multiplex TCP connections over smux — which is why
+//! [`PortForwarder`] accepts them and nothing else. `AWS-StartSSHSession` looks
+//! like port forwarding but is a plain bidirectional byte stream: SSH speaks its
+//! own protocol over the session's stdin and stdout. Treating it as a
+//! multiplexed forward would frame SSH's handshake as smux frames and hang.
 //!
-//! # Design Philosophy
-//!
-//! Instead of using `HashMap<String, Vec<String>>` with magic keys like
-//! `"portNumber"`, we define proper Rust types that encode the valid
-//! parameters for each document.
-//!
-//! # Example
-//!
-//! ```rust,no_run
-//! use aws_ssm_bridge::documents::{PortForwardingSession, SsmDocument};
-//!
-//! // Type-safe port forwarding configuration
-//! let doc = PortForwardingSession::new(3306);
-//!
-//! // With optional local port
-//! let doc = PortForwardingSession::builder()
-//!     .remote_port(3306)
-//!     .local_port(13306)
-//!     .build()?;
-//! # Ok::<(), aws_ssm_bridge::errors::Error>(())
-//! ```
+//! [`PortForwarder`]: crate::PortForwarder
 
-use crate::protocol::SessionType;
 use std::collections::HashMap;
 
-// =============================================================================
-// Document Trait
-// =============================================================================
+/// What a session's byte stream means, and therefore how to drive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionType {
+    /// A bidirectional byte stream: shell, SSH transport, or a command's stdio.
+    #[default]
+    StandardStream,
+    /// TCP connections multiplexed over smux; drive with [`PortForwarder`].
+    ///
+    /// [`PortForwarder`]: crate::PortForwarder
+    Port,
+}
 
-/// Trait for SSM document types
-///
-/// Each document type implements this trait to provide:
-/// - The document name
-/// - The session type
-/// - Parameters as a HashMap (for AWS API compatibility)
-pub trait SsmDocument: Send + Sync {
-    /// The AWS SSM document name (e.g., "AWS-StartPortForwardingSession")
+/// An SSM document that can start a session.
+pub trait SsmDocument {
+    /// The document name passed to `StartSession`.
+    ///
+    /// Empty means "no document", which starts a default shell session.
     fn document_name(&self) -> &'static str;
 
-    /// The session type for this document
+    /// The kind of session this document produces.
     fn session_type(&self) -> SessionType;
 
-    /// Convert parameters to HashMap for AWS API
+    /// Document parameters in `StartSession` form.
     fn parameters(&self) -> HashMap<String, Vec<String>>;
 }
 
-// =============================================================================
-// Port Forwarding Document
-// =============================================================================
+fn params<const N: usize>(pairs: [(&str, String); N]) -> HashMap<String, Vec<String>> {
+    pairs
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), vec![v]))
+        .collect()
+}
 
-/// AWS-StartPortForwardingSession document
+// ---------------------------------------------------------------------------
+// Shell
+// ---------------------------------------------------------------------------
+
+/// A plain interactive shell — what `aws ssm start-session` gives you with no
+/// `--document-name`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShellSession;
+
+impl ShellSession {
+    /// Create a shell session document.
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl SsmDocument for ShellSession {
+    fn document_name(&self) -> &'static str {
+        ""
+    }
+    fn session_type(&self) -> SessionType {
+        SessionType::StandardStream
+    }
+    fn parameters(&self) -> HashMap<String, Vec<String>> {
+        HashMap::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Port forwarding
+// ---------------------------------------------------------------------------
+
+/// `AWS-StartPortForwardingSession` — reach a port on the instance itself.
 ///
-/// Forwards a remote port on an EC2 instance to a local port.
-///
-/// # Example
-///
-/// ```rust
-/// use aws_ssm_bridge::documents::PortForwardingSession;
-///
-/// // Simple: just remote port
-/// let doc = PortForwardingSession::new(3306);
-///
-/// // With local port specified
-/// let doc = PortForwardingSession::builder()
-///     .remote_port(3306)
-///     .local_port(13306)
-///     .build()?;
-/// # Ok::<(), aws_ssm_bridge::errors::Error>(())
 /// ```
-#[derive(Debug, Clone)]
+/// use aws_ssm_bridge::documents::{PortForwardingSession, SsmDocument, SessionType};
+///
+/// let doc = PortForwardingSession::new(3306);
+/// assert_eq!(doc.session_type(), SessionType::Port);
+/// assert_eq!(doc.parameters()["portNumber"], vec!["3306".to_string()]);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortForwardingSession {
-    /// Remote port on the EC2 instance
+    /// Port to connect to on the instance.
     pub remote_port: u16,
-    /// Optional local port (if not specified, a random port is used)
-    pub local_port: Option<u16>,
 }
 
 impl PortForwardingSession {
-    /// Document name constant
+    /// The AWS document name.
     pub const DOCUMENT_NAME: &'static str = "AWS-StartPortForwardingSession";
 
-    /// Create a new port forwarding session for the given remote port
-    pub fn new(remote_port: u16) -> Self {
-        Self {
-            remote_port,
-            local_port: None,
-        }
-    }
-
-    /// Create a builder for more complex configurations
-    pub fn builder() -> PortForwardingSessionBuilder {
-        PortForwardingSessionBuilder::default()
+    /// Forward to `remote_port` on the target instance.
+    pub const fn new(remote_port: u16) -> Self {
+        Self { remote_port }
     }
 }
 
@@ -119,100 +124,41 @@ impl SsmDocument for PortForwardingSession {
     fn document_name(&self) -> &'static str {
         Self::DOCUMENT_NAME
     }
-
     fn session_type(&self) -> SessionType {
         SessionType::Port
     }
-
     fn parameters(&self) -> HashMap<String, Vec<String>> {
-        let mut params = HashMap::new();
-        params.insert("portNumber".to_string(), vec![self.remote_port.to_string()]);
-        if let Some(local) = self.local_port {
-            params.insert("localPortNumber".to_string(), vec![local.to_string()]);
-        }
-        params
+        params([("portNumber", self.remote_port.to_string())])
     }
 }
 
-/// Builder for PortForwardingSession
-#[derive(Debug, Default)]
-pub struct PortForwardingSessionBuilder {
-    remote_port: Option<u16>,
-    local_port: Option<u16>,
-}
-
-impl PortForwardingSessionBuilder {
-    /// Set the remote port (required)
-    pub fn remote_port(mut self, port: u16) -> Self {
-        self.remote_port = Some(port);
-        self
-    }
-
-    /// Set the local port (optional)
-    pub fn local_port(mut self, port: u16) -> Self {
-        self.local_port = Some(port);
-        self
-    }
-
-    /// Build the document configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Config`] if `remote_port` was not set.
-    pub fn build(self) -> crate::errors::Result<PortForwardingSession> {
-        let remote_port = self.remote_port.ok_or_else(|| {
-            crate::errors::Error::Config("remote_port is required for PortForwardingSession".into())
-        })?;
-        Ok(PortForwardingSession {
-            remote_port,
-            local_port: self.local_port,
-        })
-    }
-}
-
-// =============================================================================
-// Port Forwarding to Remote Host Document
-// =============================================================================
-
-/// AWS-StartPortForwardingSessionToRemoteHost document
+/// `AWS-StartPortForwardingSessionToRemoteHost` — reach a third host through the
+/// instance, for example an RDS endpoint from a bastion.
 ///
-/// Forwards a port through an EC2 instance to a remote host (e.g., RDS).
-///
-/// # Example
-///
-/// ```rust
-/// use aws_ssm_bridge::documents::PortForwardingToRemoteHost;
-///
-/// // Forward to an RDS instance through a bastion
-/// let doc = PortForwardingToRemoteHost::new("mydb.cluster-xxx.us-east-1.rds.amazonaws.com", 3306);
 /// ```
-#[derive(Debug, Clone)]
+/// use aws_ssm_bridge::documents::{PortForwardingToRemoteHost, SsmDocument};
+///
+/// let doc = PortForwardingToRemoteHost::new("db.cluster-abc.eu-central-1.rds.amazonaws.com", 5432);
+/// assert_eq!(doc.parameters()["portNumber"], vec!["5432".to_string()]);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortForwardingToRemoteHost {
-    /// Remote host to connect to (hostname or IP)
+    /// Hostname or IP the instance should connect to.
     pub host: String,
-    /// Port on the remote host
+    /// Port on that host.
     pub remote_port: u16,
-    /// Optional local port
-    pub local_port: Option<u16>,
 }
 
 impl PortForwardingToRemoteHost {
-    /// Document name constant
+    /// The AWS document name.
     pub const DOCUMENT_NAME: &'static str = "AWS-StartPortForwardingSessionToRemoteHost";
 
-    /// Create a new port forwarding session to a remote host
+    /// Forward through the target instance to `host:remote_port`.
     pub fn new(host: impl Into<String>, remote_port: u16) -> Self {
         Self {
             host: host.into(),
             remote_port,
-            local_port: None,
         }
-    }
-
-    /// Set the local port
-    pub fn with_local_port(mut self, port: u16) -> Self {
-        self.local_port = Some(port);
-        self
     }
 }
 
@@ -220,150 +166,47 @@ impl SsmDocument for PortForwardingToRemoteHost {
     fn document_name(&self) -> &'static str {
         Self::DOCUMENT_NAME
     }
-
     fn session_type(&self) -> SessionType {
         SessionType::Port
     }
-
     fn parameters(&self) -> HashMap<String, Vec<String>> {
-        let mut params = HashMap::new();
-        params.insert("host".to_string(), vec![self.host.clone()]);
-        params.insert("portNumber".to_string(), vec![self.remote_port.to_string()]);
-        if let Some(local) = self.local_port {
-            params.insert("localPortNumber".to_string(), vec![local.to_string()]);
-        }
-        params
+        params([
+            ("host", self.host.clone()),
+            ("portNumber", self.remote_port.to_string()),
+        ])
     }
 }
 
-// =============================================================================
-// Interactive Shell Document
-// =============================================================================
+// ---------------------------------------------------------------------------
+// SSH
+// ---------------------------------------------------------------------------
 
-/// Standard interactive shell session (no custom document)
+/// `AWS-StartSSHSession` — the transport `ssh -o ProxyCommand` uses.
 ///
-/// This is the default session type - a simple shell session.
-#[derive(Debug, Clone, Default)]
-pub struct ShellSession;
-
-impl ShellSession {
-    /// Create a new shell session
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl SsmDocument for ShellSession {
-    fn document_name(&self) -> &'static str {
-        // Shell sessions don't require a document name
-        ""
-    }
-
-    fn session_type(&self) -> SessionType {
-        SessionType::StandardStream
-    }
-
-    fn parameters(&self) -> HashMap<String, Vec<String>> {
-        HashMap::new()
-    }
-}
-
-// =============================================================================
-// Interactive Command Document
-// =============================================================================
-
-/// AWS-StartInteractiveCommand document
+/// This is a **byte stream**, not a multiplexed port forward: pipe
+/// [`Session::output`] to your SSH client's stdin and its stdout to
+/// [`Session::send`]. See the module documentation for why the distinction
+/// matters.
 ///
-/// Execute commands in an interactive shell session with specified commands.
-/// Unlike a plain shell session, this runs specific commands.
-///
-/// # Example
-///
-/// ```rust
-/// use aws_ssm_bridge::documents::InteractiveCommand;
-///
-/// // Run a single command
-/// let doc = InteractiveCommand::new("top");
-///
-/// // Run multiple commands
-/// let doc = InteractiveCommand::with_commands(vec!["cd /var/log".into(), "tail -f syslog".into()]);
-/// ```
-#[derive(Debug, Clone)]
-pub struct InteractiveCommand {
-    /// Commands to execute
-    pub commands: Vec<String>,
-}
-
-impl InteractiveCommand {
-    /// Document name constant
-    pub const DOCUMENT_NAME: &'static str = "AWS-StartInteractiveCommand";
-
-    /// Create with a single command
-    pub fn new(command: impl Into<String>) -> Self {
-        Self {
-            commands: vec![command.into()],
-        }
-    }
-
-    /// Create with multiple commands
-    pub fn with_commands(commands: Vec<String>) -> Self {
-        Self { commands }
-    }
-}
-
-impl SsmDocument for InteractiveCommand {
-    fn document_name(&self) -> &'static str {
-        Self::DOCUMENT_NAME
-    }
-
-    fn session_type(&self) -> SessionType {
-        SessionType::InteractiveCommands
-    }
-
-    fn parameters(&self) -> HashMap<String, Vec<String>> {
-        let mut params = HashMap::new();
-        params.insert("command".to_string(), self.commands.clone());
-        params
-    }
-}
-
-// =============================================================================
-// SSH Session Document
-// =============================================================================
-
-/// AWS-StartSSHSession document
-///
-/// Start an SSH session through SSM (SSH over Session Manager).
-/// This is used by `aws ssm start-session --document-name AWS-StartSSHSession`.
-///
-/// # Example
-///
-/// ```rust
-/// use aws_ssm_bridge::documents::SshSession;
-///
-/// // Default SSH port (22)
-/// let doc = SshSession::new();
-///
-/// // Custom SSH port
-/// let doc = SshSession::with_port(2222);
-/// ```
-#[derive(Debug, Clone)]
+/// [`Session::output`]: crate::Session::output
+/// [`Session::send`]: crate::Session::send
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SshSession {
-    /// SSH port on the remote instance (default: 22)
+    /// SSH port on the instance.
     pub port: u16,
 }
 
 impl SshSession {
-    /// Document name constant
+    /// The AWS document name.
     pub const DOCUMENT_NAME: &'static str = "AWS-StartSSHSession";
 
-    /// Create a new SSH session with default port (22)
-    pub fn new() -> Self {
+    /// SSH on the standard port 22.
+    pub const fn new() -> Self {
         Self { port: 22 }
     }
 
-    /// Create a new SSH session with custom port
-    pub fn with_port(port: u16) -> Self {
+    /// SSH on a non-standard port.
+    pub const fn on_port(port: u16) -> Self {
         Self { port }
     }
 }
@@ -378,104 +221,177 @@ impl SsmDocument for SshSession {
     fn document_name(&self) -> &'static str {
         Self::DOCUMENT_NAME
     }
-
     fn session_type(&self) -> SessionType {
-        SessionType::Port
+        // Deliberately not `Port`: the agent streams SSH's own protocol here
+        // rather than smux frames.
+        SessionType::StandardStream
     }
-
     fn parameters(&self) -> HashMap<String, Vec<String>> {
-        let mut params = HashMap::new();
-        params.insert("portNumber".to_string(), vec![self.port.to_string()]);
-        params
+        params([("portNumber", self.port.to_string())])
     }
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+/// `AWS-StartInteractiveCommand` — run a command with a pty attached.
+///
+/// Use this for anything that draws to the terminal or reads input (`top`,
+/// `less`, a REPL). For a command whose output you only want to collect, prefer
+/// [`NonInteractiveCommand`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveCommand {
+    /// Command line to run.
+    pub command: String,
+}
+
+impl InteractiveCommand {
+    /// The AWS document name.
+    pub const DOCUMENT_NAME: &'static str = "AWS-StartInteractiveCommand";
+
+    /// Run `command` interactively.
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+        }
+    }
+}
+
+impl SsmDocument for InteractiveCommand {
+    fn document_name(&self) -> &'static str {
+        Self::DOCUMENT_NAME
+    }
+    fn session_type(&self) -> SessionType {
+        SessionType::StandardStream
+    }
+    fn parameters(&self) -> HashMap<String, Vec<String>> {
+        params([("command", self.command.clone())])
+    }
+}
+
+/// `AWS-StartNonInteractiveCommand` — run a command with no pty.
+///
+/// The command's output streams back and the session ends when it exits; read
+/// the status from [`Session::exit_code`].
+///
+/// [`Session::exit_code`]: crate::Session::exit_code
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonInteractiveCommand {
+    /// Command line to run.
+    pub command: String,
+}
+
+impl NonInteractiveCommand {
+    /// The AWS document name.
+    pub const DOCUMENT_NAME: &'static str = "AWS-StartNonInteractiveCommand";
+
+    /// Run `command` and stream its output.
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+        }
+    }
+}
+
+impl SsmDocument for NonInteractiveCommand {
+    fn document_name(&self) -> &'static str {
+        Self::DOCUMENT_NAME
+    }
+    fn session_type(&self) -> SessionType {
+        SessionType::StandardStream
+    }
+    fn parameters(&self) -> HashMap<String, Vec<String>> {
+        params([("command", self.command.clone())])
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_port_forwarding_simple() {
-        let doc = PortForwardingSession::new(3306);
+    fn shell_sessions_carry_no_document() {
+        let doc = ShellSession::new();
+        assert!(doc.document_name().is_empty());
+        assert!(doc.parameters().is_empty());
+        assert_eq!(doc.session_type(), SessionType::StandardStream);
+    }
+
+    #[test]
+    fn port_forwarding_uses_the_documented_parameter_names() {
+        let doc = PortForwardingSession::new(3389);
         assert_eq!(doc.document_name(), "AWS-StartPortForwardingSession");
+        assert_eq!(doc.parameters()["portNumber"], vec!["3389".to_string()]);
         assert_eq!(doc.session_type(), SessionType::Port);
-
-        let params = doc.parameters();
-        assert_eq!(params.get("portNumber"), Some(&vec!["3306".to_string()]));
-        assert!(!params.contains_key("localPortNumber"));
     }
 
     #[test]
-    fn test_port_forwarding_builder() {
-        let doc = PortForwardingSession::builder()
-            .remote_port(3306)
-            .local_port(13306)
-            .build()
-            .unwrap();
-
-        let params = doc.parameters();
-        assert_eq!(params.get("portNumber"), Some(&vec!["3306".to_string()]));
-        assert_eq!(
-            params.get("localPortNumber"),
-            Some(&vec!["13306".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_port_forwarding_to_remote_host() {
-        let doc =
-            PortForwardingToRemoteHost::new("mydb.rds.amazonaws.com", 5432).with_local_port(15432);
-
+    fn remote_host_forwarding_sends_host_and_port() {
+        let doc = PortForwardingToRemoteHost::new("db.internal", 5432);
+        let p = doc.parameters();
         assert_eq!(
             doc.document_name(),
             "AWS-StartPortForwardingSessionToRemoteHost"
         );
-
-        let params = doc.parameters();
-        assert_eq!(
-            params.get("host"),
-            Some(&vec!["mydb.rds.amazonaws.com".to_string()])
-        );
-        assert_eq!(params.get("portNumber"), Some(&vec!["5432".to_string()]));
-        assert_eq!(
-            params.get("localPortNumber"),
-            Some(&vec!["15432".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_shell_session() {
-        let doc = ShellSession::new();
-        assert_eq!(doc.session_type(), SessionType::StandardStream);
-        assert!(doc.parameters().is_empty());
-    }
-
-    #[test]
-    fn test_interactive_command() {
-        let doc = InteractiveCommand::new("top");
-        assert_eq!(doc.document_name(), "AWS-StartInteractiveCommand");
-        assert_eq!(doc.session_type(), SessionType::InteractiveCommands);
-
-        let params = doc.parameters();
-        assert_eq!(params.get("command"), Some(&vec!["top".to_string()]));
-    }
-
-    #[test]
-    fn test_ssh_session() {
-        let doc = SshSession::new();
-        assert_eq!(doc.document_name(), "AWS-StartSSHSession");
+        assert_eq!(p["host"], vec!["db.internal".to_string()]);
+        assert_eq!(p["portNumber"], vec!["5432".to_string()]);
         assert_eq!(doc.session_type(), SessionType::Port);
+    }
 
-        let params = doc.parameters();
-        assert_eq!(params.get("portNumber"), Some(&vec!["22".to_string()]));
+    /// The agent only speaks smux for documents whose session properties set
+    /// `type: LocalPortForwarding`. `AWS-StartSSHSession` does not, so
+    /// classifying it as `Port` would send SSH's handshake into the smux frame
+    /// parser and hang the session.
+    #[test]
+    fn ssh_is_a_byte_stream_not_a_multiplexed_forward() {
+        assert_eq!(
+            SshSession::new().session_type(),
+            SessionType::StandardStream
+        );
+        assert_eq!(
+            SshSession::new().parameters()["portNumber"],
+            vec!["22".to_string()]
+        );
+        assert_eq!(
+            SshSession::on_port(2222).parameters()["portNumber"],
+            vec!["2222".to_string()]
+        );
+    }
 
-        // Custom port
-        let doc = SshSession::with_port(2222);
-        let params = doc.parameters();
-        assert_eq!(params.get("portNumber"), Some(&vec!["2222".to_string()]));
+    #[test]
+    fn command_documents_pass_the_command_through() {
+        assert_eq!(
+            InteractiveCommand::new("top -b").parameters()["command"],
+            vec!["top -b".to_string()]
+        );
+        assert_eq!(
+            NonInteractiveCommand::new("uname -a").parameters()["command"],
+            vec!["uname -a".to_string()]
+        );
+        assert_eq!(
+            NonInteractiveCommand::DOCUMENT_NAME,
+            "AWS-StartNonInteractiveCommand"
+        );
+    }
+
+    /// Only the two forwarding documents may be handed to `PortForwarder`.
+    #[test]
+    fn exactly_two_documents_are_port_sessions() {
+        let port_types = [
+            PortForwardingSession::new(1).session_type(),
+            PortForwardingToRemoteHost::new("h", 1).session_type(),
+        ];
+        assert!(port_types.iter().all(|t| *t == SessionType::Port));
+
+        let stream_types = [
+            ShellSession::new().session_type(),
+            SshSession::new().session_type(),
+            InteractiveCommand::new("x").session_type(),
+            NonInteractiveCommand::new("x").session_type(),
+        ];
+        assert!(stream_types
+            .iter()
+            .all(|t| *t == SessionType::StandardStream));
     }
 }
