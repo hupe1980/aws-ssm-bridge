@@ -25,6 +25,18 @@ use tokio_tungstenite::tungstenite::Message;
 pub enum Behaviour {
     /// Complete the handshake, then echo every input payload back as output.
     Echo,
+    /// Complete the handshake, echo, then close the WebSocket without a close
+    /// frame once the client has sent something.
+    EchoThenDrop,
+    /// A **resumed** data channel, as the agent presents one.
+    ///
+    /// No handshake — the agent initialises its handshake state in `Initialize`
+    /// and a resume does not go through it — and the sequence counters carry on
+    /// from the previous connection rather than restarting, because both sides
+    /// of the reference reset them only in `Initialize`
+    /// (`agent/datachannel.go:251-252`). It opens with `start_publication`,
+    /// which is how the gateway lets a client send on a fresh channel.
+    ResumeEcho,
     /// Complete the handshake, then close the WebSocket.
     CloseAfterHandshake,
     /// Complete the handshake, stay open briefly, then close the WebSocket.
@@ -97,6 +109,9 @@ pub struct MockGateway {
     /// synchronous and cannot await the async mutex the rest of the gateway
     /// uses. Merged back in by [`MockGateway::observed`].
     upgrade_headers: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// Outbound sequence, shared across connections so a resumed channel can
+    /// continue it the way a real agent does.
+    outbound_sequence: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl MockGateway {
@@ -116,10 +131,12 @@ impl MockGateway {
         let addr = listener.local_addr().expect("local_addr");
         let observed = Arc::new(Mutex::new(Observed::default()));
         let upgrade_headers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outbound_sequence = Arc::new(std::sync::atomic::AtomicI64::new(0));
 
         tokio::spawn({
             let observed = Arc::clone(&observed);
             let captured = Arc::clone(&upgrade_headers);
+            let sequence = Arc::clone(&outbound_sequence);
             async move {
                 for connection in 0.. {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -130,10 +147,11 @@ impl MockGateway {
 
                     let observed = Arc::clone(&observed);
                     let captured = Arc::clone(&captured);
+                    let sequence = Arc::clone(&sequence);
                     // One task per connection so a lingering previous session
                     // cannot hold up the next dial.
                     tokio::spawn(async move {
-                        serve_connection(stream, behaviour, observed, captured).await;
+                        serve_connection(stream, behaviour, observed, captured, sequence).await;
                     });
                 }
             }
@@ -143,6 +161,7 @@ impl MockGateway {
             addr,
             observed,
             upgrade_headers,
+            outbound_sequence,
         }
     }
 
@@ -158,6 +177,7 @@ async fn serve_connection(
     behaviour: Behaviour,
     observed: Arc<Mutex<Observed>>,
     captured: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    sequence: Arc<std::sync::atomic::AtomicI64>,
 ) {
     if behaviour == Behaviour::DropConnection {
         drop(stream);
@@ -191,7 +211,7 @@ async fn serve_connection(
     let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, inspect).await else {
         return;
     };
-    serve(ws, behaviour, observed).await;
+    serve(ws, behaviour, observed, sequence).await;
 }
 
 impl MockGateway {
@@ -325,11 +345,21 @@ async fn serve<S>(
     ws: tokio_tungstenite::WebSocketStream<S>,
     behaviour: Behaviour,
     observed: Arc<Mutex<Observed>>,
+    sequence: Arc<std::sync::atomic::AtomicI64>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (mut sink, mut source) = ws.split();
-    let mut outbound_sequence: i64 = 0;
+    // A resumed channel continues the agent's numbering; any other connection is
+    // a new data channel, whose counters `Initialize` sets to zero.
+    if behaviour != Behaviour::ResumeEcho {
+        sequence.store(0, std::sync::atomic::Ordering::Release);
+    }
+    macro_rules! next_sequence {
+        () => {
+            sequence.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        };
+    }
     // smux reassembly: the client's frames arrive split across stream-data
     // payloads and do not align to frame boundaries.
     let mut smux_buf: Vec<u8> = Vec::new();
@@ -343,7 +373,21 @@ async fn serve<S>(
         _ => return,
     }
 
-    if behaviour != Behaviour::LegacyNoHandshake {
+    if behaviour == Behaviour::ResumeEcho {
+        // No handshake on a resume, and the sequence counter is *not* reset —
+        // both are what the agent does, and both are what the client has to
+        // cope with. `start_publication` carries sequence 0 and a zeroed digest
+        // by protocol, so it does not consume a stream sequence number.
+        let open = ClientMessage::new(
+            MessageType::StartPublication,
+            0,
+            PayloadType::Undefined,
+            Bytes::new(),
+        );
+        if sink.send(Message::Binary(open.serialize())).await.is_err() {
+            return;
+        }
+    } else if behaviour != Behaviour::LegacyNoHandshake {
         let session_type = match behaviour {
             Behaviour::SmuxEcho | Behaviour::SmuxFlood => "Port",
             _ => "Standard_Stream",
@@ -358,7 +402,7 @@ async fn serve<S>(
         .to_string();
         if !send(
             &mut sink,
-            outbound_sequence,
+            next_sequence!(),
             PayloadType::HandshakeRequest,
             Bytes::from(request),
         )
@@ -366,17 +410,15 @@ async fn serve<S>(
         {
             return;
         }
-        outbound_sequence += 1;
     } else {
         // A legacy agent just starts streaming.
         send(
             &mut sink,
-            outbound_sequence,
+            next_sequence!(),
             PayloadType::Output,
             Bytes::from_static(b"legacy-shell$ "),
         )
         .await;
-        outbound_sequence += 1;
     }
 
     while let Some(frame) = source.next().await {
@@ -428,7 +470,7 @@ async fn serve<S>(
                         .to_string();
                         if !send(
                             &mut sink,
-                            outbound_sequence,
+                            next_sequence!(),
                             PayloadType::HandshakeComplete,
                             Bytes::from(complete),
                         )
@@ -436,7 +478,6 @@ async fn serve<S>(
                         {
                             return;
                         }
-                        outbound_sequence += 1;
 
                         match behaviour {
                             Behaviour::GoSilent => {
@@ -464,7 +505,7 @@ async fn serve<S>(
                                 .to_string();
                                 let closed = ClientMessage::new(
                                     MessageType::ChannelClosed,
-                                    outbound_sequence,
+                                    next_sequence!(),
                                     PayloadType::Undefined,
                                     Bytes::from(body),
                                 );
@@ -480,7 +521,7 @@ async fn serve<S>(
                                 .to_string();
                                 if !send(
                                     &mut sink,
-                                    outbound_sequence,
+                                    next_sequence!(),
                                     PayloadType::EncChallengeRequest,
                                     Bytes::from(body),
                                 )
@@ -488,12 +529,12 @@ async fn serve<S>(
                                 {
                                     return;
                                 }
-                                outbound_sequence += 1;
                             }
                             Behaviour::OutOfOrder => {
                                 // Deliver 2, 1, 0 so the client must buffer and
                                 // reassemble before anything reaches the caller.
-                                let base = outbound_sequence;
+                                let base =
+                                    sequence.fetch_add(3, std::sync::atomic::Ordering::AcqRel);
                                 for (offset, text) in
                                     [(2i64, "third "), (1, "second "), (0, "first ")]
                                 {
@@ -505,7 +546,6 @@ async fn serve<S>(
                                     )
                                     .await;
                                 }
-                                outbound_sequence = base + 3;
                             }
                             _ => {}
                         }
@@ -550,7 +590,7 @@ async fn serve<S>(
                             for reply in replies {
                                 if !send(
                                     &mut sink,
-                                    outbound_sequence,
+                                    next_sequence!(),
                                     PayloadType::Output,
                                     Bytes::from(reply),
                                 )
@@ -558,7 +598,6 @@ async fn serve<S>(
                                 {
                                     return;
                                 }
-                                outbound_sequence += 1;
                             }
                         }
                     }
@@ -568,15 +607,26 @@ async fn serve<S>(
                         if behaviour != Behaviour::NeverAcknowledge {
                             acknowledge(&mut sink, &message).await;
                         }
-                        if matches!(behaviour, Behaviour::Echo | Behaviour::LegacyNoHandshake) {
+                        if matches!(
+                            behaviour,
+                            Behaviour::Echo
+                                | Behaviour::LegacyNoHandshake
+                                | Behaviour::ResumeEcho
+                                | Behaviour::EchoThenDrop
+                        ) {
                             send(
                                 &mut sink,
-                                outbound_sequence,
+                                next_sequence!(),
                                 PayloadType::Output,
                                 message.payload.clone(),
                             )
                             .await;
-                            outbound_sequence += 1;
+
+                            // Die once the client has seen one echo, so the
+                            // session has real sequence state to carry over.
+                            if behaviour == Behaviour::EchoThenDrop {
+                                return;
+                            }
                         }
                     }
                 }

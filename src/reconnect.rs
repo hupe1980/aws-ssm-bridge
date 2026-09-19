@@ -25,13 +25,21 @@
 //! # Ok(()) }
 //! ```
 //!
-//! # What reconnection cannot restore
+//! # Resumed, or replaced
 //!
-//! A new session is a new process on the target. Shell state — the working
-//! directory, environment, running foreground job, scrollback — is gone, and
-//! output produced while disconnected was never sent. This type restores
-//! *connectivity*, not continuity; treat every [`ReconnectEvent::Reconnected`]
-//! as a fresh shell.
+//! A dropped connection is **resumed** where it can be: `ssm:ResumeSession`
+//! returns a new stream for the same session, so the remote process survives and
+//! the byte stream carries on — the sequence numbering continues rather than
+//! restarting, which is what makes it a continuation rather than a new channel
+//! wearing the old session's name.
+//!
+//! A session that has *timed out* cannot be resumed. Then a new one is started,
+//! and that is a new process: shell state — the working directory, environment,
+//! running foreground job, scrollback — is gone, along with anything printed
+//! while disconnected.
+//!
+//! [`ReconnectEvent::Resumed`] and [`ReconnectEvent::Reconnected`] distinguish
+//! the two; the session ID is unchanged in the first and new in the second.
 //!
 //! Only failures that a retry could plausibly fix trigger a reconnect:
 //! [`CloseReason::is_recoverable`] decides. A session the agent closed, or one
@@ -89,6 +97,17 @@ pub enum ReconnectEvent {
         attempt: u32,
         /// How long the supervisor will wait first.
         delay: Duration,
+    },
+    /// The **same** session was resumed, so the remote process is still there.
+    ///
+    /// `session_id` is unchanged from before the disconnect — that is what
+    /// distinguishes this from [`Reconnected`](Self::Reconnected), where the id
+    /// is new because the shell is.
+    Resumed {
+        /// ID of the session that carried on, unchanged.
+        session_id: String,
+        /// How many attempts it took.
+        attempts: u32,
     },
     /// A new session is open.
     Reconnected {
@@ -343,7 +362,14 @@ async fn supervise(inner: Arc<Inner>) {
             break;
         }
 
-        match reconnect(&inner).await {
+        // Resuming needs both, and they only exist while the old session does.
+        // Not every recoverable close is worth resuming — see
+        // `CloseReason::is_resumable`.
+        let resume_from = reason
+            .is_resumable()
+            .then(|| (session.id().to_owned(), session.continuity()));
+
+        match reconnect(&inner, resume_from).await {
             Ok(()) => continue,
             Err(e) => {
                 inner.emit(ReconnectEvent::GaveUp {
@@ -361,7 +387,15 @@ async fn supervise(inner: Arc<Inner>) {
 }
 
 /// Retry with exponential backoff and full jitter until a session opens.
-async fn reconnect(inner: &Arc<Inner>) -> Result<()> {
+///
+/// `resume_from` is the dead session's id and stream state. Each attempt tries
+/// `ssm:ResumeSession` with it first, because that keeps the remote process —
+/// and the byte stream — alive. It is cleared as soon as the service says the
+/// session cannot be resumed, after which only a new session is possible.
+async fn reconnect(
+    inner: &Arc<Inner>,
+    mut resume_from: Option<(String, Arc<crate::connection::Continuity>)>,
+) -> Result<()> {
     let mut attempt = 0u32;
     let mut ceiling = inner.config.initial_delay;
 
@@ -387,6 +421,41 @@ async fn reconnect(inner: &Arc<Inner>) -> Result<()> {
                 return Err(Error::SessionClosed("shutdown requested while reconnecting".into()));
             }
             _ = tokio::time::sleep(delay) => {}
+        }
+
+        // A resume keeps the shell; only fall back to a new one once the
+        // service has said this session is gone.
+        if let Some((session_id, continuity)) = resume_from.clone() {
+            match inner
+                .manager
+                .resume_session(&session_id, inner.config.session.clone(), continuity)
+                .await
+            {
+                Ok(Some(session)) => {
+                    let session = Arc::new(session);
+                    inner.adopt(session).await;
+                    info!(%session_id, attempt, "resumed");
+                    inner.emit(ReconnectEvent::Resumed {
+                        session_id,
+                        attempts: attempt,
+                    });
+                    return Ok(());
+                }
+                Ok(None) => {
+                    // Timed out rather than disconnected: the remote process is
+                    // gone, so a fresh session is the only thing left.
+                    resume_from = None;
+                }
+                Err(e) if !e.is_retriable() => {
+                    warn!(error = %e, "resume failed permanently; starting a new session");
+                    resume_from = None;
+                }
+                Err(e) => {
+                    warn!(attempt, error = %e, "resume attempt failed");
+                    ceiling = (ceiling * 2).min(inner.config.max_delay);
+                    continue;
+                }
+            }
         }
 
         match inner

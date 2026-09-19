@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version stays below `1.0.0`, a minor bump may contain breaking changes.
 
-## [0.6.0] — unreleased
+## [0.6.0] — 2026-09-19
 
 ### Added
 
@@ -20,6 +20,18 @@ While the version stays below `1.0.0`, a minor bump may contain breaking changes
   itself, and the second may have no credentials to sign with. Signing needs both
   a credentials provider and a region; without either the upgrade goes unsigned
   and a warning is logged.
+
+- **Reconnection now resumes the session instead of replacing it.** A recoverable
+  disconnect calls `ssm:ResumeSession` first, which returns a new stream for the
+  *same* session, so the remote process and the shell survive the gap; the
+  sequence counters, unacknowledged backlog, reorder buffer and any negotiated
+  cipher are carried into the rebuilt channel, because a resumed channel
+  continues the agent's numbering rather than restarting it. A session that has
+  timed out is replaced as before, and so is one closed by `DeliveryFailed`,
+  where a resume would only re-send the backlog the agent just refused
+  (`CloseReason::is_resumable`). The new `ReconnectEvent::Resumed` carries the
+  session ID unchanged where `Reconnected` carries a new one; the enum is
+  `#[non_exhaustive]`, so matching already required a catch-all arm.
 
 ### Changed
 
@@ -232,4 +244,5 @@ Released before this changelog was kept. See the
 [commit history](https://github.com/hupe1980/aws-ssm-bridge/commits/main) and the
 [release tags](https://github.com/hupe1980/aws-ssm-bridge/releases).
 
+[0.6.0]: https://github.com/hupe1980/aws-ssm-bridge/releases/tag/v0.6.0
 [0.5.0]: https://github.com/hupe1980/aws-ssm-bridge/releases/tag/v0.5.0

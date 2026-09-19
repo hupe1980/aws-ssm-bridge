@@ -24,7 +24,7 @@ use zeroize::Zeroizing;
 
 use crate::binary_protocol::{PayloadType, DEFAULT_PAYLOAD_CHUNK_SIZE};
 use crate::channels::{OutputFanout, OutputStream, DEFAULT_SUBSCRIBER_CAPACITY};
-use crate::connection::{self, Command, ConnectionParams, EndpointPolicy};
+use crate::connection::{self, Command, ConnectionParams, Continuity, EndpointPolicy};
 use crate::crypto::SessionCrypto;
 use crate::documents::{SessionType, SsmDocument};
 use crate::errors::{Error, Result};
@@ -118,6 +118,22 @@ impl CloseReason {
                 | CloseReason::Transport(_)
         )
     }
+
+    /// Whether a reconnect should **resume** this session rather than replace
+    /// it.
+    ///
+    /// Narrower than [`is_recoverable`](Self::is_recoverable), and the gap is
+    /// [`DeliveryFailed`](Self::DeliveryFailed): resuming carries the
+    /// unacknowledged backlog back to the agent that just spent its entire
+    /// retransmission budget not acknowledging it. The reference plugin
+    /// terminates the session outright in that case; replacing it keeps a
+    /// recovery path without re-presenting what was already refused.
+    pub fn is_resumable(&self) -> bool {
+        matches!(
+            self,
+            CloseReason::PeerUnresponsive { .. } | CloseReason::Transport(_)
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,14 +157,16 @@ pub(crate) struct SessionCore {
     /// Woken whenever an acknowledgement frees space in the outgoing buffer.
     ack_notify: Notify,
 
-    crypto: OnceLock<Arc<SessionCrypto>>,
+    /// Sequence, buffer and cipher state that outlives this channel. Held here
+    /// so `crypto()` reaches it from every call site unchanged.
+    continuity: Arc<Continuity>,
     agent_version: OnceLock<String>,
     banner: Mutex<Option<String>>,
     exit_code: Mutex<Option<i32>>,
 }
 
 impl SessionCore {
-    fn new(session_id: String, subscriber_capacity: usize) -> Self {
+    fn new(session_id: String, subscriber_capacity: usize, continuity: Arc<Continuity>) -> Self {
         Self {
             session_id,
             fanout: OutputFanout::new(),
@@ -159,7 +177,7 @@ impl SessionCore {
             closed_notify: Notify::new(),
             close_reason: Mutex::new(None),
             ack_notify: Notify::new(),
-            crypto: OnceLock::new(),
+            continuity,
             agent_version: OnceLock::new(),
             banner: Mutex::new(None),
             exit_code: Mutex::new(None),
@@ -268,11 +286,11 @@ impl SessionCore {
     }
 
     pub(crate) fn crypto(&self) -> Option<Arc<SessionCrypto>> {
-        self.crypto.get().cloned()
+        self.continuity.crypto()
     }
 
     pub(crate) fn set_crypto(&self, crypto: Arc<SessionCrypto>) {
-        let _ = self.crypto.set(crypto);
+        self.continuity.set_crypto(crypto);
     }
 
     pub(crate) fn set_agent_version(&self, version: Option<&str>) {
@@ -476,6 +494,24 @@ impl DocumentSpec {
 // Session
 // ---------------------------------------------------------------------------
 
+/// Everything [`Session::open`] needs.
+///
+/// A struct rather than eight positional arguments: three of them are
+/// `Option`s of similar-looking types, and a call site that mixed two up would
+/// still compile.
+pub(crate) struct Opening {
+    pub session_id: String,
+    pub config: SessionConfig,
+    pub stream_url: String,
+    pub token: Zeroizing<String>,
+    pub ssm: Option<Arc<aws_sdk_ssm::Client>>,
+    pub signer: Option<UpgradeSigner>,
+    /// Stream state to inherit; [`Continuity::fresh`] for a new session.
+    pub continuity: Arc<Continuity>,
+    #[cfg(feature = "kms")]
+    pub kms: Option<aws_sdk_kms::Client>,
+}
+
 /// An open SSM session.
 ///
 /// Cheap to share: wrap it in an [`Arc`] and hand it to as many tasks as you
@@ -492,20 +528,28 @@ pub struct Session {
     commands: mpsc::Sender<Command>,
     config: SessionConfig,
     ssm: Option<Arc<aws_sdk_ssm::Client>>,
+    continuity: Arc<Continuity>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Session {
-    pub(crate) async fn open(
-        session_id: String,
-        config: SessionConfig,
-        stream_url: String,
-        token: Zeroizing<String>,
-        ssm: Option<Arc<aws_sdk_ssm::Client>>,
-        signer: Option<UpgradeSigner>,
-        #[cfg(feature = "kms")] kms: Option<aws_sdk_kms::Client>,
-    ) -> Result<Self> {
-        let core = Arc::new(SessionCore::new(session_id.clone(), config.output_buffer));
+    pub(crate) async fn open(opening: Opening) -> Result<Self> {
+        let Opening {
+            session_id,
+            config,
+            stream_url,
+            token,
+            ssm,
+            signer,
+            continuity,
+            #[cfg(feature = "kms")]
+            kms,
+        } = opening;
+        let core = Arc::new(SessionCore::new(
+            session_id.clone(),
+            config.output_buffer,
+            Arc::clone(&continuity),
+        ));
 
         let (commands, tasks) = connection::connect(
             Arc::clone(&core),
@@ -517,6 +561,7 @@ impl Session {
                 chunk_size: config.payload_chunk_size,
                 endpoint_policy: config.endpoint_policy,
                 signer,
+                continuity: Arc::clone(&continuity),
                 heartbeat_interval: config.heartbeat_interval,
                 idle_timeout: config.idle_timeout,
                 #[cfg(feature = "kms")]
@@ -531,6 +576,7 @@ impl Session {
             commands,
             config,
             ssm,
+            continuity,
             tasks: Mutex::new(tasks),
         })
     }
@@ -568,16 +614,17 @@ impl Session {
         config: SessionConfig,
     ) -> Result<Self> {
         config.validate()?;
-        Self::open(
-            session_id.into(),
+        Self::open(Opening {
+            session_id: session_id.into(),
             config,
-            stream_url.into(),
-            Zeroizing::new(token.into()),
-            None,
-            None,
+            stream_url: stream_url.into(),
+            token: Zeroizing::new(token.into()),
+            ssm: None,
+            signer: None,
+            continuity: Continuity::fresh(),
             #[cfg(feature = "kms")]
-            None,
-        )
+            kms: None,
+        })
         .await
     }
 
@@ -589,6 +636,11 @@ impl Session {
     /// The configuration this session was started with.
     pub fn config(&self) -> &SessionConfig {
         &self.config
+    }
+
+    /// The stream state a resumed channel must inherit from this one.
+    pub(crate) fn continuity(&self) -> Arc<Continuity> {
+        Arc::clone(&self.continuity)
     }
 
     /// Version of the SSM agent on the target, once the handshake has run.
@@ -931,16 +983,17 @@ impl SessionManager {
 
         info!(session_id = %session_id, "SSM session created");
 
-        match Session::open(
-            session_id.clone(),
+        match Session::open(Opening {
+            session_id: session_id.clone(),
             config,
             stream_url,
             token,
-            Some(Arc::clone(&self.ssm)),
-            self.signer.clone(),
+            ssm: Some(Arc::clone(&self.ssm)),
+            signer: self.signer.clone(),
+            continuity: Continuity::fresh(),
             #[cfg(feature = "kms")]
-            self.kms.clone(),
-        )
+            kms: self.kms.clone(),
+        })
         .await
         {
             Ok(session) => Ok(session),
@@ -959,6 +1012,61 @@ impl SessionManager {
                 Err(e)
             }
         }
+    }
+
+    /// Resume a **disconnected** session, keeping the remote process alive.
+    ///
+    /// `ssm:ResumeSession` returns a fresh stream URL and token for the same
+    /// `SessionId`, and the agent carries on counting where it left off — so
+    /// `continuity` must be the state of the channel being replaced, not a new
+    /// one. Handing it fresh state would restart both sequence counters at zero
+    /// and silently break the session in both directions.
+    ///
+    /// Returns `Ok(None)` when the service answers with no token: that means the
+    /// session has **timed out** rather than merely disconnected, and it cannot
+    /// be resumed. The reference plugin prints "Session … timed out." and exits;
+    /// a library has somewhere better to go, so the caller starts a new session
+    /// instead.
+    pub(crate) async fn resume_session(
+        &self,
+        session_id: &str,
+        config: SessionConfig,
+        continuity: Arc<Continuity>,
+    ) -> Result<Option<Session>> {
+        config.validate()?;
+        info!(%session_id, "resuming SSM session");
+
+        let response = self
+            .ssm
+            .resume_session()
+            .session_id(session_id)
+            .send()
+            .await
+            .map_err(Error::from)?;
+
+        let (Some(stream_url), Some(token)) = (response.stream_url(), response.token_value())
+        else {
+            info!(%session_id, "the session cannot be resumed; it has timed out");
+            return Ok(None);
+        };
+        if token.is_empty() {
+            info!(%session_id, "the session cannot be resumed; it has timed out");
+            return Ok(None);
+        }
+
+        Session::open(Opening {
+            session_id: session_id.to_owned(),
+            config,
+            stream_url: stream_url.to_owned(),
+            token: Zeroizing::new(token.to_owned()),
+            ssm: Some(Arc::clone(&self.ssm)),
+            signer: self.signer.clone(),
+            continuity,
+            #[cfg(feature = "kms")]
+            kms: self.kms.clone(),
+        })
+        .await
+        .map(Some)
     }
 
     /// Terminate a session by ID without holding a [`Session`] handle.
@@ -1093,7 +1201,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_records_the_first_reason_only() {
-        let core = SessionCore::new("s-1".into(), 8);
+        let core = SessionCore::new("s-1".into(), 8, Continuity::fresh());
         core.close(CloseReason::Transport("socket reset".into()));
         core.close(CloseReason::Terminated);
         assert_eq!(
@@ -1105,7 +1213,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_resolves_for_waiters_registered_before_and_after() {
-        let core = Arc::new(SessionCore::new("s-1".into(), 8));
+        let core = Arc::new(SessionCore::new("s-1".into(), 8, Continuity::fresh()));
 
         let waiter = tokio::spawn({
             let core = Arc::clone(&core);
@@ -1129,7 +1237,7 @@ mod tests {
     /// otherwise a caller hangs forever on a channel that will never open.
     #[tokio::test]
     async fn closing_releases_tasks_waiting_to_send() {
-        let core = Arc::new(SessionCore::new("s-1".into(), 8));
+        let core = Arc::new(SessionCore::new("s-1".into(), 8, Continuity::fresh()));
         let waiter = tokio::spawn({
             let core = Arc::clone(&core);
             async move { core.wait_sendable().await }
@@ -1147,13 +1255,58 @@ mod tests {
     async fn output_stops_when_the_session_closes() {
         use futures_util::StreamExt;
 
-        let core = SessionCore::new("s-1".into(), 8);
+        let core = SessionCore::new("s-1".into(), 8, Continuity::fresh());
         let mut output = core.subscribe();
         core.emit_output(Bytes::from_static(b"hello"));
         core.close(CloseReason::Terminated);
 
         assert_eq!(output.next().await.unwrap(), Bytes::from_static(b"hello"));
         assert!(output.next().await.is_none());
+    }
+
+    /// Resuming is narrower than recovering, and the gap is `DeliveryFailed`.
+    ///
+    /// A resume carries the unacknowledged backlog back to the same agent — the
+    /// one that just spent its whole retransmission budget not acknowledging
+    /// it. The reference plugin terminates outright there; replacing keeps a
+    /// recovery path without re-presenting what was already refused.
+    #[test]
+    fn delivery_failure_is_recoverable_but_not_resumable() {
+        let failed = CloseReason::DeliveryFailed {
+            sequence: 7,
+            attempts: 3000,
+        };
+        assert!(failed.is_recoverable(), "a replacement can still help");
+        assert!(
+            !failed.is_resumable(),
+            "resuming would re-send exactly what the agent refused"
+        );
+    }
+
+    #[test]
+    fn a_dead_or_broken_channel_is_resumable() {
+        assert!(CloseReason::Transport("reset".into()).is_resumable());
+        assert!(CloseReason::PeerUnresponsive {
+            idle: Duration::from_secs(120)
+        }
+        .is_resumable());
+    }
+
+    /// Nothing the agent or the protocol decided is resumed: a resume would
+    /// reopen a session the other end has already finished with.
+    #[test]
+    fn a_deliberate_or_protocol_close_is_neither() {
+        for reason in [
+            CloseReason::Terminated,
+            CloseReason::AgentClosed {
+                exit_code: Some(0),
+                detail: None,
+            },
+            CloseReason::Protocol("bad digest".into()),
+        ] {
+            assert!(!reason.is_recoverable(), "{reason}");
+            assert!(!reason.is_resumable(), "{reason}");
+        }
     }
 
     #[test]
@@ -1190,7 +1343,7 @@ mod tests {
 
     #[tokio::test]
     async fn pause_publication_stops_sending_until_resumed() {
-        let core = Arc::new(SessionCore::new("s-1".into(), 8));
+        let core = Arc::new(SessionCore::new("s-1".into(), 8, Continuity::fresh()));
         core.set_sendable(true);
         assert!(core.is_sendable());
 

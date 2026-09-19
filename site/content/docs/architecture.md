@@ -179,17 +179,26 @@ then reading the reply. Collapsing both directions at once truncates that reply.
         ├── output fan-out ──────────────► your stream (survives reconnects)
         │        ▲
         │        │ pump
-        │   ┌────┴─────┐   closed()   ┌──────────┐
-        └──►│ Session  │─────────────►│supervisor│──► new Session
+        │   ┌────┴─────┐   closed()   ┌──────────┐    resume, else
+        └──►│ Session  │─────────────►│supervisor│──► a new Session
             └──────────┘              └──────────┘
 ```
 
 The supervisor waits on `closed()`, checks `CloseReason::is_recoverable()`, and
-rebuilds with full-jitter exponential backoff. Your `OutputStream` is attached to
+retries with full-jitter exponential backoff. Your `OutputStream` is attached to
 the wrapper's fan-out, not to any individual session, so it spans the gap.
 
-Only recoverable failures trigger a rebuild. Reconnecting after a clean
-`AgentClosed` would resurrect a session an operator deliberately ended.
+It tries `ssm:ResumeSession` first, which keeps the same session and the same
+remote process. The sequence counters, the unacknowledged backlog, the reorder
+buffer and any negotiated cipher travel into the rebuilt channel — a resumed
+channel continues the agent's numbering rather than restarting it. A session that
+has timed out cannot be resumed, and is replaced instead.
+
+Not every recoverable close is worth resuming: `CloseReason::is_resumable()`
+excludes `DeliveryFailed`, where the agent has already spent its retransmission
+budget refusing the very backlog a resume would re-send. And nothing is retried
+after a clean `AgentClosed` — that would resurrect a session an operator
+deliberately ended.
 
 
 ## Concurrency choices

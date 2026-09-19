@@ -15,6 +15,7 @@
 # Environment:
 #   SSM_TARGET      instance to connect to            (required)
 #   SSM_SMOKE_PORT  port to forward for the tunnel check  (default 22)
+#   SSM_SMOKE_BYTES bytes for the bulk-transfer check (default 200000)
 #   FEATURES        cargo features                    (default interactive,kms)
 
 set -euo pipefail
@@ -22,8 +23,10 @@ set -euo pipefail
 TARGET="${SSM_TARGET:-}"
 PORT="${SSM_SMOKE_PORT:-22}"
 FEATURES="${FEATURES:-interactive,kms}"
+BULK="${SSM_SMOKE_BYTES:-200000}"
 SENTINEL="live-smoke-$$-$(date +%s)"
 LOCAL_ADDR="127.0.0.1:18022"
+REMOTE_HOST_ADDR="127.0.0.1:18023"
 WORK="$(mktemp -d)"
 FORWARDER=""
 
@@ -136,7 +139,60 @@ grep -q "releasing the local port" "$WORK/fwd.log" || fail "the port was not rel
 pass "clean shutdown"
 
 # ---------------------------------------------------------------------------
-# 3. Nothing left running on the AWS side
+# 3. Bulk transfer: chunking, sequencing, acknowledgement and reassembly
+# ---------------------------------------------------------------------------
+step "Bulk transfer of $BULK bytes"
+# `Q` appears once in the command, which the remote pty echoes back, so the
+# count is allowed slack above the payload but never below it: a dropped chunk
+# lands well under, a duplicated one well over.
+./target/debug/examples/shell "$TARGET" "head -c $BULK /dev/zero | tr '\\0' Q" \
+  >"$WORK/bulk.log" 2>&1 || fail "the bulk transfer exited non-zero"
+
+RECEIVED="$(tr -dc 'Q' <"$WORK/bulk.log" | wc -c | tr -d ' ')"
+[[ "$RECEIVED" -ge "$BULK" ]] \
+  || fail "received $RECEIVED of $BULK bytes — the stream lost data"
+[[ "$RECEIVED" -le $((BULK + 32)) ]] \
+  || fail "received $RECEIVED for a $BULK-byte payload — the stream duplicated data"
+pass "$RECEIVED bytes intact across ~$((BULK / 1024)) protocol messages"
+
+# ---------------------------------------------------------------------------
+# 4. The other forwarding document: through the instance to a third host
+# ---------------------------------------------------------------------------
+step "Remote-host forwarding $REMOTE_HOST_ADDR -> localhost:$PORT via the instance"
+./target/debug/examples/port_forward "$TARGET" "$PORT" "$REMOTE_HOST_ADDR" localhost \
+  >"$WORK/remote.log" 2>&1 &
+FORWARDER=$!
+
+for _ in $(seq 1 60); do
+  grep -q "forwarding connections" "$WORK/remote.log" 2>/dev/null && break
+  kill -0 "$FORWARDER" 2>/dev/null \
+    || fail "the remote-host forwarder exited early: $(tail -3 "$WORK/remote.log")"
+  sleep 1
+done
+grep -q "forwarding connections" "$WORK/remote.log" \
+  || fail "the remote-host forwarder never became ready"
+
+python3 "$(dirname "$0")/probe_banner.py" "$REMOTE_HOST_ADDR" \
+  || fail "AWS-StartPortForwardingSessionToRemoteHost carried no bytes"
+pass "the remote-host document forwards too"
+
+kill -INT "$FORWARDER"
+for _ in $(seq 1 20); do kill -0 "$FORWARDER" 2>/dev/null || break; sleep 1; done
+FORWARDER=""
+
+# ---------------------------------------------------------------------------
+# 5. Several sessions at once
+# ---------------------------------------------------------------------------
+step "Three concurrent sessions"
+./target/debug/examples/fleet "echo fleet-$SENTINEL" "$TARGET" "$TARGET" "$TARGET" \
+  >"$WORK/fleet.log" 2>&1 || fail "the fleet example exited non-zero"
+BLOCKS="$(grep -c "^=== $TARGET ===" "$WORK/fleet.log" || true)"
+[[ "$BLOCKS" -eq 3 ]] || fail "expected 3 concurrent sessions, saw $BLOCKS"
+grep -q "fleet-$SENTINEL" "$WORK/fleet.log" || fail "no output came back from the fleet"
+pass "three sessions ran concurrently"
+
+# ---------------------------------------------------------------------------
+# 6. Nothing left running on the AWS side
 # ---------------------------------------------------------------------------
 if command -v aws >/dev/null; then
   step "Checking for orphaned sessions"

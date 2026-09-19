@@ -33,7 +33,7 @@ use futures_util::{
     SinkExt, StreamExt,
 };
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -222,6 +222,78 @@ pub(crate) enum Command {
     },
 }
 
+/// The stream state that survives a channel being rebuilt.
+///
+/// `ssm:ResumeSession` hands back a new URL and token for the **same** session,
+/// and the agent keeps counting where it left off — both sides of the reference
+/// reset their counters in `Initialize` and never in `Reconnect`. A resumed
+/// channel that restarted at zero would have its input discarded as
+/// already-seen and its output parked in a reorder buffer forever, in silence.
+///
+/// So everything that is per-*session* rather than per-*connection* lives here
+/// and is handed to the next channel.
+pub(crate) struct Continuity {
+    /// Sequence counter for everything this client sends — one stream, one
+    /// counter — behind the mutex that serialises the whole outbound path.
+    ///
+    /// Two tasks reach `send_payload` concurrently: the reader answering a
+    /// handshake or an encryption challenge, and the command task streaming
+    /// caller data. Allocating the number, recording the message for
+    /// retransmission and handing it to the writer must happen as one critical
+    /// section. Interleaved, two messages would be stamped with the same
+    /// sequence number and the counter would skip one, leaving a gap the agent
+    /// waits on forever — the session hangs with no error anywhere.
+    pub sequence: tokio::sync::Mutex<i64>,
+    /// Sent but unacknowledged. Carried over rather than cleared, so a resume
+    /// retransmits what the old channel never delivered.
+    pub outgoing: OutgoingBuffer,
+    /// Next `output_stream_data` sequence expected from the agent.
+    pub expected: std::sync::atomic::AtomicI64,
+    /// Out-of-order inbound messages.
+    pub incoming: IncomingBuffer,
+    /// The negotiated session cipher, if any.
+    ///
+    /// A resume does **not** re-run the handshake, so there is nothing to
+    /// re-negotiate this with. Losing it would make `decrypt_if_needed` fall
+    /// through and hand the caller ciphertext as if it were plaintext.
+    pub crypto: OnceLock<Arc<crate::crypto::SessionCrypto>>,
+}
+
+impl Continuity {
+    /// State for a brand-new session.
+    ///
+    /// A resumed session does not build a new one — it keeps the `Arc`, which
+    /// is what makes the counters, the unacknowledged backlog, the reorder
+    /// buffer and the cipher continuous across the rebuilt channel.
+    pub(crate) fn fresh() -> Arc<Self> {
+        Arc::new(Self {
+            sequence: tokio::sync::Mutex::new(0),
+            outgoing: OutgoingBuffer::new(MESSAGE_BUFFER_CAPACITY, MAX_RETRANSMIT_ATTEMPTS),
+            expected: std::sync::atomic::AtomicI64::new(0),
+            incoming: IncomingBuffer::new(MESSAGE_BUFFER_CAPACITY),
+            crypto: OnceLock::new(),
+        })
+    }
+
+    pub(crate) fn crypto(&self) -> Option<Arc<crate::crypto::SessionCrypto>> {
+        self.crypto.get().cloned()
+    }
+
+    pub(crate) fn set_crypto(&self, crypto: Arc<crate::crypto::SessionCrypto>) {
+        let _ = self.crypto.set(crypto);
+    }
+}
+
+impl std::fmt::Debug for Continuity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Continuity")
+            .field("expected", &self.expected)
+            .field("unacknowledged", &self.outgoing.len())
+            .field("encrypted", &self.crypto.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Everything the data channel needs to establish itself.
 pub(crate) struct ConnectionParams {
     pub session_id: String,
@@ -238,6 +310,8 @@ pub(crate) struct ConnectionParams {
     ///
     /// [`Session::attach`]: crate::Session::attach
     pub signer: Option<UpgradeSigner>,
+    /// Stream state inherited from the channel this one replaces, or fresh.
+    pub continuity: Arc<Continuity>,
     pub heartbeat_interval: Duration,
     pub idle_timeout: Duration,
     #[cfg(feature = "kms")]
@@ -289,8 +363,7 @@ pub(crate) async fn connect(
     let shared = Arc::new(ChannelState {
         core: Arc::clone(&core),
         writer_tx: writer_tx.clone(),
-        outgoing: OutgoingBuffer::new(MESSAGE_BUFFER_CAPACITY, MAX_RETRANSMIT_ATTEMPTS),
-        sequence: tokio::sync::Mutex::new(0),
+        stream: Arc::clone(&params.continuity),
         last_inbound: Mutexed::new(Instant::now()),
         chunk_size: params.chunk_size.clamp(1, MAX_PAYLOAD_SIZE),
     });
@@ -390,18 +463,9 @@ impl<T> Mutexed<T> {
 struct ChannelState {
     core: Arc<SessionCore>,
     writer_tx: mpsc::Sender<Message>,
-    outgoing: OutgoingBuffer,
-    /// Sequence counter for everything this client sends — one stream, one
-    /// counter — behind the mutex that serialises the whole outbound path.
-    ///
-    /// Two tasks reach [`send_payload`] concurrently: the reader answering a
-    /// handshake or an encryption challenge, and the command task streaming
-    /// caller data. Allocating the number, recording the message for
-    /// retransmission and handing it to the writer must therefore happen as one
-    /// critical section. Interleaved, two messages would be stamped with the
-    /// same sequence number and the counter would skip one, leaving a gap the
-    /// agent waits on forever — the session hangs with no error anywhere.
-    sequence: tokio::sync::Mutex<i64>,
+    /// Sequence and buffer state shared with whatever channel replaces this
+    /// one; see [`Continuity`].
+    stream: Arc<Continuity>,
     /// When the last frame of any kind arrived; drives dead-peer detection.
     last_inbound: Mutexed<Instant>,
     chunk_size: usize,
@@ -519,7 +583,7 @@ async fn retransmit_task(state: Arc<ChannelState>) {
         tokio::select! {
             biased;
             () = state.core.closed() => break,
-            _ = ticker.tick() => match state.outgoing.poll_retransmit() {
+            _ = ticker.tick() => match state.stream.outgoing.poll_retransmit() {
                 RetransmitAction::Idle => {}
                 RetransmitAction::Resend { sequence, wire } => {
                     metrics::counter(names::RETRANSMISSIONS, 1);
@@ -628,8 +692,8 @@ async fn send_payload(
     };
 
     // One sender at a time, for the whole allocate/track/write sequence. See
-    // `ChannelState::sequence` for why splitting this up corrupts the stream.
-    let mut sequence = state.sequence.lock().await;
+    // `Continuity::sequence` for why splitting this up corrupts the stream.
+    let mut sequence = state.stream.sequence.lock().await;
 
     // Built once: nothing about the message changes while we wait for room, and
     // re-serializing would re-hash the payload on every retry — precisely when
@@ -651,7 +715,7 @@ async fn send_payload(
         // this task parked until some later one happens to arrive.
         let acked = state.core.ack_notified();
 
-        if state.outgoing.track(wire.clone(), *sequence) {
+        if state.stream.outgoing.track(wire.clone(), *sequence) {
             *sequence += 1;
             break;
         }
@@ -684,18 +748,33 @@ async fn send_payload(
 /// Per-reader state that evolves as the session progresses.
 struct ReaderState {
     handshake: HandshakeHandler,
-    /// Next `output_stream_data` sequence number we expect from the agent.
-    expected_sequence: i64,
-    incoming: IncomingBuffer,
+    /// Sequence and reorder state, shared with whatever channel replaces this
+    /// one. Only the reader task touches `expected`, but it has to survive the
+    /// task — see [`Continuity`].
+    stream: Arc<Continuity>,
     handshake_started: Option<Instant>,
+}
+
+impl ReaderState {
+    fn expected(&self) -> i64 {
+        self.stream
+            .expected
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn advance_expected(&self) -> i64 {
+        self.stream
+            .expected
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1
+    }
 }
 
 /// Owns the WebSocket stream, decodes messages and routes them.
 async fn reader_task(mut source: WsSource, state: Arc<ChannelState>, handshake: HandshakeHandler) {
     let mut reader = ReaderState {
         handshake,
-        expected_sequence: 0,
-        incoming: IncomingBuffer::new(MESSAGE_BUFFER_CAPACITY),
+        stream: Arc::clone(&state.stream),
         handshake_started: None,
     };
 
@@ -789,9 +868,9 @@ async fn route(
         MessageType::Acknowledge => {
             let content = ack::parse_ack(&message)?;
             metrics::counter(names::ACKS_RECEIVED, 1);
-            if state.outgoing.acknowledge(content.sequence_number) {
+            if state.stream.outgoing.acknowledge(content.sequence_number) {
                 state.core.notify_ack();
-                let rtt = state.outgoing.rtt();
+                let rtt = state.stream.outgoing.rtt();
                 metrics::histogram(names::RTT_SECONDS, rtt.smoothed.as_secs_f64());
             }
             Ok(())
@@ -838,23 +917,23 @@ async fn route_stream_data(
 ) -> Result<()> {
     use std::cmp::Ordering as Ord;
 
-    match message.sequence_number.cmp(&reader.expected_sequence) {
+    match message.sequence_number.cmp(&reader.expected()) {
         Ord::Less => {
             trace!(
                 sequence = message.sequence_number,
-                expected = reader.expected_sequence,
+                expected = reader.expected(),
                 "dropping an already-processed message without acknowledging"
             );
             Ok(())
         }
         Ord::Greater => {
             let sequence = message.sequence_number;
-            if reader.incoming.insert(message.clone()) {
+            if reader.stream.incoming.insert(message.clone()) {
                 acknowledge(state, &message, false);
                 trace!(
                     sequence,
-                    expected = reader.expected_sequence,
-                    buffered = reader.incoming.len(),
+                    expected = reader.expected(),
+                    buffered = reader.stream.incoming.len(),
                     "buffered an out-of-order message"
                 );
             } else {
@@ -870,12 +949,12 @@ async fn route_stream_data(
         Ord::Equal => {
             acknowledge(state, &message, true);
             deliver(state, reader, message).await?;
-            reader.expected_sequence += 1;
+            let mut next = reader.advance_expected();
 
             // Drain whatever the gap was holding back.
-            while let Some(buffered) = reader.incoming.take(reader.expected_sequence) {
+            while let Some(buffered) = reader.stream.incoming.take(next) {
                 deliver(state, reader, buffered).await?;
-                reader.expected_sequence += 1;
+                next = reader.advance_expected();
             }
             Ok(())
         }

@@ -213,10 +213,19 @@ let mut output = session.output();   // this stream outlives each session
 session.send(&b"tail -f /var/log/syslog\r"[..]).await?;
 ```
 
-Reconnection restores connectivity, **not continuity**. A new session is a new
-process on the target: the working directory, environment, running jobs and
-anything printed while disconnected are gone. Treat every
-`ReconnectEvent::Reconnected` as a fresh shell.
+A dropped connection is **resumed** where possible. `ssm:ResumeSession` hands
+back a new stream for the same session, so the remote process, the working
+directory and the running job all survive — and the byte stream picks up where it
+stopped, because the sequence numbering continues rather than restarting.
+
+That is not always possible. A session that has *timed out* cannot be resumed, so
+a new one is started: a new process, and the shell state is gone. The event says
+which happened.
+
+| Event | Meaning |
+|:---|:---|
+| `Resumed { session_id }` | The same session, same shell. The id is unchanged |
+| `Reconnected { session_id }` | A replacement. The id is new, and so is the shell |
 
 
 ## Many instances at once

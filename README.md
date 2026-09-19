@@ -179,9 +179,12 @@ stops accepting when the tunnel dies, the pool reaps dead entries, and
 `ReconnectingSession` knows when to rebuild. There is no state in which the
 handle looks alive but nothing is running.
 
-Reconnection restores *connectivity*, not continuity — a new session is a new
-process on the target, so shell state and anything printed while disconnected
-are gone.
+Reconnection **resumes** the session where it can: `ssm:ResumeSession` keeps the
+same session and the same remote process, so the shell survives the gap. When the
+session has timed out rather than merely disconnected, it cannot be resumed and a
+new one is started instead — a new process, so shell state and anything printed
+while disconnected are gone. `ReconnectEvent` tells the two apart: `Resumed`
+carries the same session ID, `Reconnected` a new one.
 
 ---
 

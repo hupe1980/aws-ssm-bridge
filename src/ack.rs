@@ -319,7 +319,12 @@ impl OutgoingBuffer {
         self.lock().rtt
     }
 
-    /// Drop all pending messages, e.g. when the channel is being re-established.
+    /// Drop every pending message.
+    ///
+    /// **Not** for re-establishing a channel. A resumed session carries its
+    /// unacknowledged backlog across, because the agent is still expecting
+    /// those sequence numbers; clearing here would strand it waiting for
+    /// messages that will never be sent again.
     pub fn clear(&self) {
         self.lock().pending.clear();
     }

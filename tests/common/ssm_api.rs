@@ -29,6 +29,8 @@ pub struct ApiCalls {
     pub started: Vec<String>,
     /// Session ids passed to `TerminateSession`.
     pub terminated: Vec<String>,
+    /// Session ids passed to `ResumeSession`.
+    pub resumed: Vec<String>,
 }
 
 /// A running fake SSM endpoint.
@@ -37,10 +39,25 @@ pub struct MockSsmApi {
     calls: Arc<Mutex<ApiCalls>>,
 }
 
+/// How the fake API answers `ResumeSession`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resumable {
+    /// Hand back a fresh token for the same session.
+    Yes,
+    /// Answer with no token, which is how the service says a session has timed
+    /// out rather than merely disconnected.
+    TimedOut,
+}
+
 impl MockSsmApi {
     /// Serve `StartSession` and `TerminateSession`, handing out data channels
     /// on `gateway_url`.
     pub async fn start(gateway_url: String) -> Self {
+        Self::with_resume(gateway_url, Resumable::Yes).await
+    }
+
+    /// Serve, deciding in advance how `ResumeSession` will answer.
+    pub async fn with_resume(gateway_url: String, resumable: Resumable) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let calls = Arc::new(Mutex::new(ApiCalls::default()));
@@ -54,11 +71,12 @@ impl MockSsmApi {
                     };
                     let calls = Arc::clone(&calls);
                     let gateway_url = gateway_url.clone();
+                    let resumable = resumable;
                     // One task per connection: the SDK opens a fresh one for
                     // each request, and a serial loop would deadlock the moment
                     // it decided not to.
                     tokio::spawn(async move {
-                        let _ = handle(stream, gateway_url, calls).await;
+                        let _ = handle(stream, gateway_url, calls, resumable).await;
                     });
                 }
             }
@@ -86,6 +104,7 @@ async fn handle(
     mut stream: tokio::net::TcpStream,
     gateway_url: String,
     calls: Arc<Mutex<ApiCalls>>,
+    resumable: Resumable,
 ) -> std::io::Result<()> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 4096];
@@ -128,11 +147,21 @@ async fn handle(
             "StreamUrl": gateway_url,
             "TokenValue": "mock-token",
         })
+    } else if head.contains("amazonssm.resumesession") {
+        let session_id = session_id_from(&body);
+        calls.lock().await.resumed.push(session_id.clone());
+        match resumable {
+            // A fresh token for the *same* session: the remote process lives on.
+            Resumable::Yes => serde_json::json!({
+                "SessionId": session_id,
+                "StreamUrl": gateway_url,
+                "TokenValue": "mock-resume-token",
+            }),
+            // No token is how the service reports a session that timed out.
+            Resumable::TimedOut => serde_json::json!({ "SessionId": session_id }),
+        }
     } else if head.contains("amazonssm.terminatesession") {
-        let session_id = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("SessionId")?.as_str().map(str::to_owned))
-            .unwrap_or_default();
+        let session_id = session_id_from(&body);
         calls.lock().await.terminated.push(session_id.clone());
         serde_json::json!({ "SessionId": session_id })
     } else {
@@ -154,6 +183,13 @@ async fn handle(
         )
         .await?;
     stream.flush().await
+}
+
+fn session_id_from(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("SessionId")?.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
