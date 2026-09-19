@@ -30,6 +30,7 @@ credential for the data channel until the session ends.
 | Scrubbed from memory | Held in `Zeroizing` buffers from the API response through to the open message |
 | Never logged | Stream URLs are sanitised before they reach a log line, case-insensitively |
 | Not duplicated | The open-message struct has no `Clone` and no derived `Debug` |
+| Not the only credential | The WebSocket upgrade is additionally signed with SigV4 over `ssmmessages`, matching the reference plugin since 1.2.764.0 |
 
 Key material for session encryption gets the same treatment: `SessionCrypto`
 implements neither `Clone` nor a derived `Debug`, so a stray `dbg!` cannot print

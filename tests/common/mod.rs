@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+pub mod ssm_api;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +27,13 @@ pub enum Behaviour {
     Echo,
     /// Complete the handshake, then close the WebSocket.
     CloseAfterHandshake,
+    /// Complete the handshake, stay open briefly, then close the WebSocket.
+    ///
+    /// The pause is the whole point: a caller of `ReconnectingSession` can only
+    /// subscribe to events *after* `connect_with` returns, so a close that lands
+    /// immediately is unobservable and makes any test of it flaky. This gives
+    /// the test somewhere to stand.
+    CloseAfterPause,
     /// Complete the handshake, then stop responding entirely — no data, no
     /// acknowledgements, not even a pong. Simulates a black-holed connection.
     GoSilent,
@@ -39,6 +48,13 @@ pub enum Behaviour {
     /// Complete the handshake, then send a `channel_closed` message carrying the
     /// agent's JSON explanation of why.
     ChannelClosedWithReason,
+    /// Negotiate a `Port` session and speak smux: echo every `PSH` frame back on
+    /// the stream it arrived on, and answer `FIN` with `FIN`.
+    SmuxEcho,
+    /// Negotiate a `Port` session, then flood the **first** stream the client
+    /// opens with more frames than its inbound queue holds, while still echoing
+    /// on every other stream. Drives the slow-consumer eviction path.
+    SmuxFlood,
     /// Complete the handshake, then send an encryption challenge with a
     /// base64-encoded `Challenge`, exactly as the Go agent encodes a `[]byte`.
     Base64Challenge,
@@ -57,48 +73,128 @@ pub struct Observed {
     pub handshake_response: Option<String>,
     /// Payloads received with `PayloadType::Size`.
     pub terminal_sizes: Vec<String>,
+    /// Payload type of every client stream-data message, in arrival order.
+    ///
+    /// `inputs` and `terminal_sizes` are separate vectors, so the *relative*
+    /// order of data and control payloads is only observable here.
+    pub payload_order: Vec<PayloadType>,
     /// Number of WebSocket pings received.
     pub pings: usize,
+    /// How many WebSocket connections the gateway has accepted.
+    ///
+    /// A reconnect is a *new* data channel, so this is how "it reconnected" is
+    /// observed from the gateway's side.
+    pub connections: usize,
+    /// Headers of the WebSocket upgrade request, lowercased names.
+    pub upgrade_headers: Vec<(String, String)>,
 }
 
 /// A running mock gateway.
 pub struct MockGateway {
     addr: SocketAddr,
     observed: Arc<Mutex<Observed>>,
+    /// Captured separately from [`Observed`] because the upgrade callback is
+    /// synchronous and cannot await the async mutex the rest of the gateway
+    /// uses. Merged back in by [`MockGateway::observed`].
+    upgrade_headers: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 impl MockGateway {
     /// Bind on an ephemeral loopback port and serve exactly one connection.
     pub async fn start(behaviour: Behaviour) -> Self {
+        Self::scripted(vec![behaviour]).await
+    }
+
+    /// Serve a **sequence** of connections, one behaviour each.
+    ///
+    /// The last behaviour repeats for any further connection, so a script of
+    /// `[DropConnection, Echo]` means "fail the first data channel, then behave"
+    /// however many times the client comes back.
+    pub async fn scripted(script: Vec<Behaviour>) -> Self {
+        assert!(!script.is_empty(), "a script needs at least one behaviour");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let observed = Arc::new(Mutex::new(Observed::default()));
+        let upgrade_headers = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         tokio::spawn({
             let observed = Arc::clone(&observed);
+            let captured = Arc::clone(&upgrade_headers);
             async move {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                if behaviour == Behaviour::DropConnection {
-                    drop(stream);
-                    return;
+                for connection in 0.. {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let behaviour = script[connection.min(script.len() - 1)];
+                    observed.lock().await.connections += 1;
+
+                    let observed = Arc::clone(&observed);
+                    let captured = Arc::clone(&captured);
+                    // One task per connection so a lingering previous session
+                    // cannot hold up the next dial.
+                    tokio::spawn(async move {
+                        serve_connection(stream, behaviour, observed, captured).await;
+                    });
                 }
-                let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
-                    return;
-                };
-                serve(ws, behaviour, observed).await;
             }
         });
 
-        Self { addr, observed }
+        Self {
+            addr,
+            observed,
+            upgrade_headers,
+        }
     }
 
     /// The `ws://` URL to hand to `Session::attach`.
     pub fn url(&self) -> String {
         format!("ws://{}/v1/data-channel/mock", self.addr)
     }
+}
 
+/// Accept one WebSocket and serve it with `behaviour`.
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    behaviour: Behaviour,
+    observed: Arc<Mutex<Observed>>,
+    captured: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+) {
+    if behaviour == Behaviour::DropConnection {
+        drop(stream);
+        return;
+    }
+
+    // `accept_hdr_async` rather than `accept_async`: the upgrade request is the
+    // only place the SigV4 headers appear, so a test that wants to assert on
+    // them needs the gateway to have seen them.
+    //
+    // The `Err` variant is tungstenite's `ErrorResponse`, whose size is fixed by
+    // the callback signature this has to match.
+    #[allow(clippy::result_large_err)]
+    let inspect =
+        |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            let mut seen = captured.lock().unwrap_or_else(|e| e.into_inner());
+            *seen = request
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_ascii_lowercase(),
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            Ok(response)
+        };
+
+    let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, inspect).await else {
+        return;
+    };
+    serve(ws, behaviour, observed).await;
+}
+
+impl MockGateway {
     /// A snapshot of what the gateway has seen so far.
     pub async fn observed(&self) -> Observed {
         let guard = self.observed.lock().await;
@@ -108,7 +204,14 @@ impl MockGateway {
             sequences: guard.sequences.clone(),
             handshake_response: guard.handshake_response.clone(),
             terminal_sizes: guard.terminal_sizes.clone(),
+            payload_order: guard.payload_order.clone(),
             pings: guard.pings,
+            connections: guard.connections,
+            upgrade_headers: self
+                .upgrade_headers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         }
     }
 
@@ -135,6 +238,67 @@ impl MockGateway {
 }
 
 type Sink<S> = futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>;
+
+/// How long [`Behaviour::CloseAfterPause`] stays open before closing.
+///
+/// Long enough that a test reliably subscribes first, short enough not to be
+/// felt in the suite.
+pub const CLOSE_PAUSE: Duration = Duration::from_millis(300);
+
+/// Frames the gateway floods the first stream with under [`Behaviour::SmuxFlood`].
+///
+/// The client holds 256 frames per stream, so this must exceed that for the
+/// queue to overflow and the stream to be evicted.
+pub const FLOOD_FRAMES: usize = 300;
+
+/// smux v1 framing, for the gateway side.
+///
+/// Transcribed from `xtaci/smux` `frame.go` (`rawHeader` at `:77-91`) rather
+/// than from this crate's own encoder: a mock that reuses the code under test
+/// agrees with it by construction and proves nothing.
+///
+/// ```text
+/// [0] version  [1] cmd  [2..4] length (u16 LE)  [4..8] stream id (u32 LE)
+/// ```
+pub mod smux {
+    /// Protocol version 1 — the version the agent's `smux.DefaultConfig()` uses.
+    pub const VERSION: u8 = 1;
+    /// Stream open.
+    pub const SYN: u8 = 0;
+    /// Stream close, a.k.a. EOF.
+    pub const FIN: u8 = 1;
+    /// Data push.
+    pub const PSH: u8 = 2;
+    /// The fixed header size.
+    pub const HEADER: usize = 8;
+
+    /// Encode one frame.
+    pub fn encode(cmd: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER + payload.len());
+        out.push(VERSION);
+        out.push(cmd);
+        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        out.extend_from_slice(&stream_id.to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Decode one frame from the front of `buf`, consuming it on success.
+    pub fn decode(buf: &mut Vec<u8>) -> Option<(u8, u32, Vec<u8>)> {
+        if buf.len() < HEADER {
+            return None;
+        }
+        let length = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+        if buf.len() < HEADER + length {
+            return None;
+        }
+        let cmd = buf[1];
+        let stream_id = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let payload = buf[HEADER..HEADER + length].to_vec();
+        buf.drain(..HEADER + length);
+        Some((cmd, stream_id, payload))
+    }
+}
 
 /// Send one `output_stream_data` message.
 async fn send<S>(
@@ -166,6 +330,10 @@ async fn serve<S>(
 {
     let (mut sink, mut source) = ws.split();
     let mut outbound_sequence: i64 = 0;
+    // smux reassembly: the client's frames arrive split across stream-data
+    // payloads and do not align to frame boundaries.
+    let mut smux_buf: Vec<u8> = Vec::new();
+    let mut flooded: Option<u32> = None;
 
     // The client opens with a JSON text frame carrying the session token.
     match source.next().await {
@@ -176,11 +344,15 @@ async fn serve<S>(
     }
 
     if behaviour != Behaviour::LegacyNoHandshake {
+        let session_type = match behaviour {
+            Behaviour::SmuxEcho | Behaviour::SmuxFlood => "Port",
+            _ => "Standard_Stream",
+        };
         let request = serde_json::json!({
             "AgentVersion": "3.3.1345.0",
             "RequestedClientActions": [{
                 "ActionType": "SessionType",
-                "ActionParameters": { "SessionType": "Standard_Stream" }
+                "ActionParameters": { "SessionType": session_type }
             }]
         })
         .to_string();
@@ -237,6 +409,12 @@ async fn serve<S>(
                     .sequences
                     .push(message.sequence_number);
 
+                observed
+                    .lock()
+                    .await
+                    .payload_order
+                    .push(message.payload_type);
+
                 match message.payload_type {
                     PayloadType::HandshakeResponse => {
                         observed.lock().await.handshake_response =
@@ -269,6 +447,11 @@ async fn serve<S>(
                                 std::future::pending::<()>().await;
                             }
                             Behaviour::CloseAfterHandshake => {
+                                let _ = sink.send(Message::Close(None)).await;
+                                return;
+                            }
+                            Behaviour::CloseAfterPause => {
+                                tokio::time::sleep(CLOSE_PAUSE).await;
                                 let _ = sink.send(Message::Close(None)).await;
                                 return;
                             }
@@ -334,6 +517,50 @@ async fn serve<S>(
                             .terminal_sizes
                             .push(String::from_utf8_lossy(&message.payload).into_owned());
                         acknowledge(&mut sink, &message).await;
+                    }
+                    _ if matches!(behaviour, Behaviour::SmuxEcho | Behaviour::SmuxFlood) => {
+                        acknowledge(&mut sink, &message).await;
+                        smux_buf.extend_from_slice(&message.payload);
+
+                        while let Some((cmd, stream_id, payload)) = smux::decode(&mut smux_buf) {
+                            let replies: Vec<Vec<u8>> = match cmd {
+                                smux::SYN
+                                    if behaviour == Behaviour::SmuxFlood && flooded.is_none() =>
+                                {
+                                    flooded = Some(stream_id);
+                                    // One more than the client's per-stream
+                                    // queue holds, so the last frame is the one
+                                    // that cannot be delivered.
+                                    (0..FLOOD_FRAMES)
+                                        .map(|n| {
+                                            smux::encode(
+                                                smux::PSH,
+                                                stream_id,
+                                                format!("{n:04}").as_bytes(),
+                                            )
+                                        })
+                                        .collect()
+                                }
+                                smux::SYN => Vec::new(),
+                                smux::PSH => vec![smux::encode(smux::PSH, stream_id, &payload)],
+                                smux::FIN => vec![smux::encode(smux::FIN, stream_id, &[])],
+                                _ => Vec::new(),
+                            };
+
+                            for reply in replies {
+                                if !send(
+                                    &mut sink,
+                                    outbound_sequence,
+                                    PayloadType::Output,
+                                    Bytes::from(reply),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                outbound_sequence += 1;
+                            }
+                        }
                     }
                     _ => {
                         observed.lock().await.inputs.push(message.payload.to_vec());

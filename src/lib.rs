@@ -111,6 +111,7 @@ pub mod terminal;
 
 mod channels;
 mod connection;
+mod signing;
 
 /// PyO3 bindings.
 #[cfg(feature = "python")]

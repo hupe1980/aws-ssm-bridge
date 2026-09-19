@@ -12,7 +12,7 @@ the Amazon Message Gateway Service, and a token.
 <figure class="diagram">
 <svg class="seq" viewBox="0 0 718 446" width="718" height="446" role="img" aria-labelledby="t-Establ d-Establ" xmlns="http://www.w3.org/2000/svg">
 <title id="t-Establ">Establishing an SSM session</title>
-<desc id="d-Establ">The client calls StartSession on the SSM API, receives a session ID, stream URL and token, opens a WebSocket to the Message Gateway, authenticates with the token in the open message, and then completes a three-message handshake with the SSM agent.</desc>
+<desc id="d-Establ">The client calls StartSession on the SSM API, receives a session ID, stream URL and token, opens a WebSocket to the Message Gateway, authenticates with the token in the open message, and then completes a three-message handshake with the SSM agent when the session type requires one.</desc>
 <defs>
 <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
 <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/></marker>
@@ -55,6 +55,30 @@ the Amazon Message Gateway Service, and a token.
 The token goes in the **open message**, never in the URL. The reference plugin
 does the same, and the reason matters: a URL is recorded by proxies, connection
 traces and crash reports; a WebSocket payload is not.
+
+### Signing the upgrade
+
+The WebSocket upgrade itself is signed with **SigV4 over the `ssmmessages`
+service**, using the same credentials that called `StartSession`. Only the `Host`
+header is covered by the signature: the handshake headers (`Sec-WebSocket-Key`
+and friends) are added by the dialer afterwards and were never part of the
+canonical request. The body is empty, so the payload hash is the SHA-256 of zero
+bytes.
+
+Two cases go unsigned, both deliberately:
+
+- **A presigned stream URL**, which already authenticates itself. Signing it
+  again would put two credentials on one request.
+- **[`Session::attach`]**, whose caller may hold no credentials at all — the
+  session was started somewhere else. Signing that upgrade with whatever
+  credentials happen to be in the local environment would present a principal
+  unrelated to the session.
+
+A fresh signature is computed on every dial attempt, because a SigV4 signature
+carries the time it was made and a retry after backoff must not present a stale
+one.
+
+[`Session::attach`]: https://docs.rs/aws-ssm-bridge/latest/aws_ssm_bridge/session/struct.Session.html#method.attach
 
 
 ## Message format
@@ -372,7 +396,9 @@ Everything here is a deliberate, tested choice, not an accident of porting.
 | Area | Reference plugin | This crate | Why |
 |:---|:---|:---|:---|
 | Liveness | Ping every 5 min, no reply check | Ping every 30 s, idle deadline on any inbound frame | A silently dead connection otherwise hangs forever |
-| Retransmit timeout | Fixed 200 ms | Jacobson/Karels adaptive | A fixed 200 ms retransmits constantly on slow links |
+| Retransmit timeout | Jacobson/Karels, capped at 1 s | Same, clamped to 50 ms–30 s | A 1 s ceiling retransmits every message forever on any slower link |
+| RTT sampling | Samples every acknowledgement | Karn's algorithm: retransmitted messages are excluded | A sample taken across a retransmission belongs to neither send |
+| Upgrade signature | Signed once per dial | Re-signed on every attempt | A SigV4 signature carries its timestamp; a retry after backoff must not present a stale one |
 | Outgoing buffer full | Drop the oldest unacknowledged message | Refuse the new one and apply backpressure | Dropping the head abandons a message the agent is still waiting for and stalls the stream permanently |
 | Chunk size | Fixed 1024 | Configurable, default 1024 | Bulk transfers benefit; the default stays interoperable |
 | Terminal input | Platform-specific | Raw byte passthrough | Preserves modified keys, mouse reporting and application cursor mode |

@@ -21,6 +21,20 @@ target
 #.idea/
 
 # custom
+# Internal-only design notes (not published), plus concepts/references/ — the
+# third-party sources they are written against. Those are copyrighted
+# publications (AWS documentation, the Apache-2.0 reference implementations, the
+# MIT-licensed smux sources, NIST PDFs), so this entry is a licensing boundary as
+# well as an editorial one: publishing the notes would mean extracting them from
+# the material they sit beside. REFERENCES.md indexes every file with its
+# retrieval URL, so the folder can be rebuilt from scratch.
+concepts/
+
+# Agent instructions. Every phase of the round procedure reads concepts/, so it
+# describes a tree a clone does not have — and it is internal working method
+# rather than anything a consumer of this crate needs.
+.claude/
+
 _prompts/
 BACKLOG*.md
 CONCEPT.md

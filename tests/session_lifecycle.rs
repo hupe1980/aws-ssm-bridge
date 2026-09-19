@@ -523,3 +523,100 @@ async fn invalid_configuration_is_rejected_before_connecting() {
         .await
         .is_err());
 }
+
+/// A session opened with [`Session::attach`] must send an **unsigned** upgrade.
+///
+/// `attach` exists for a data channel somebody else obtained — a broker holding
+/// the IAM permission, a Lambda minting short-lived sessions. Signing that
+/// upgrade with whatever credentials happen to be lying around in the local
+/// environment would present a principal that has nothing to do with the session,
+/// which is worse than presenting none.
+#[tokio::test]
+async fn an_attached_session_sends_an_unsigned_upgrade() {
+    let gateway = MockGateway::start(Behaviour::Echo).await;
+    let session = connect(&gateway).await;
+    session.wait_ready().await.expect("handshake must complete");
+
+    let observed = gateway.observed().await;
+    let names: Vec<&str> = observed
+        .upgrade_headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    assert!(
+        !names.contains(&"authorization"),
+        "an attached session must not sign the upgrade: {names:?}"
+    );
+    assert!(
+        !names.contains(&"x-amz-date"),
+        "an attached session must not date the upgrade: {names:?}"
+    );
+
+    // The upgrade this crate builds itself still has to be a valid one, and this
+    // is the only place that is observed from the far end of a real socket.
+    for required in ["host", "connection", "upgrade", "sec-websocket-key"] {
+        assert!(
+            names.contains(&required),
+            "the upgrade must carry {required}: {names:?}"
+        );
+    }
+
+    session.terminate().await.expect("terminate");
+}
+
+/// A terminal resize is **not** prioritised over data already queued.
+///
+/// `send` and `send_terminal_size` share one FIFO command channel, and a large
+/// write is split into `payload_chunk_size` messages inside the command task —
+/// so a resize issued during a bulk transfer is delivered after it, not during.
+///
+/// This is documented behaviour rather than an accident, and the test exists so
+/// that making control payloads jump the queue cannot quietly falsify the page
+/// that says so.
+#[tokio::test]
+async fn a_resize_queues_behind_pending_data() {
+    use aws_ssm_bridge::binary_protocol::PayloadType;
+
+    let gateway = MockGateway::start(Behaviour::Echo).await;
+    let session = connect(&gateway).await;
+    session.wait_ready().await.expect("handshake must complete");
+
+    // Eight chunks at the 1 KiB default, then a resize.
+    let bulk = vec![b'x'; 8 * 1024];
+    session.send(bulk).await.expect("bulk send");
+    session
+        .send_terminal_size(120, 40)
+        .await
+        .expect("resize must be accepted");
+
+    let observed = gateway
+        .wait_for(Duration::from_secs(5), "the resize to arrive", |o| {
+            !o.terminal_sizes.is_empty()
+        })
+        .await;
+
+    let size_at = observed
+        .payload_order
+        .iter()
+        .position(|p| *p == PayloadType::Size)
+        .expect("the resize must have arrived");
+    let data_after = observed.payload_order[size_at..]
+        .iter()
+        .filter(|p| **p == PayloadType::Output)
+        .count();
+
+    assert_eq!(
+        observed.inputs.len(),
+        8,
+        "the bulk write must arrive as eight chunks: {:?}",
+        observed.payload_order
+    );
+    assert_eq!(
+        data_after, 0,
+        "every queued chunk must precede the resize: {:?}",
+        observed.payload_order
+    );
+
+    session.terminate().await.expect("terminate");
+}

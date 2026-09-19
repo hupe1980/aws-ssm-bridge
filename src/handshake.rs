@@ -1,7 +1,18 @@
 //! The SSM agent handshake.
 //!
-//! Every modern SSM agent opens a session with a three-message exchange before
-//! any stream data flows:
+//! An SSM agent opens a session with a three-message exchange **when there is
+//! something to negotiate** — a session type the client must be told about, or
+//! encryption. A plain, unencrypted shell gets no handshake at all:
+//! `RequireHandshake()` is `false` for the agent's `standardstream` plugin and
+//! `true` for `port` and the command plugins, and the agent skips the exchange
+//! unless one of those or encryption applies
+//! (`plugins/sessionplugin/sessionplugin.go:88`).
+//!
+//! So a shell session commonly leaves [`Session::agent_version`] `None`, and the
+//! connection layer enables sending on the first output instead. When the
+//! exchange does happen it looks like this:
+//!
+//! [`Session::agent_version`]: crate::Session::agent_version
 //!
 //! ```text
 //! agent                                                client
@@ -25,8 +36,9 @@
 //!   enabled; otherwise the action is failed with an actionable message rather
 //!   than silently downgrading to an unencrypted session.
 //!
-//! Legacy agents (pre-2.3) send output immediately without a handshake; the
-//! connection layer detects that separately and does not depend on this module.
+//! An agent that sends output before any handshake — whether because it skipped
+//! the exchange or because it predates the protocol — is handled by the
+//! connection layer, which does not depend on this module.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -48,7 +60,14 @@ use crate::errors::{Error, Result};
 ///
 /// It is therefore deliberately decoupled from `CARGO_PKG_VERSION`: bumping the
 /// crate must not change how the agent behaves.
-pub const CLIENT_PROTOCOL_VERSION: &str = "1.2.707.0";
+///
+/// The value is **1.2.764.0** because that is the release whose behaviour this
+/// client implements: it is the one that introduced SigV4 signing of the
+/// data-channel upgrade, and it is the minimum version AWS documents as
+/// supported. A later release is not claimed, because 1.2.814.0 and 1.2.835.0
+/// each added behaviour this crate does not have, and a version string is a
+/// claim about behaviour rather than a number to keep current.
+pub const CLIENT_PROTOCOL_VERSION: &str = "1.2.764.0";
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -827,6 +846,28 @@ mod tests {
         assert!(
             (parts[0], parts[1], parts[2]) > (1, 2, 331),
             "{CLIENT_PROTOCOL_VERSION} must exceed 1.2.331 to disable agent keep-alives"
+        );
+    }
+
+    /// AWS documents a *minimum supported* plugin version, and operations below
+    /// it "might not succeed". The advertised version must not drop under it.
+    ///
+    /// Raising this threshold is not a free edit: the version claims the
+    /// behaviour of the release it names, so whatever that release introduced
+    /// has to exist here first.
+    #[test]
+    fn client_version_is_at_least_the_minimum_aws_supports() {
+        /// The minimum supported Session Manager plugin version, per
+        /// `plugin-version-history.html`, read 2026-09-19.
+        const AWS_MINIMUM_SUPPORTED: (u32, u32, u32, u32) = (1, 2, 764, 0);
+
+        let parts: Vec<u32> = CLIENT_PROTOCOL_VERSION
+            .split('.')
+            .map(|p| p.parse().unwrap())
+            .collect();
+        assert!(
+            (parts[0], parts[1], parts[2], parts[3]) >= AWS_MINIMUM_SUPPORTED,
+            "{CLIENT_PROTOCOL_VERSION} is below the minimum version AWS supports"
         );
     }
 }

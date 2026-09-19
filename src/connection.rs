@@ -55,6 +55,7 @@ use crate::handshake::{
 };
 use crate::metrics::{self, names};
 use crate::session::{CloseReason, SessionCore};
+use crate::signing::{self, UpgradeSigner};
 
 /// Schema version sent in the data-channel open message.
 const MESSAGE_SCHEMA_VERSION: &str = "1.0";
@@ -229,6 +230,14 @@ pub(crate) struct ConnectionParams {
     pub token: Zeroizing<String>,
     pub chunk_size: usize,
     pub endpoint_policy: EndpointPolicy,
+    /// Signs the WebSocket upgrade, when the caller holds credentials.
+    ///
+    /// `None` for [`Session::attach`], whose caller may have none — the session
+    /// was started somewhere else. The reference plugin also sends an unsigned
+    /// upgrade when the stream URL is already presigned.
+    ///
+    /// [`Session::attach`]: crate::Session::attach
+    pub signer: Option<UpgradeSigner>,
     pub heartbeat_interval: Duration,
     pub idle_timeout: Duration,
     #[cfg(feature = "kms")]
@@ -256,7 +265,7 @@ pub(crate) async fn connect(
         "opening SSM data channel"
     );
 
-    let ws = dial(&params.stream_url).await?;
+    let ws = dial(&params.stream_url, params.signer.as_ref()).await?;
     let (mut sink, source) = ws.split();
 
     // Authenticate the channel before anything else is written to it.
@@ -317,10 +326,27 @@ pub(crate) async fn connect(
 }
 
 /// Dial the WebSocket, retrying only failures that a retry can fix.
-async fn dial(url: &str) -> Result<WsStream> {
+///
+/// The upgrade request is rebuilt on every attempt rather than reused. Two
+/// reasons, and both are correctness rather than tidiness: `Sec-WebSocket-Key`
+/// must be fresh per handshake, and a SigV4 signature carries the timestamp it
+/// was made at — a retry after the backoff must not present a stale one into a
+/// five-minute skew window.
+async fn dial(url: &str, signer: Option<&UpgradeSigner>) -> Result<WsStream> {
     let mut backoff = Duration::from_millis(200);
     for attempt in 1..=CONNECT_ATTEMPTS {
-        match connect_async(url).await {
+        let mut request = signing::upgrade_request(url)?;
+        match signer {
+            // A presigned URL authenticates itself; signing it again would put
+            // two credentials on one request. `IsPresignedURL` in the reference
+            // makes the same call.
+            Some(_) if signing::is_presigned(url) => {
+                debug!("stream URL is presigned; not signing the upgrade");
+            }
+            Some(signer) => signer.sign(&mut request).await?,
+            None => {}
+        }
+        match connect_async(request).await {
             Ok((ws, response)) => {
                 debug!(status = ?response.status(), attempt, "WebSocket connected");
                 return Ok(ws);

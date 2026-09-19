@@ -29,6 +29,20 @@ use crate::crypto::SessionCrypto;
 use crate::documents::{SessionType, SsmDocument};
 use crate::errors::{Error, Result};
 use crate::metrics::{self, names};
+use crate::signing::UpgradeSigner;
+
+/// Longest `Target` that `ssm:StartSession` accepts.
+///
+/// Counted in **characters**, not bytes: the API's length constraints are
+/// expressed over the string, so a multi-byte target is not penalised for its
+/// encoding.
+const MAX_TARGET_CHARS: usize = 400;
+
+/// Longest `Reason` that `ssm:StartSession` accepts, in characters.
+///
+/// The API's pattern is `^.{1,256}$`, so an empty reason is rejected as well as
+/// an over-long one.
+const MAX_REASON_CHARS: usize = 256;
 
 /// Why a session ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +321,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct SessionConfig {
     /// What to connect to: an instance ID, `mi-` managed instance, ECS target
     /// or ARN. See [`SessionManager::start_session`] for the accepted forms.
+    ///
+    /// At most 400 characters. The *shape* is not checked here; AWS validates
+    /// that authoritatively.
     pub target: String,
 
     /// The SSM document to run, and its parameters.
@@ -316,9 +333,12 @@ pub struct SessionConfig {
     pub document: Option<DocumentSpec>,
 
     /// Free-text reason recorded in CloudTrail for this session.
+    ///
+    /// At most 256 characters, and not empty — leave it `None` rather than
+    /// setting an empty string.
     pub reason: Option<String>,
 
-    /// How long to wait for the agent handshake before giving up.
+    /// How long to wait for the session to become ready before giving up.
     pub ready_timeout: Duration,
 
     /// How often to send a WebSocket keep-alive ping.
@@ -382,6 +402,30 @@ impl SessionConfig {
     fn validate(&self) -> Result<()> {
         if self.target.trim().is_empty() {
             return Err(Error::Config("target must not be empty".into()));
+        }
+        // Length only, never a pattern: AWS validates the shape of a target
+        // authoritatively, and a client-side guess breaks new target types
+        // before this crate learns about them.
+        let target_chars = self.target.chars().count();
+        if target_chars > MAX_TARGET_CHARS {
+            return Err(Error::Config(format!(
+                "target is {target_chars} characters; ssm:StartSession accepts \
+                 at most {MAX_TARGET_CHARS}"
+            )));
+        }
+        if let Some(reason) = &self.reason {
+            let reason_chars = reason.chars().count();
+            if reason_chars == 0 {
+                return Err(Error::Config(
+                    "reason must not be empty; leave it unset instead".into(),
+                ));
+            }
+            if reason_chars > MAX_REASON_CHARS {
+                return Err(Error::Config(format!(
+                    "reason is {reason_chars} characters; ssm:StartSession \
+                     accepts at most {MAX_REASON_CHARS}"
+                )));
+            }
         }
         if self.payload_chunk_size == 0 {
             return Err(Error::Config(
@@ -458,6 +502,7 @@ impl Session {
         stream_url: String,
         token: Zeroizing<String>,
         ssm: Option<Arc<aws_sdk_ssm::Client>>,
+        signer: Option<UpgradeSigner>,
         #[cfg(feature = "kms")] kms: Option<aws_sdk_kms::Client>,
     ) -> Result<Self> {
         let core = Arc::new(SessionCore::new(session_id.clone(), config.output_buffer));
@@ -471,6 +516,7 @@ impl Session {
                 token,
                 chunk_size: config.payload_chunk_size,
                 endpoint_policy: config.endpoint_policy,
+                signer,
                 heartbeat_interval: config.heartbeat_interval,
                 idle_timeout: config.idle_timeout,
                 #[cfg(feature = "kms")]
@@ -527,6 +573,7 @@ impl Session {
             config,
             stream_url.into(),
             Zeroizing::new(token.into()),
+            None,
             None,
             #[cfg(feature = "kms")]
             None,
@@ -596,7 +643,11 @@ impl Session {
         self.core.closed().await;
     }
 
-    /// Wait for the agent handshake to finish.
+    /// Wait for the session to become ready.
+    ///
+    /// Ready means the agent will accept data: the handshake completing where
+    /// one is negotiated, and the first output otherwise — a plain, unencrypted
+    /// shell negotiates no handshake at all.
     ///
     /// Returns an error if the session ends first or
     /// [`SessionConfig::ready_timeout`] elapses. You do not need to call this
@@ -760,6 +811,10 @@ impl std::fmt::Debug for Session {
 #[derive(Clone)]
 pub struct SessionManager {
     ssm: Arc<aws_sdk_ssm::Client>,
+    /// Signs the data-channel upgrade. `None` when the resolved configuration
+    /// has no credentials provider or no region, in which case the upgrade is
+    /// sent unsigned.
+    signer: Option<UpgradeSigner>,
     #[cfg(feature = "kms")]
     kms: Option<aws_sdk_kms::Client>,
 }
@@ -788,8 +843,25 @@ impl SessionManager {
     /// Use this to share credential providers, retry settings or an HTTP client
     /// with the rest of your application.
     pub fn from_conf(config: &aws_config::SdkConfig) -> Self {
+        // Both halves are required: a signature names a region, and there is
+        // no sensible default for one. Missing either means the upgrade is sent
+        // unsigned rather than signed wrongly.
+        let signer = match (config.credentials_provider(), config.region()) {
+            (Some(credentials), Some(region)) => {
+                Some(UpgradeSigner::new(credentials, region.to_string()))
+            }
+            _ => {
+                warn!(
+                    "no credentials provider or no region in the AWS configuration; \
+                     the data channel upgrade will not be signed"
+                );
+                None
+            }
+        };
+
         Self {
             ssm: Arc::new(aws_sdk_ssm::Client::new(config)),
+            signer,
             #[cfg(feature = "kms")]
             kms: Some(aws_sdk_kms::Client::new(config)),
         }
@@ -865,6 +937,7 @@ impl SessionManager {
             stream_url,
             token,
             Some(Arc::clone(&self.ssm)),
+            self.signer.clone(),
             #[cfg(feature = "kms")]
             self.kms.clone(),
         )
@@ -921,6 +994,59 @@ mod tests {
     fn empty_target_is_rejected() {
         assert!(SessionConfig::new("   ").validate().is_err());
         assert!(SessionConfig::new("").validate().is_err());
+    }
+
+    /// `StartSession` caps `Target` at 400 characters and `Reason` at 256.
+    /// Catching that here costs nothing; catching it at the API costs a round
+    /// trip and reports it in the service's words rather than the caller's.
+    #[test]
+    fn oversized_target_and_reason_are_rejected() {
+        let mut config = SessionConfig::new("i".repeat(401));
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("400"), "{err}");
+
+        config = SessionConfig::new("i-abc");
+        config.reason = Some("r".repeat(257));
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("256"), "{err}");
+    }
+
+    /// Exactly at the limit is valid — an off-by-one here rejects a request the
+    /// service would have accepted, which is the worse direction to be wrong in.
+    #[test]
+    fn target_and_reason_at_the_limit_are_accepted() {
+        let mut config = SessionConfig::new("i".repeat(400));
+        config.reason = Some("r".repeat(256));
+        assert!(config.validate().is_ok());
+    }
+
+    /// The API counts **characters**, not bytes (`^.{1,256}$`). A byte-length
+    /// check would refuse a perfectly legal reason the moment it stopped being
+    /// ASCII — an incident reference in Japanese, say.
+    #[test]
+    fn the_limits_count_characters_not_bytes() {
+        let mut config = SessionConfig::new("i-abc");
+        let reason = "é".repeat(256);
+        assert_eq!(reason.len(), 512, "the fixture must be multi-byte");
+        config.reason = Some(reason);
+        assert!(
+            config.validate().is_ok(),
+            "256 characters is 256 characters whatever they encode to"
+        );
+
+        let target = "ü".repeat(400);
+        assert_eq!(target.len(), 800, "the fixture must be multi-byte");
+        assert!(SessionConfig::new(target).validate().is_ok());
+    }
+
+    /// The API pattern is `^.{1,256}$`, so an empty reason is not "no reason" —
+    /// it is a value the service rejects. Omitting it is the caller's job.
+    #[test]
+    fn an_empty_reason_is_rejected_rather_than_silently_dropped() {
+        let mut config = SessionConfig::new("i-abc");
+        config.reason = Some(String::new());
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("reason"), "{err}");
     }
 
     /// An idle timeout at or below the ping interval declares healthy

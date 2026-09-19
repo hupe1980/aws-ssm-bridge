@@ -250,7 +250,8 @@ corrupt the display.
 |:---|:---|
 | `TargetNotConnected` | The SSM agent is not running, or the instance has no route to the SSM endpoints |
 | `AccessDeniedException` | Missing `ssm:StartSession`, or a session-document condition in the policy |
-| Handshake times out | The agent connected but never replied — usually a KMS problem; check the logs for the `KMSEncryption` action |
+| `wait_ready` times out | The agent connected but never became ready. When the session negotiates a handshake — port forwarding, or any encrypted session — this is usually KMS; check the logs for the `KMSEncryption` action. A plain shell negotiates none, so a timeout there means no output ever arrived |
 | `not an AWS SSM messages endpoint` | The stream URL was not an AWS host. Set `endpoint_policy` to `AllowAny` only if you are deliberately testing against a mock |
 | `PortForwarder needs a port-forwarding session` | The session was started without a forwarding document |
 | Nothing arrives after sending | You subscribed with `output()` after `send()`; subscribe first |
+| `reason must not be empty` | An optional flag was plumbed through as `""`. Leave `reason` unset instead — the API rejects an empty one |

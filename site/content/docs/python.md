@@ -30,7 +30,7 @@ from aws_ssm_bridge import SessionManager
 async def main():
     manager = await SessionManager.new(region="eu-central-1")
 
-    # The context manager waits for the agent handshake on entry and terminates
+    # The context manager waits for the session to become ready on entry, and terminates
     # the session on exit, including when the body raises.
     async with await manager.start_session("i-0123456789abcdef0") as session:
         await session.send(b"uname -a\r")
@@ -239,6 +239,47 @@ results = await asyncio.gather(
 )
 ```
 
+
+## Signals and the event loop
+
+Forwarding the local terminal size means handling `SIGWINCH`. Install the handler
+with **`loop.add_signal_handler`**, not `signal.signal`:
+
+```python
+import asyncio, os, signal
+
+async def track_terminal_size(session):
+    loop = asyncio.get_running_loop()
+    sizes = asyncio.Queue()
+    loop.add_signal_handler(signal.SIGWINCH, lambda: sizes.put_nowait(os.get_terminal_size()))
+
+    while True:
+        size = await sizes.get()
+        await session.send_terminal_size(size.columns, size.lines)
+```
+
+With `signal.signal`, the handler runs but the coroutine waiting on the queue
+does not wake: `Queue.put_nowait` resumes its waiter through `loop.call_soon`,
+which does not write to the loop's self-pipe. The loop stays blocked in
+`select()` until something unrelated wakes it — in a session, the next chunk of
+output. The symptom is a resize that applies only when the remote next prints.
+`add_signal_handler` installs a wakeup file descriptor, so the signal itself
+breaks the `select()`.
+
+If you must keep `signal.signal`, wake the loop explicitly:
+
+```python
+signal.signal(
+    signal.SIGWINCH,
+    lambda *_: loop.call_soon_threadsafe(sizes.put_nowait, os.get_terminal_size()),
+)
+```
+
+`add_signal_handler` is Unix-only, which is no loss — `SIGWINCH` is too.
+
+**Resizes queue behind pending data.** `send` and `send_terminal_size` share one
+ordered command channel, and a large `send` is split into `payload_chunk_size`
+messages, so a resize issued during a bulk transfer is delivered after it.
 
 ## Logging
 

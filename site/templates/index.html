@@ -106,7 +106,7 @@
     </div>
     <div class="stat">
       <strong>Fuzzed</strong>
-      <span>Every parser that touches network bytes</span>
+      <span>The message, handshake and acknowledgement parsers</span>
     </div>
     <div class="stat">
       <strong>Verified</strong>
@@ -119,8 +119,8 @@
   </div>
   <p class="muted">
     The data channel refuses any endpoint that is not an AWS SSM messages host,
-    and the session token travels only in the open message — never in a URL,
-    where proxies and traces would record it.
+    signs its WebSocket upgrade with SigV4, and keeps the session token in the
+    open message — never in a URL, where proxies and traces would record it.
     <a class="arrow" href="{{ get_url(path='@/docs/security.md') }}">Read the threat model</a>
   </p>
 </section>

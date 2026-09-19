@@ -6,6 +6,54 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version stays below `1.0.0`, a minor bump may contain breaking changes.
 
+## [0.6.0] — unreleased
+
+### Added
+
+- **SigV4 signing of the data-channel WebSocket upgrade**, over `ssmmessages`,
+  matching the reference plugin. Accepted by the live gateway on the first
+  attempt (verified 2026-09-19 against SSM agent 3.3.3572.0, `eu-central-1`). Only the `Host` header is signed and the payload
+  hash is that of an empty body, because the WebSocket handshake headers are
+  added by the dialer after signing. Each dial attempt is signed afresh, since a
+  signature carries the instant it was made. A presigned stream URL and a session
+  opened with `Session::attach` are sent unsigned — the first authenticates
+  itself, and the second may have no credentials to sign with. Signing needs both
+  a credentials provider and a region; without either the upgrade goes unsigned
+  and a warning is logged.
+
+### Changed
+
+- **`CLIENT_PROTOCOL_VERSION` is now `1.2.764.0`** (was `1.2.707.0`): the minimum
+  version AWS documents as supported, and the release that introduced upgrade
+  signing, so the string is a true claim about this client. Later releases are
+  deliberately not claimed. The agent gates protocol features on this value, so
+  this is behavioural, not cosmetic; both thresholds that matter were already
+  satisfied and remain so.
+
+- **`SessionConfig` now rejects a `target` over 400 characters, and a `reason`
+  that is empty or over 256**, before the `StartSession` round trip rather than
+  after it. Both limits count characters, not bytes, matching the API. An empty
+  reason is an error rather than a silent omission: the API's pattern is
+  `^.{1,256}$`, so it is a value the service rejects, and leaving it unset is the
+  way to send none.
+
+### Documentation
+
+- **Signals and the event loop**, on the Python page. A `SIGWINCH` handler
+  installed with `signal.signal` that calls `asyncio.Queue.put_nowait` does not
+  wake the event loop, so a terminal resize appears to apply only when the remote
+  next prints. Use `loop.add_signal_handler`. The page now covers the fix, the
+  workaround, and why a resize issued during a bulk transfer is delivered after
+  it rather than during.
+- Corrected the published comparison with the reference plugin: it does implement
+  an adaptive retransmit timeout. The real differences are its 1-second ceiling
+  and its lack of Karn's algorithm.
+
+### Dependencies
+
+- Added `aws-sigv4` (`sign-http` only) and `aws-credential-types`, both already
+  present in the tree transitively.
+
 ## [0.5.0] — 2026-08-14
 
 A substantial rework of the public API. Almost every type moved, was renamed, or

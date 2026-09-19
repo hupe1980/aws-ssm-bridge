@@ -123,6 +123,13 @@ live-shell CMD="uname -a": _require-target
 live-forward PORT="22" LOCAL="127.0.0.1:0": _require-target
     RUST_LOG=aws_ssm_bridge=info cargo run --example port_forward --features {{FEATURES}} -- {{TARGET}} {{PORT}} {{LOCAL}}
 
+# Deliberately not in CI: this project puts no AWS credentials into GitHub, so
+# the only check that talks to the service is one a human runs.
+
+# The pre-release gate: signing, a shell and a multiplexed tunnel, against a real agent.
+live-smoke: _require-target
+    SSM_TARGET={{TARGET}} scripts/live-smoke.sh
+
 # Open an interactive shell on the target.
 live-interactive: _require-target
     cargo run --example interactive --features {{FEATURES}} -- {{TARGET}}

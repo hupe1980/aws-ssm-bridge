@@ -76,12 +76,16 @@ impl SessionBuilder {
     }
 
     /// Record why this session was opened. Shows up in CloudTrail.
+    ///
+    /// At most 256 characters, and not empty — simply do not call this if you
+    /// have no reason to give.
     pub fn reason(mut self, reason: impl Into<String>) -> Self {
         self.config.reason = Some(reason.into());
         self
     }
 
-    /// How long to wait for the agent handshake.
+    /// How long to wait for the session to become ready — the handshake where
+    /// one is negotiated, and the first output otherwise.
     pub fn ready_timeout(mut self, timeout: Duration) -> Self {
         self.config.ready_timeout = timeout;
         self
@@ -171,8 +175,9 @@ mod tests {
         assert_eq!(config.session_type(), SessionType::StandardStream);
     }
 
-    /// `region()` used to be silently ignored. Pin it to the builder state so a
-    /// refactor cannot quietly drop it again.
+    /// `region()` must reach the builder's state: it is read only by `start()`,
+    /// which makes it the kind of field a refactor can drop without any other
+    /// test noticing.
     #[test]
     fn region_is_recorded() {
         assert_eq!(

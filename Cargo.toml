@@ -1,6 +1,6 @@
 [package]
 name = "aws-ssm-bridge"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 # Set by the AWS SDK, not by this crate's own code: aws-config and the
 # aws-sdk-* crates declare 1.94.1, and aws-sigv4 pulls in a `digest` whose
@@ -69,6 +69,11 @@ aws-sdk-kms = { version = "1.40", default-features = false, features = [
 aws-smithy-types = "1.2"
 aws-smithy-runtime-api = "1.7"
 
+# SigV4 signing of the data-channel WebSocket upgrade. The headers are applied to
+# a tungstenite request directly, so the `http1` default feature is not needed.
+aws-sigv4 = { version = "1.5", default-features = false, features = ["sign-http"] }
+aws-credential-types = "1.2"
+
 # WebSocket
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 
@@ -104,6 +109,10 @@ pyo3 = { version = "0.29", features = ["abi3-py38"], optional = true }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"], optional = true }
 
 [dev-dependencies]
+# The reconnection tests build an `SdkConfig` the way a caller would, to point a
+# real `SessionManager` at a fake SSM endpoint. Neither crate is new to the tree.
+aws-config = { version = "1.5", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-credential-types = "1.2"
 tokio = { version = "1.40", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"

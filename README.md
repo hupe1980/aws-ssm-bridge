@@ -71,8 +71,9 @@ the target, and `ssm:TerminateSession` on your own sessions.
 | **Observability** | `tracing` spans throughout, pluggable metrics recorder |
 | **Python** | Full async API, type stubs, context managers |
 
-Verified against a live SSM agent (3.3.3572.0): shell sessions, handshake,
-six concurrent multiplexed TCP streams, and clean teardown.
+Verified against a live SSM agent (3.3.3572.0): the SigV4-signed data-channel
+upgrade, shell sessions, the handshake, concurrent multiplexed TCP streams, and
+clean teardown.
 
 ---
 
@@ -242,6 +243,9 @@ The site is built with [Zola](https://www.getzola.org) from [`site/`](site);
 - `unsafe_code = "forbid"` for the whole crate, so any `unsafe` fails the build.
 - The session token travels only in the data-channel open message — never in a
   URL, where proxies and traces would record it.
+- The data-channel WebSocket upgrade is signed with SigV4 over `ssmmessages`,
+  matching the reference plugin. A presigned stream URL, and a session opened
+  with `Session::attach`, are sent unsigned.
 - SHA-256 payload digests are **verified**, matching the reference
   implementation; a mismatch ends the session rather than delivering corrupt
   bytes.
@@ -265,6 +269,7 @@ just fuzz           # cargo-fuzz over the network-facing parsers
 just python         # build and install the wheel
 just site           # serve the documentation site locally
 just release-check  # everything above, plus MSRV, --locked, publish dry run
+SSM_TARGET=i-… just live-smoke   # the pre-release check against a real instance
 ```
 
 The MSRV is set by the AWS SDK, not by this crate's own code. `just msrv`
